@@ -574,16 +574,17 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Declare global USE_WANDB at the beginning of the block if we intend to modify the module-level one.
+    global USE_WANDB
+
     if args.no_wandb:
-        global USE_WANDB
         USE_WANDB = False
         print("Weights & Biases logging explicitly disabled via --no-wandb flag.")
 
     if args.sweep_id:
-        if not USE_WANDB:
-            print("WARNING: --no-wandb is set, but sweep functionality relies on W&B. W&B will be enabled for sweep agent.")
-            global USE_WANDB # Force enable for sweep
-            USE_WANDB = True
+        if not USE_WANDB: # If --no-wandb was set, but a sweep is also requested
+            print("WARNING: --no-wandb was set, but sweep functionality relies on W&B. W&B will be re-enabled for the sweep agent.")
+            USE_WANDB = True # Force enable for sweep agent as it needs W&B
         print(f"Starting wandb agent for sweep_id: {args.sweep_id}")
 
 
