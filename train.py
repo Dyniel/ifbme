@@ -11,6 +11,11 @@ import time
 import wandb # Dodano wandb
 import yaml # Do wczytywania konfiguracji sweepa
 import argparse # Do obsługi argumentów linii poleceń dla sweepów
+import io
+from PIL import Image
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve as sk_roc_curve, auc as sk_auc, confusion_matrix as sk_confusion_matrix
+
 
 
 from data_utils import load_and_preprocess_data
@@ -69,6 +74,7 @@ def get_input_dim_from_data(sample_csv_path, lap_pe_k_dim, sign_pe_k_dim):
     num_numerical_features = 0
     if 'num' in preprocessor_sample.named_transformers_ and preprocessor_sample.named_transformers_['num'] != 'drop':
         num_numerical_features = len(preprocessor_sample.transformers_[0][2])
+
 
 
     num_onehot_features = 0
@@ -132,37 +138,85 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
             if task_name == "Mortality":
                 val_target = val_data.y_mortality.to(DEVICE)
                 val_loss = criterion(val_out, val_target)
-                val_probs = torch.sigmoid(val_out).cpu().numpy()
-                val_target_cpu = val_target.cpu().numpy()
-                val_metric = roc_auc_score(val_target_cpu, val_probs)
+                val_probs_np = torch.sigmoid(val_out).cpu().numpy().flatten() # Spłaszczenie
+                val_target_cpu_np = val_target.cpu().numpy().flatten() # Spłaszczenie
+                val_metric = roc_auc_score(val_target_cpu_np, val_probs_np)
+
                 metric_name = "AUROC"
 
                 if wandb.run is not None:
                     try:
-                        log_plots_dict[f"{task_name}/roc_curve"] = wandb.plot.roc_curve(val_target_cpu, np.stack((1-val_probs, val_probs), axis=-1))
-                        val_preds_classes = (val_probs > 0.5).astype(int)
-                        log_plots_dict[f"{task_name}/confusion_matrix"] = wandb.plot.confusion_matrix(
-                            preds=val_preds_classes, y_true=val_target_cpu, class_names=['Survival', 'Death'])
+                        # --- Ręczne generowanie krzywej ROC ---
+                        fpr, tpr, _ = sk_roc_curve(val_target_cpu_np, val_probs_np)
+                        roc_auc_value = sk_auc(fpr, tpr)
+                        plt.figure()
+                        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc_value:.2f})')
+                        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+                        plt.xlim([0.0, 1.0])
+                        plt.ylim([0.0, 1.05])
+                        plt.xlabel('False Positive Rate')
+                        plt.ylabel('True Positive Rate')
+                        plt.title(f'Receiver Operating Characteristic - {task_name}')
+                        plt.legend(loc="lower right")
+
+                        buf_roc = io.BytesIO()
+                        plt.savefig(buf_roc, format='png')
+                        buf_roc.seek(0)
+                        roc_image = Image.open(buf_roc)
+                        wandb.log({f"{task_name}/roc_curve_image": wandb.Image(roc_image)}, step=epoch)
+                        plt.close()
+                        buf_roc.close()
+
+                        # --- Ręczne generowanie macierzy konfuzji ---
+                        val_preds_classes_np = (val_probs_np > 0.5).astype(int)
+                        cm = sk_confusion_matrix(val_target_cpu_np, val_preds_classes_np)
+                        fig_cm, ax_cm = plt.subplots()
+                        cax = ax_cm.matshow(cm, cmap=plt.cm.Blues)
+                        fig_cm.colorbar(cax)
+                        class_names = ['Survival', 'Death']
+                        ax_cm.set_xticks(np.arange(len(class_names)))
+                        ax_cm.set_yticks(np.arange(len(class_names)))
+                        ax_cm.set_xticklabels(class_names)
+                        ax_cm.set_yticklabels(class_names)
+                        plt.xlabel('Predicted')
+                        plt.ylabel('True')
+                        plt.title(f'Confusion Matrix - {task_name}')
+                        for i in range(cm.shape[0]):
+                            for j in range(cm.shape[1]):
+                                ax_cm.text(j, i, str(cm[i, j]), va='center', ha='center', color='black' if cm[i,j] < cm.max()/2 else 'white')
+
+                        buf_cm = io.BytesIO()
+                        plt.savefig(buf_cm, format='png')
+                        buf_cm.seek(0)
+                        cm_image = Image.open(buf_cm)
+                        wandb.log({f"{task_name}/confusion_matrix_image": wandb.Image(cm_image)}, step=epoch)
+                        plt.close(fig_cm)
+                        buf_cm.close()
+
                     except Exception as e:
-                        print(f"Error preparing wandb plots for Mortality: {e}")
+                        print(f"Error logging wandb plots for Mortality: {e}")
 
 
             elif task_name == "LoS":
                 val_target_log = torch.log1p(val_data.y_los.to(DEVICE))
                 val_loss = criterion(val_out, val_target_log)
-                val_preds_original_scale = torch.expm1(val_out).cpu().numpy().clip(min=0)
-                val_target_original_scale = val_data.y_los.cpu().numpy()
-                val_metric = np.sqrt(mean_squared_error(val_target_original_scale, val_preds_original_scale))
+                val_preds_original_scale_np = torch.expm1(val_out).cpu().numpy().clip(min=0).flatten()
+                val_target_original_scale_np = val_data.y_los.cpu().numpy().flatten()
+                val_metric = np.sqrt(mean_squared_error(val_target_original_scale_np, val_preds_original_scale_np))
+
                 metric_name = "RMSE"
 
                 if wandb.run is not None:
                     try:
-                        data_scatter = [[true_val, pred_val] for true_val, pred_val in zip(val_target_original_scale.flatten(), val_preds_original_scale.flatten())]
-                        table_scatter = wandb.Table(data=data_scatter, columns=["Actual LoS", "Predicted LoS"])
-                        log_plots_dict[f"{task_name}/predictions_scatter"] = wandb.plot.scatter(
-                            table_scatter, "Actual LoS", "Predicted LoS", title="Actual vs. Predicted LoS")
+                        # Konwersja na listy Pythona dla tabeli scatter
+                        data_scatter_list = [[float(true_val), float(pred_val)] for true_val, pred_val in zip(val_target_original_scale_np, val_preds_original_scale_np)]
+                        table_scatter = wandb.Table(data=data_scatter_list, columns=["Actual LoS", "Predicted LoS"])
+                        # Wykres scatter powinien działać bez problemu, więc go nie zmieniam
+                        wandb.log({f"{task_name}/predictions_scatter": wandb.plot.scatter(
+                            table_scatter, "Actual LoS", "Predicted LoS", title="Actual vs. Predicted LoS"
+                        )}, step=epoch)
                     except Exception as e:
-                        print(f"Error preparing wandb plots for LoS: {e}")
+                        print(f"Error logging wandb plots for LoS: {e}")
 
 
         epoch_duration = time.time() - start_time
@@ -170,7 +224,7 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
 
         if wandb.run is not None:
             log_metrics_dict = {
-                f"{task_name}/epoch": epoch,
+                #f"{task_name}/epoch": epoch, # Już logowane jako step
 
                 f"{task_name}/train_loss": loss.item(),
                 f"{task_name}/val_loss": val_loss.item(),
@@ -178,7 +232,7 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
                 f"{task_name}/learning_rate": optimizer.param_groups[0]['lr'],
                 f"{task_name}/epoch_duration_sec": epoch_duration,
             }
-            wandb.log({**log_metrics_dict, **log_plots_dict}, step=epoch)
+            wandb.log(log_metrics_dict, step=epoch) # Logowanie metryk numerycznych
 
 
         if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -211,7 +265,8 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
     if wandb.run is not None:
         wandb.save(model_path)
         wandb.summary[f"best_val_{metric_name.lower()}_{task_name.lower()}"] = best_val_metric
-    return model
+    return model, best_val_metric # Zwracamy również najlepszą metrykę
+
 
 # --- Main Training Execution ---
 def main(run_config_from_sweep=None):
@@ -357,10 +412,11 @@ def main(run_config_from_sweep=None):
     optimizer_mortality = optim.AdamW(mortality_model.parameters(), lr=_LEARNING_RATE, weight_decay=_WEIGHT_DECAY)
     scheduler_mortality = CosineAnnealingWarmRestarts(optimizer_mortality, T_0=_COSINE_T_0, T_mult=_COSINE_T_MULT)
 
-
-    mortality_model = train_model(mortality_model, train_graph, val_graph, criterion_mortality,
-                                  optimizer_mortality, scheduler_mortality, "Mortality",
-                                  _EPOCHS, _PATIENCE_EARLY_STOPPING, MORTALITY_MODEL_PATH)
+    mortality_model, best_auroc_mortality = train_model(mortality_model, train_graph, val_graph, criterion_mortality,
+                                                        optimizer_mortality, scheduler_mortality, "Mortality",
+                                                        _EPOCHS, _PATIENCE_EARLY_STOPPING, MORTALITY_MODEL_PATH)
+    if wandb.run:
+        wandb.summary["final_best_auroc_mortality"] = best_auroc_mortality
 
     # --- Train LoS Model ---
     print("\nInitializing LoS Predictor...")
@@ -377,16 +433,35 @@ def main(run_config_from_sweep=None):
     optimizer_los = optim.AdamW(los_model.parameters(), lr=_LEARNING_RATE, weight_decay=_WEIGHT_DECAY)
     scheduler_los = CosineAnnealingWarmRestarts(optimizer_los, T_0=_COSINE_T_0, T_mult=_COSINE_T_MULT)
 
+    los_model, best_rmse_los = train_model(los_model, train_graph, val_graph, criterion_los,
+                                           optimizer_los, scheduler_los, "LoS",
+                                           _EPOCHS, _PATIENCE_EARLY_STOPPING, LOS_MODEL_PATH)
+    if wandb.run:
+        wandb.summary["final_best_rmse_los"] = best_rmse_los
 
-    los_model = train_model(los_model, train_graph, val_graph, criterion_los,
-                            optimizer_los, scheduler_los, "LoS",
-                            _EPOCHS, _PATIENCE_EARLY_STOPPING, LOS_MODEL_PATH)
 
     print("\nTraining finished. Models saved to:")
     print(f"Mortality Model: {MORTALITY_MODEL_PATH}")
     print(f"LoS Model: {LOS_MODEL_PATH}")
 
+    # Obliczanie i logowanie GLscore
     if wandb.run is not None:
+        # Normalizacja RMSE (prosta, można dostosować)
+        # Chcemy, aby wyższy wynik był lepszy, więc dla RMSE (gdzie niższy jest lepszy),
+        # możemy użyć 1 - znormalizowany_rmse.
+        # Normalizacja RMSE do zakresu ~0-1: normalized_rmse = rmse / (C + rmse), gdzie C to stała, np. 1 lub średnie RMSE.
+        # Lub prostsze: exp(-k * rmse)
+        # Dla tej implementacji użyjemy: 1 / (1 + RMSE) jako "wynik" dla LoS, aby był w (0,1] i wyższy był lepszy.
+        if best_rmse_los is not None and best_auroc_mortality is not None:
+            los_score_component = 1 / (1 + best_rmse_los) # Wyższy jest lepszy, zakres (0,1) dla RMSE > 0
+            gl_score = best_auroc_mortality + los_score_component
+
+            wandb.summary["los_score_component"] = los_score_component
+            wandb.summary["GLscore"] = gl_score
+            print(f"GLscore calculated: {gl_score:.4f} (AUROC: {best_auroc_mortality:.4f}, LoS_component: {los_score_component:.4f} from RMSE: {best_rmse_los:.4f})")
+        else:
+            print("Could not calculate GLscore because one or both primary metrics are missing.")
+
         wandb.finish()
 
 
