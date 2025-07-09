@@ -12,6 +12,7 @@ import wandb # Dodano wandb
 import yaml # Do wczytywania konfiguracji sweepa
 import argparse # Do obsługi argumentów linii poleceń dla sweepów
 
+
 from data_utils import load_and_preprocess_data
 from models import MortalityPredictor, LoSPredictor
 
@@ -47,6 +48,7 @@ LOS_MODEL_PATH = 'model_los.pt'
 # Wandb configuration
 WANDB_PROJECT = "ifbme-projekt"
 WANDB_ENTITY = None # Uzupełnij, jeśli używasz teamu w wandb
+
 
 
 # --- Helper Functions ---
@@ -144,6 +146,7 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
                     except Exception as e:
                         print(f"Error preparing wandb plots for Mortality: {e}")
 
+
             elif task_name == "LoS":
                 val_target_log = torch.log1p(val_data.y_los.to(DEVICE))
                 val_loss = criterion(val_out, val_target_log)
@@ -161,12 +164,14 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
                     except Exception as e:
                         print(f"Error preparing wandb plots for LoS: {e}")
 
+
         epoch_duration = time.time() - start_time
         print(f"Epoch {epoch}/{epochs} | Train Loss: {loss.item():.4f} | Val Loss: {val_loss.item():.4f} | Val {metric_name}: {val_metric:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f} | Time: {epoch_duration:.2f}s")
 
         if wandb.run is not None:
             log_metrics_dict = {
                 f"{task_name}/epoch": epoch,
+
                 f"{task_name}/train_loss": loss.item(),
                 f"{task_name}/val_loss": val_loss.item(),
                 f"{task_name}/val_{metric_name.lower()}": val_metric,
@@ -174,6 +179,7 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
                 f"{task_name}/epoch_duration_sec": epoch_duration,
             }
             wandb.log({**log_metrics_dict, **log_plots_dict}, step=epoch)
+
 
         if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step(val_metric if task_name == "Mortality" else val_loss)
@@ -234,6 +240,7 @@ def main(run_config_from_sweep=None):
         # Nazwa dla sweep runa, agent wandb może ją nadpisać
         run_name = f"sweep_run_{wandb.run.id if wandb.run else time.strftime('%Y%m%d-%H%M%S')}"
 
+
     wandb.init(
         project=WANDB_PROJECT,
         entity=WANDB_ENTITY,
@@ -241,6 +248,7 @@ def main(run_config_from_sweep=None):
         name=run_name,
         mode=wandb_mode
     )
+
 
     # Pobierz wartości z wandb.config (które jest kopią current_run_config)
     _LEARNING_RATE = wandb.config.learning_rate
@@ -308,6 +316,7 @@ def main(run_config_from_sweep=None):
     elif _SIGN_PE_K_DIM > 0:
         print(f"WARNING: SIGN_PE_K_DIM is {_SIGN_PE_K_DIM} but no SignPE found in data. SignPE dim for model will be 0.")
 
+
     print("Loading and preprocessing validation data...")
     val_graph, _ = load_and_preprocess_data(
         VAL_CSV, preprocessor=preprocessor, fit_preprocessor=False,
@@ -334,6 +343,7 @@ def main(run_config_from_sweep=None):
             "actual_sign_pe_dim_from_data_for_model": actual_sign_pe_dim # Log what model actually uses
         }, allow_val_change=True)
 
+
     if train_graph.y_mortality is not None:
         num_positive = torch.sum(train_graph.y_mortality == 1)
         num_negative = torch.sum(train_graph.y_mortality == 0)
@@ -346,6 +356,7 @@ def main(run_config_from_sweep=None):
 
     optimizer_mortality = optim.AdamW(mortality_model.parameters(), lr=_LEARNING_RATE, weight_decay=_WEIGHT_DECAY)
     scheduler_mortality = CosineAnnealingWarmRestarts(optimizer_mortality, T_0=_COSINE_T_0, T_mult=_COSINE_T_MULT)
+
 
     mortality_model = train_model(mortality_model, train_graph, val_graph, criterion_mortality,
                                   optimizer_mortality, scheduler_mortality, "Mortality",
@@ -366,6 +377,7 @@ def main(run_config_from_sweep=None):
     optimizer_los = optim.AdamW(los_model.parameters(), lr=_LEARNING_RATE, weight_decay=_WEIGHT_DECAY)
     scheduler_los = CosineAnnealingWarmRestarts(optimizer_los, T_0=_COSINE_T_0, T_mult=_COSINE_T_MULT)
 
+
     los_model = train_model(los_model, train_graph, val_graph, criterion_los,
                             optimizer_los, scheduler_los, "LoS",
                             _EPOCHS, _PATIENCE_EARLY_STOPPING, LOS_MODEL_PATH)
@@ -379,12 +391,14 @@ def main(run_config_from_sweep=None):
 
 
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--sweep_id', type=str, default=None, help='Wandb sweep ID to run an agent for.')
     parser.add_argument('--sweep_config', type=str, default='sweep.yaml', help='Path to the sweep configuration file.')
     parser.add_argument('--project', type=str, default=WANDB_PROJECT, help='Wandb project name.')
     parser.add_argument('--entity', type=str, default=WANDB_ENTITY, help='Wandb entity (user or team).')
     parser.add_argument('--count', type=int, default=None, help='Number of runs for the sweep agent.')
+
     args = parser.parse_args()
 
     if args.sweep_id:
