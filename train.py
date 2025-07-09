@@ -113,7 +113,9 @@ def get_input_dim_from_data(sample_csv_path, lap_pe_k_dim, sign_pe_k_dim):
 
 
 def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
-                task_name, epochs, patience, model_path):
+                task_name, epochs, patience, model_path,
+                # Added config parameters needed within the training loop
+                label_smoothing_factor, clip_grad_norm_value, warmup_epochs_value):
     best_val_metric = -np.inf if task_name == "Mortality" else np.inf
     epochs_no_improve = 0
 
@@ -132,18 +134,9 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
 
         if task_name == "Mortality":
             target = train_data.y_mortality.to(DEVICE)
-            if _LABEL_SMOOTHING > 0.0 and isinstance(criterion, nn.BCEWithLogitsLoss):
-                # Apply label smoothing to targets
-                # For binary classification:
-                # target = 0 becomes 0 + label_smoothing / 2
-                # target = 1 becomes 1 - label_smoothing + label_smoothing / 2 = 1 - label_smoothing / 2
-                # Simplified: target * (1.0 - label_smoothing) + 0.5 * label_smoothing
-                # No, for BCE, it's: y_ls = y_true * (1 - eps) + eps / K where K is num_classes (2 for binary)
-                # So for y=0, y_ls = 0 * (1-eps) + eps/2 = eps/2
-                # For y=1, y_ls = 1 * (1-eps) + eps/2 = 1 - eps + eps/2 = 1 - eps/2
-                # This means (1-target) * eps/2 + target * (1-eps/2)
+            if label_smoothing_factor > 0.0 and isinstance(criterion, nn.BCEWithLogitsLoss):
                 target = target.float() # ensure float
-                target = (1.0 - target) * (_LABEL_SMOOTHING / 2.0) + target * (1.0 - _LABEL_SMOOTHING / 2.0)
+                target = (1.0 - target) * (label_smoothing_factor / 2.0) + target * (1.0 - label_smoothing_factor / 2.0)
 
             loss = criterion(out, target)
         elif task_name == "LoS":
@@ -153,14 +146,18 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
             raise ValueError("Unknown task name")
 
         loss.backward()
-        if _CLIP_GRAD_NORM > 0: # Apply gradient clipping if configured
-            torch.nn.utils.clip_grad_norm_(model.parameters(), _CLIP_GRAD_NORM)
+        if clip_grad_norm_value > 0: # Apply gradient clipping if configured
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm_value)
+
         optimizer.step()
 
-        if scheduler and epoch > WARMUP_EPOCHS:
+        if scheduler and epoch > warmup_epochs_value: # Use passed warmup_epochs_value
             if isinstance(scheduler, CosineAnnealingWarmRestarts):
-                scheduler.step(epoch - WARMUP_EPOCHS)
+                scheduler.step(epoch - warmup_epochs_value) # Use passed warmup_epochs_value
             else:
+                # For other schedulers like ReduceLROnPlateau, they might not need warmup_epochs_value explicitly here
+                # or their step() is called with metric/loss later.
+                # This part of logic remains as is for CosineAnnealingWarmRestarts.
                 pass
 
         model.eval()
@@ -495,9 +492,13 @@ def main(run_config_from_sweep=None):
     optimizer_mortality = optim.AdamW(mortality_model.parameters(), lr=_LEARNING_RATE, weight_decay=_WEIGHT_DECAY)
     scheduler_mortality = CosineAnnealingWarmRestarts(optimizer_mortality, T_0=_COSINE_T_0, T_mult=_COSINE_T_MULT)
 
-    mortality_model, best_auroc_mortality = train_model(mortality_model, train_graph, val_graph, criterion_mortality,
-                                                        optimizer_mortality, scheduler_mortality, "Mortality",
-                                                        _EPOCHS, _PATIENCE_EARLY_STOPPING, MORTALITY_MODEL_PATH)
+    mortality_model, best_auroc_mortality = train_model(
+        model=mortality_model, train_data=train_graph, val_data=val_graph, criterion=criterion_mortality,
+        optimizer=optimizer_mortality, scheduler=scheduler_mortality, task_name="Mortality",
+        epochs=_EPOCHS, patience=_PATIENCE_EARLY_STOPPING, model_path=MORTALITY_MODEL_PATH,
+        label_smoothing_factor=_LABEL_SMOOTHING, clip_grad_norm_value=_CLIP_GRAD_NORM, warmup_epochs_value=_WARMUP_EPOCHS
+    )
+
     if USE_WANDB and wandb.run:
         wandb.summary["final_best_auroc_mortality"] = best_auroc_mortality
 
@@ -517,9 +518,14 @@ def main(run_config_from_sweep=None):
     optimizer_los = optim.AdamW(los_model.parameters(), lr=_LEARNING_RATE, weight_decay=_WEIGHT_DECAY)
     scheduler_los = CosineAnnealingWarmRestarts(optimizer_los, T_0=_COSINE_T_0, T_mult=_COSINE_T_MULT)
 
-    los_model, best_rmse_los = train_model(los_model, train_graph, val_graph, criterion_los,
-                                           optimizer_los, scheduler_los, "LoS",
-                                           _EPOCHS, _PATIENCE_EARLY_STOPPING, LOS_MODEL_PATH)
+    los_model, best_rmse_los = train_model(
+        model=los_model, train_data=train_graph, val_data=val_graph, criterion=criterion_los,
+        optimizer=optimizer_los, scheduler=scheduler_los, task_name="LoS",
+        epochs=_EPOCHS, patience=_PATIENCE_EARLY_STOPPING, model_path=LOS_MODEL_PATH,
+        label_smoothing_factor=0.0, # Label smoothing not typically used for MSE/regression
+        clip_grad_norm_value=_CLIP_GRAD_NORM, warmup_epochs_value=_WARMUP_EPOCHS
+    )
+
     if USE_WANDB and wandb.run:
         wandb.summary["final_best_rmse_los"] = best_rmse_los
 
@@ -551,7 +557,6 @@ def main(run_config_from_sweep=None):
 
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser()
     parser.add_argument('--sweep_id', type=str, default=None, help='Wandb sweep ID to run an agent for.')
     parser.add_argument('--sweep_config', type=str, default='sweep.yaml', help='Path to the sweep configuration file.')
@@ -563,49 +568,42 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=LEARNING_RATE, help=f'Learning rate (default: {LEARNING_RATE})')
     parser.add_argument('--wd', type=float, default=WEIGHT_DECAY, help=f'Weight decay (default: {WEIGHT_DECAY})')
     parser.add_argument('--dropout', type=float, default=DROPOUT_RATE, help=f'Dropout rate (default: {DROPOUT_RATE})')
-    # Note: Batch size is complex for current GNN setup, added as a placeholder in config if needed later.
-    # parser.add_argument('--batch_size', type=int, default=64, help='Batch size (default: 64)')
+
     parser.add_argument('--loss_fn', type=str, default='bce', choices=['bce', 'focal'], help='Loss function for mortality task (bce or focal, default: bce)')
     parser.add_argument('--activation_fn', type=str, default='relu', choices=['relu', 'gelu', 'leaky_relu'], help='Activation function for GNN layers (default: relu)')
     parser.add_argument('--clip_grad_norm', type=float, default=0.0, help='Max norm for gradient clipping (0.0 to disable, default: 0.0)')
     parser.add_argument('--label_smoothing', type=float, default=0.0, help='Label smoothing factor for BCE loss (default: 0.0, no smoothing)')
     parser.add_argument('--no-wandb', action='store_true', help='Disable Weights & Biases logging.')
 
-
     args = parser.parse_args()
 
-    # Declare global USE_WANDB at the beginning of the block if we intend to modify the module-level one.
-    global USE_WANDB
+    # This is the correct place for `global` if we intend to modify the module-level USE_WANDB
+    # However, the script structure is such that main() reads the global USE_WANDB.
+    # We only need to ensure USE_WANDB is set correctly before main() is called.
 
+
+    # Modify the module-level USE_WANDB based on args.no_wandb
     if args.no_wandb:
-        USE_WANDB = False
+        USE_WANDB = False # This modifies the global USE_WANDB
         print("Weights & Biases logging explicitly disabled via --no-wandb flag.")
 
     if args.sweep_id:
-        if not USE_WANDB: # If --no-wandb was set, but a sweep is also requested
+        # If a sweep is requested, W&B is necessary.
+        if not USE_WANDB: # This checks the potentially modified global USE_WANDB
             print("WARNING: --no-wandb was set, but sweep functionality relies on W&B. W&B will be re-enabled for the sweep agent.")
-            USE_WANDB = True # Force enable for sweep agent as it needs W&B
+            USE_WANDB = True # Modify the global USE_WANDB again
+
         print(f"Starting wandb agent for sweep_id: {args.sweep_id}")
 
-
-        # Funkcja `main` oczekuje argumentu `run_config_from_sweep`, ale wandb.agent przekaże config bezpośrednio.
-        # Aby to pogodzić, możemy stworzyć prostą funkcję opakowującą (wrapper),
-        # która przyjmie config od agenta i przekaże go do `main` pod oczekiwaną nazwą.
-        # Jednakże, wandb.agent jest wystarczająco inteligentny, by przekazać config do funkcji,
-        # która go akceptuje jako pierwszy argument lub jako argument nazwany 'config'.
-        # Zmieniono nazwę argumentu w main na `run_config_from_sweep` dla jasności,
-        # ale agent powinien sobie z tym poradzić. Jeśli nie, potrzebny byłby wrapper.
-        # Dla pewności, agent wandb przekazuje config jako kwargs, więc `main` musi akceptować `**kwargs`
-        # lub mieć argument o nazwie `config`. Zmieniam `main` tak, by akceptował `config` jako argument.
-
-        # Re-definiujemy `main_for_sweep` aby pasował do oczekiwań `wandb.agent`
-        # który przekazuje konfigurację jako pojedynczy argument słownikowy.
         def main_for_sweep(config_from_agent=None):
             main(run_config_from_sweep=config_from_agent)
 
-
-        wandb.agent(sweep_id=args.sweep_id, function=main_for_sweep, count=args.count, project=args.project,
-                    entity=args.entity)
+        wandb.agent(sweep_id=args.sweep_id, function=main_for_sweep, count=args.count, project=args.project, entity=args.entity)
     else:
-        print("Starting a single training run (not a sweep agent).")
-        main()  # Wywołanie z config=None, użyje domyślnych wartości
+        # For a single run, USE_WANDB would have been set by --no-wandb if provided.
+        # If not provided, it remains its default True value from module level.
+        if not USE_WANDB:
+            print("Starting a single training run with W&B disabled.")
+        else:
+            print("Starting a single training run (W&B will be used unless it was disabled by --no-wandb).")
+        main()
