@@ -3,3 +3,4 @@ torch_geometric==2.6.1
 pandas
 numpy
 scikit-learn
+wandb
