@@ -23,6 +23,7 @@ class GPSLayer(nn.Module):
             gin_nn = nn.Sequential(nn.Linear(dim_h, dim_h), nn.ReLU(), nn.Linear(dim_h, dim_h))
             self.local_gnn = pyg_nn.GINConv(gin_nn)
         elif local_gnn_type == 'GATConv': # Default for predictors
+
             self.local_gnn = pyg_nn.GATConv(dim_h, dim_h, heads=num_heads, concat=False, dropout=attention_dropout)
         else:
             raise ValueError(f"Unsupported local_gnn_type: {local_gnn_type}")
@@ -32,6 +33,7 @@ class GPSLayer(nn.Module):
 
         self.norm1_local = nn.LayerNorm(dim_h)
         self.norm1_attn = nn.LayerNorm(dim_h) # Changed from norm1_local to norm1_attn
+
         self.dropout_local = nn.Dropout(dropout)
         self.dropout_attn = nn.Dropout(dropout)
 
@@ -65,6 +67,7 @@ class GPSLayer(nn.Module):
         x_ffn_out = self.ffn(x)
         x_ffn_out = self.dropout_ffn(x_ffn_out)
         x = x_res_ffn + x_ffn_out
+
         x = self.norm2(x)
 
         return x
@@ -72,6 +75,7 @@ class GPSLayer(nn.Module):
 class GraphGPS(nn.Module):
     def __init__(self, dim_in, dim_h, dim_out_graph_level, num_layers, num_heads, # dim_out_graph_level for graph-level tasks
                  lap_pe_dim, sign_pe_dim, # These are the dimensions of PE features *provided in the Data object*
+
                  dropout=0.1, local_gnn_type='GCNConv', pool_type='mean'):
         super().__init__()
         self.dim_h = dim_h
@@ -140,6 +144,7 @@ class GraphGPS(nn.Module):
         else:
             # For node-level tasks, derived classes will use these node embeddings
             return x # Node embeddings, shape [num_nodes, dim_h]
+
 
 
 class MortalityPredictor(GraphGPS):
@@ -216,6 +221,7 @@ if __name__ == '__main__':
         lap_pe_dim=LAP_PE_K_DIM if dummy_lap_pe is not None else 0,
         sign_pe_dim=SIGN_PE_K_DIM, # SIGN_PE_K_DIM is 0
         dropout=DROPOUT_RATE
+
     )
     print(f"Mortality model structure:\n{mortality_model}")
     try:
@@ -223,6 +229,7 @@ if __name__ == '__main__':
         print(f"Mortality model output shape: {mortality_output.shape}")
         assert mortality_output.shape == (num_nodes, 1)
         print(f"Mortality model output sample (first 5):\n{mortality_output[:5]}")
+n
     except Exception as e:
         print(f"Error during MortalityPredictor forward pass: {e}")
         import traceback
@@ -235,6 +242,7 @@ if __name__ == '__main__':
         lap_pe_dim=LAP_PE_K_DIM if dummy_lap_pe is not None else 0,
         sign_pe_dim=SIGN_PE_K_DIM,
         dropout=DROPOUT_RATE
+
     )
     print(f"LoS model structure:\n{los_model}")
     try:
@@ -242,6 +250,7 @@ if __name__ == '__main__':
         print(f"LoS model output shape: {los_output.shape}")
         assert los_output.shape == (num_nodes, 1)
         print(f"LoS model output sample (first 5):\n{los_output[:5]}")
+
     except Exception as e:
         print(f"Error during LoSPredictor forward pass: {e}")
         import traceback
