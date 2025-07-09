@@ -1,0 +1,40 @@
+program: train.py
+method: bayes  # Można zmienić na random, grid
+metric:
+  name: "Mortality/val_auroc" # Lub "LoS/val_rmse" - zależnie od głównego celu sweepa
+  goal: maximize # Zmienić na "minimize" dla RMSE
+parameters:
+  learning_rate:
+    distribution: log_uniform_values
+    min: 1e-5
+    max: 1e-2
+  dim_hidden:
+    values: [64, 128, 256]
+  num_gps_layers:
+    values: [2, 3, 4, 5]
+  dropout_rate:
+    distribution: uniform
+    min: 0.1
+    max: 0.5
+  weight_decay:
+    distribution: log_uniform_values
+    min: 1e-6
+    max: 1e-3
+  # --- Można dodać więcej parametrów do przeszukiwania ---
+  # epochs:
+  #   value: 100 # Można też przeszukiwać, ale zwykle ustala się na stałą wartość z early stopping
+  # num_attn_heads:
+  #   values: [2, 4, 8]
+  # cosine_t_0:
+  #   values: [10, 15, 20]
+
+# Dodatkowe ustawienia dla sweepa, jeśli potrzebne
+# early_terminate:
+#   type: hyperband
+#   min_iter: 5 # Minimalna liczba epok przed zatrzymaniem przez early_terminate
+#   # s: 2 # Opcjonalnie, dla hyperband
+
+# Upewnij się, że WANDB_PROJECT i WANDB_ENTITY są ustawione w środowisku lub skrypcie
+# Można też dodać je tutaj:
+# project: ifbme-projekt
+# entity: twoja_nazwa_uzytkownika_lub_teamu
