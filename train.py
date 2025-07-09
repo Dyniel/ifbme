@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve as sk_roc_curve, auc as sk_auc, confusion_matrix as sk_confusion_matrix
 
 
+
 from data_utils import load_and_preprocess_data
 from models import MortalityPredictor, LoSPredictor
 
@@ -54,6 +55,7 @@ WANDB_PROJECT = "ifbme-projekt"
 WANDB_ENTITY = None # Uzupełnij, jeśli używasz teamu w wandb
 
 
+
 # --- Helper Functions ---
 def get_input_dim_from_data(sample_csv_path, lap_pe_k_dim, sign_pe_k_dim):
     """
@@ -72,6 +74,7 @@ def get_input_dim_from_data(sample_csv_path, lap_pe_k_dim, sign_pe_k_dim):
     num_numerical_features = 0
     if 'num' in preprocessor_sample.named_transformers_ and preprocessor_sample.named_transformers_['num'] != 'drop':
         num_numerical_features = len(preprocessor_sample.transformers_[0][2])
+
 
 
     num_onehot_features = 0
@@ -138,6 +141,7 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
                 val_probs_np = torch.sigmoid(val_out).cpu().numpy().flatten() # Spłaszczenie
                 val_target_cpu_np = val_target.cpu().numpy().flatten() # Spłaszczenie
                 val_metric = roc_auc_score(val_target_cpu_np, val_probs_np)
+
                 metric_name = "AUROC"
 
                 if wandb.run is not None:
@@ -192,12 +196,14 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
                     except Exception as e:
                         print(f"Error logging wandb plots for Mortality: {e}")
 
+
             elif task_name == "LoS":
                 val_target_log = torch.log1p(val_data.y_los.to(DEVICE))
                 val_loss = criterion(val_out, val_target_log)
                 val_preds_original_scale_np = torch.expm1(val_out).cpu().numpy().clip(min=0).flatten()
                 val_target_original_scale_np = val_data.y_los.cpu().numpy().flatten()
                 val_metric = np.sqrt(mean_squared_error(val_target_original_scale_np, val_preds_original_scale_np))
+
                 metric_name = "RMSE"
 
                 if wandb.run is not None:
@@ -212,12 +218,14 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
                     except Exception as e:
                         print(f"Error logging wandb plots for LoS: {e}")
 
+
         epoch_duration = time.time() - start_time
         print(f"Epoch {epoch}/{epochs} | Train Loss: {loss.item():.4f} | Val Loss: {val_loss.item():.4f} | Val {metric_name}: {val_metric:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f} | Time: {epoch_duration:.2f}s")
 
         if wandb.run is not None:
             log_metrics_dict = {
                 #f"{task_name}/epoch": epoch, # Już logowane jako step
+
                 f"{task_name}/train_loss": loss.item(),
                 f"{task_name}/val_loss": val_loss.item(),
                 f"{task_name}/val_{metric_name.lower()}": val_metric,
@@ -225,6 +233,7 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
                 f"{task_name}/epoch_duration_sec": epoch_duration,
             }
             wandb.log(log_metrics_dict, step=epoch) # Logowanie metryk numerycznych
+
 
         if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step(val_metric if task_name == "Mortality" else val_loss)
@@ -258,6 +267,7 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
         wandb.summary[f"best_val_{metric_name.lower()}_{task_name.lower()}"] = best_val_metric
     return model, best_val_metric # Zwracamy również najlepszą metrykę
 
+
 # --- Main Training Execution ---
 def main(run_config_from_sweep=None):
     """
@@ -285,6 +295,7 @@ def main(run_config_from_sweep=None):
         # Nazwa dla sweep runa, agent wandb może ją nadpisać
         run_name = f"sweep_run_{wandb.run.id if wandb.run else time.strftime('%Y%m%d-%H%M%S')}"
 
+
     wandb.init(
         project=WANDB_PROJECT,
         entity=WANDB_ENTITY,
@@ -292,6 +303,7 @@ def main(run_config_from_sweep=None):
         name=run_name,
         mode=wandb_mode
     )
+
 
     # Pobierz wartości z wandb.config (które jest kopią current_run_config)
     _LEARNING_RATE = wandb.config.learning_rate
@@ -359,6 +371,7 @@ def main(run_config_from_sweep=None):
     elif _SIGN_PE_K_DIM > 0:
         print(f"WARNING: SIGN_PE_K_DIM is {_SIGN_PE_K_DIM} but no SignPE found in data. SignPE dim for model will be 0.")
 
+
     print("Loading and preprocessing validation data...")
     val_graph, _ = load_and_preprocess_data(
         VAL_CSV, preprocessor=preprocessor, fit_preprocessor=False,
@@ -384,6 +397,7 @@ def main(run_config_from_sweep=None):
             "actual_lap_pe_dim_from_data_for_model": actual_lap_pe_dim, # Log what model actually uses
             "actual_sign_pe_dim_from_data_for_model": actual_sign_pe_dim # Log what model actually uses
         }, allow_val_change=True)
+
 
     if train_graph.y_mortality is not None:
         num_positive = torch.sum(train_graph.y_mortality == 1)
@@ -425,6 +439,7 @@ def main(run_config_from_sweep=None):
     if wandb.run:
         wandb.summary["final_best_rmse_los"] = best_rmse_los
 
+
     print("\nTraining finished. Models saved to:")
     print(f"Mortality Model: {MORTALITY_MODEL_PATH}")
     print(f"LoS Model: {LOS_MODEL_PATH}")
@@ -451,12 +466,14 @@ def main(run_config_from_sweep=None):
 
 
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--sweep_id', type=str, default=None, help='Wandb sweep ID to run an agent for.')
     parser.add_argument('--sweep_config', type=str, default='sweep.yaml', help='Path to the sweep configuration file.')
     parser.add_argument('--project', type=str, default=WANDB_PROJECT, help='Wandb project name.')
     parser.add_argument('--entity', type=str, default=WANDB_ENTITY, help='Wandb entity (user or team).')
     parser.add_argument('--count', type=int, default=None, help='Number of runs for the sweep agent.')
+
     args = parser.parse_args()
 
     if args.sweep_id:
