@@ -3,6 +3,9 @@ import numpy as np
 import torch
 from torch_geometric.data import Data
 from torch_geometric.nn import knn_graph
+from torch_geometric.transforms import AddLaplacianEigenvectorPE
+import torch_geometric.utils as pyg_utils # Added for to_undirected
+
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
@@ -198,6 +201,35 @@ def load_and_preprocess_data(csv_path, preprocessor=None, fit_preprocessor=False
 
     graph_data = Data(x=x, edge_index=edge_index)
 
+    # Add Laplacian Positional Encoding
+    lap_pe_k = 8 # Default k for LapPE, can be parameterized in load_and_preprocess_data if needed
+    # Check if graph_data has nodes and edges before applying transform
+    if graph_data.num_nodes > 0 and graph_data.num_edges > 0 :
+        print(f"Applying AddLaplacianEigenvectorPE with k={lap_pe_k}")
+        # is_undirected needs to be True if the graph is meant to be undirected for PE calculation
+        # PyG's knn_graph by default creates a directed graph (source to target for k-nearest).
+        # For LapPE, an undirected graph's Laplacian is typically used.
+        # We can make it undirected, or use is_undirected=False if the specific PE variant handles directed.
+        # Let's make it undirected for standard LapPE.
+        graph_data.edge_index = pyg_utils.to_undirected(graph_data.edge_index, num_nodes=graph_data.num_nodes)
+
+        lap_pe_transform = AddLaplacianEigenvectorPE(k=lap_pe_k, attr_name='lap_pe', is_undirected=True)
+        try:
+            graph_data = lap_pe_transform(graph_data)
+            print(f"Laplacian PE added. Shape: {graph_data.lap_pe.shape}")
+        except Exception as e:
+            print(f"Could not apply AddLaplacianEigenvectorPE: {e}. Num_nodes: {graph_data.num_nodes}, Num_edges: {graph_data.edge_index.size(1)}")
+            # Fallback: add zero PE if transform fails
+            graph_data.lap_pe = torch.zeros((graph_data.num_nodes, lap_pe_k), dtype=torch.float)
+            print(f"Added zero LapPE as fallback. Shape: {graph_data.lap_pe.shape}")
+    elif graph_data.num_nodes > 0 : # Nodes exist, but no edges from k-NN (e.g. k too small or isolated nodes)
+        print(f"Skipping AddLaplacianEigenvectorPE as num_edges is 0. Adding zero LapPE.")
+        graph_data.lap_pe = torch.zeros((graph_data.num_nodes, lap_pe_k), dtype=torch.float)
+        print(f"Added zero LapPE. Shape: {graph_data.lap_pe.shape}")
+    else: # No nodes
+        print("Skipping AddLaplacianEigenvectorPE as there are no nodes in the graph.")
+
+
     if targets_df is not None:
         print("Adding target variables to graph_data object...")
         if 'outcomeType' in targets_df.columns:
@@ -212,9 +244,9 @@ def load_and_preprocess_data(csv_path, preprocessor=None, fit_preprocessor=False
     print(f"Final graph object: {graph_data}")
     print(f"--- Finished data processing for: {csv_path} ---\n")
 
-    if fit_preprocessor or preprocessor is None and 'fitted_preprocessor' not in locals() : # if new preprocessor was made
+    if fit_preprocessor:
         return graph_data, targets_df, preprocessor
-    else: # if existing preprocessor was used or refitted
+    else:
         return graph_data, targets_df
 
 
