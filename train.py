@@ -19,6 +19,27 @@ from sklearn.metrics import roc_curve as sk_roc_curve, auc as sk_auc, confusion_
 from data_utils import load_and_preprocess_data
 from models import MortalityPredictor, LoSPredictor
 
+# --- Focal Loss Implementation ---
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean', pos_weight=None):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.pos_weight = pos_weight # For compatibility with BCEWithLogitsLoss usage pattern
+
+    def forward(self, inputs, targets):
+        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none', pos_weight=self.pos_weight)
+        pt = torch.exp(-BCE_loss)  # Prevents nans when BCE_loss is large
+        F_loss = self.alpha * (1 - pt)**self.gamma * BCE_loss
+
+        if self.reduction == 'mean':
+            return torch.mean(F_loss)
+        elif self.reduction == 'sum':
+            return torch.sum(F_loss)
+        else:
+            return F_loss
+
 # --- Configuration ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -110,6 +131,19 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
 
         if task_name == "Mortality":
             target = train_data.y_mortality.to(DEVICE)
+            if _LABEL_SMOOTHING > 0.0 and isinstance(criterion, nn.BCEWithLogitsLoss):
+                # Apply label smoothing to targets
+                # For binary classification:
+                # target = 0 becomes 0 + label_smoothing / 2
+                # target = 1 becomes 1 - label_smoothing + label_smoothing / 2 = 1 - label_smoothing / 2
+                # Simplified: target * (1.0 - label_smoothing) + 0.5 * label_smoothing
+                # No, for BCE, it's: y_ls = y_true * (1 - eps) + eps / K where K is num_classes (2 for binary)
+                # So for y=0, y_ls = 0 * (1-eps) + eps/2 = eps/2
+                # For y=1, y_ls = 1 * (1-eps) + eps/2 = 1 - eps + eps/2 = 1 - eps/2
+                # This means (1-target) * eps/2 + target * (1-eps/2)
+                target = target.float() # ensure float
+                target = (1.0 - target) * (_LABEL_SMOOTHING / 2.0) + target * (1.0 - _LABEL_SMOOTHING / 2.0)
+
             loss = criterion(out, target)
         elif task_name == "LoS":
             target = torch.log1p(train_data.y_los.to(DEVICE))
@@ -118,6 +152,8 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
             raise ValueError("Unknown task name")
 
         loss.backward()
+        if _CLIP_GRAD_NORM > 0: # Apply gradient clipping if configured
+            torch.nn.utils.clip_grad_norm_(model.parameters(), _CLIP_GRAD_NORM)
         optimizer.step()
 
         if scheduler and epoch > WARMUP_EPOCHS:
@@ -268,17 +304,28 @@ def main(run_config_from_sweep=None):
         run_config_from_sweep (dict, optional): Słownik konfiguracji z wandb sweep.
     """
     if run_config_from_sweep is None:
-        # Użyj domyślnych wartości, jeśli nie ma configu (np. przy standardowym uruchomieniu)
+        # Use command-line args for manual tuning if provided, otherwise script defaults
+        # This block is for non-sweep runs
         current_run_config = {
-            "learning_rate": LEARNING_RATE, "dim_hidden": DIM_HIDDEN,
-            "num_gps_layers": NUM_GPS_LAYERS, "num_attn_heads": NUM_ATTN_HEADS,
-            "dropout_rate": DROPOUT_RATE, "lap_pe_k_dim": LAP_PE_K_DIM,
-            "sign_pe_k_dim": SIGN_PE_K_DIM, "weight_decay": WEIGHT_DECAY,
-            "epochs": EPOCHS, "patience_early_stopping": PATIENCE_EARLY_STOPPING,
-            "cosine_t_0": COSINE_T_0, "cosine_t_mult": COSINE_T_MULT,
+            "learning_rate": args.lr if hasattr(args, 'lr') else LEARNING_RATE,
+            "dim_hidden": DIM_HIDDEN, # Keep other defaults or make them CLI args too if needed
+            "num_gps_layers": NUM_GPS_LAYERS,
+            "num_attn_heads": NUM_ATTN_HEADS,
+            "dropout_rate": args.dropout if hasattr(args, 'dropout') else DROPOUT_RATE,
+            "lap_pe_k_dim": LAP_PE_K_DIM,
+            "sign_pe_k_dim": SIGN_PE_K_DIM,
+            "weight_decay": args.wd if hasattr(args, 'wd') else WEIGHT_DECAY,
+            "epochs": EPOCHS,
+            "patience_early_stopping": PATIENCE_EARLY_STOPPING,
+            "cosine_t_0": COSINE_T_0,
+            "cosine_t_mult": COSINE_T_MULT,
             "warmup_epochs": WARMUP_EPOCHS,
+            "activation_fn": args.activation_fn if hasattr(args, 'activation_fn') else 'relu',
+            "clip_grad_norm": args.clip_grad_norm if hasattr(args, 'clip_grad_norm') else 0.0,
+            "label_smoothing": args.label_smoothing if hasattr(args, 'label_smoothing') else 0.0,
+            # "batch_size": args.batch_size if hasattr(args, 'batch_size') else 64 # If batch_size CLI arg is added
         }
-        wandb_mode = "online"
+        wandb_mode = "online" # or "disabled" if --no-wandb is also handled here
         # Prosta nazwa dla pojedynczego uruchomienia, wandb doda unikalne ID
         run_name = f"run_{time.strftime('%Y%m%d-%H%M%S')}"
     else:
@@ -309,9 +356,15 @@ def main(run_config_from_sweep=None):
     _COSINE_T_0 = wandb.config.cosine_t_0
     _COSINE_T_MULT = wandb.config.cosine_t_mult
     _WARMUP_EPOCHS = wandb.config.warmup_epochs
+    _BATCH_SIZE_PARAM = wandb.config.get("batch_size", 64) # Default 64, from sweep or defaults
+    _ACTIVATION_FN = wandb.config.get("activation_fn", "relu") # Default relu
+    _CLIP_GRAD_NORM = wandb.config.get("clip_grad_norm", 0.0) # Default 0.0 (disabled)
+    _LABEL_SMOOTHING = wandb.config.get("label_smoothing", 0.0) # Default 0.0
 
     print("Starting main training script execution...")
     print(f"Running with config: {wandb.config}")
+    # Note: _BATCH_SIZE_PARAM is available here but not directly used in the current GNN full-graph processing.
+    # It's made available for future modifications if subgraph batching is implemented.
 
     print("Loading and preprocessing training data for dimension inference and training...")
     train_graph, _, preprocessor = load_and_preprocess_data(
@@ -380,7 +433,8 @@ def main(run_config_from_sweep=None):
     mortality_model = MortalityPredictor(
         dim_in=DIM_IN_FEATURES_FROM_DATA, dim_h=_DIM_HIDDEN, num_layers=_NUM_GPS_LAYERS,
         num_heads=_NUM_ATTN_HEADS, lap_pe_dim=actual_lap_pe_dim,  # Use actual dim from data
-        sign_pe_dim=actual_sign_pe_dim, dropout=_DROPOUT_RATE  # Use actual dim from data
+        sign_pe_dim=actual_sign_pe_dim, dropout=_DROPOUT_RATE,  # Use actual dim from data
+        activation_fn_str=_ACTIVATION_FN
     ).to(DEVICE)
 
     if wandb.run:
@@ -396,10 +450,34 @@ def main(run_config_from_sweep=None):
         num_negative = torch.sum(train_graph.y_mortality == 0)
         pos_weight_value = num_negative / (num_positive + 1e-6)
         print(f"Mortality: Negatives={num_negative}, Positives={num_positive}, Pos_weight={pos_weight_value:.2f}")
-        criterion_mortality = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight_value], device=DEVICE))
+
+        loss_fn_choice = args.loss_fn if hasattr(args, 'loss_fn') else 'bce' # Default to bce if not in args (e.g. during sweep)
+        if loss_fn_choice == 'focal':
+            print("Using FocalLoss for mortality task.")
+            # Alpha can be tuned, common values are 0.25 for positive class if it's rare, or 1-alpha for negative.
+            # Here, pos_weight is also passed for consistency, though alpha also addresses imbalance.
+            criterion_mortality = FocalLoss(alpha=0.25, gamma=2.0, pos_weight=torch.tensor([pos_weight_value], device=DEVICE))
+        else: # Default to BCEWithLogitsLoss
+            print(f"Using BCEWithLogitsLoss for mortality task with label smoothing: {_LABEL_SMOOTHING}")
+            criterion_mortality = nn.BCEWithLogitsLoss(
+                pos_weight=torch.tensor([pos_weight_value], device=DEVICE),
+            )
+            # For label smoothing with BCEWithLogitsLoss, we adjust targets directly if label_smoothing > 0
+            # The loss function itself in PyTorch doesn't have a direct label_smoothing param like nn.CrossEntropyLoss
+            # So, this will be handled during target creation or by a custom wrapper if a more standard way is needed.
+            # For now, we'll note that PyTorch's BCEWithLogitsLoss expects raw logits and hard targets (0 or 1).
+            # True label smoothing requires adjusting target values (e.g., 0 -> eps/N, 1 -> 1 - eps + eps/N).
+            # We will adjust targets if _LABEL_SMOOTHING > 0 before passing to criterion.
+            # This adjustment will be done in the train_model loop.
     else:
-        print("Warning: y_mortality not found in train_graph. Using unweighted BCEWithLogitsLoss.")
-        criterion_mortality = nn.BCEWithLogitsLoss()
+        print("Warning: y_mortality not found in train_graph. Using unweighted loss.")
+        loss_fn_choice = args.loss_fn if hasattr(args, 'loss_fn') else 'bce'
+        if loss_fn_choice == 'focal':
+            criterion_mortality = FocalLoss(alpha=0.25, gamma=2.0)
+        else:
+            print(f"Using BCEWithLogitsLoss (unweighted) with label smoothing: {_LABEL_SMOOTHING if _LABEL_SMOOTHING > 0 else 'N/A'}")
+            criterion_mortality = nn.BCEWithLogitsLoss()
+
 
     optimizer_mortality = optim.AdamW(mortality_model.parameters(), lr=_LEARNING_RATE, weight_decay=_WEIGHT_DECAY)
     scheduler_mortality = CosineAnnealingWarmRestarts(optimizer_mortality, T_0=_COSINE_T_0, T_mult=_COSINE_T_MULT)
@@ -415,7 +493,8 @@ def main(run_config_from_sweep=None):
     los_model = LoSPredictor(
         dim_in=DIM_IN_FEATURES_FROM_DATA, dim_h=_DIM_HIDDEN, num_layers=_NUM_GPS_LAYERS,
         num_heads=_NUM_ATTN_HEADS, lap_pe_dim=actual_lap_pe_dim,  # Use actual dim from data
-        sign_pe_dim=actual_sign_pe_dim, dropout=_DROPOUT_RATE  # Use actual dim from data
+        sign_pe_dim=actual_sign_pe_dim, dropout=_DROPOUT_RATE,  # Use actual dim from data
+        activation_fn_str=_ACTIVATION_FN
     ).to(DEVICE)
 
     if wandb.run:
@@ -465,6 +544,18 @@ if __name__ == "__main__":
     parser.add_argument('--project', type=str, default=WANDB_PROJECT, help='Wandb project name.')
     parser.add_argument('--entity', type=str, default=WANDB_ENTITY, help='Wandb entity (user or team).')
     parser.add_argument('--count', type=int, default=None, help='Number of runs for the sweep agent.')
+
+    # Arguments for manual hyperparameter tuning
+    parser.add_argument('--lr', type=float, default=LEARNING_RATE, help=f'Learning rate (default: {LEARNING_RATE})')
+    parser.add_argument('--wd', type=float, default=WEIGHT_DECAY, help=f'Weight decay (default: {WEIGHT_DECAY})')
+    parser.add_argument('--dropout', type=float, default=DROPOUT_RATE, help=f'Dropout rate (default: {DROPOUT_RATE})')
+    # Note: Batch size is complex for current GNN setup, added as a placeholder in config if needed later.
+    # parser.add_argument('--batch_size', type=int, default=64, help='Batch size (default: 64)')
+    parser.add_argument('--loss_fn', type=str, default='bce', choices=['bce', 'focal'], help='Loss function for mortality task (bce or focal, default: bce)')
+    parser.add_argument('--activation_fn', type=str, default='relu', choices=['relu', 'gelu', 'leaky_relu'], help='Activation function for GNN layers (default: relu)')
+    parser.add_argument('--clip_grad_norm', type=float, default=0.0, help='Max norm for gradient clipping (0.0 to disable, default: 0.0)')
+    parser.add_argument('--label_smoothing', type=float, default=0.0, help='Label smoothing factor for BCE loss (default: 0.0, no smoothing)')
+
 
     args = parser.parse_args()
 
