@@ -113,7 +113,9 @@ def get_input_dim_from_data(sample_csv_path, lap_pe_k_dim, sign_pe_k_dim):
 
 
 def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
-                task_name, epochs, patience, model_path):
+                task_name, epochs, patience, model_path,
+                # Added config parameters needed within the training loop
+                label_smoothing_factor, clip_grad_norm_value, warmup_epochs_value):
     best_val_metric = -np.inf if task_name == "Mortality" else np.inf
     epochs_no_improve = 0
 
@@ -132,19 +134,9 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
 
         if task_name == "Mortality":
             target = train_data.y_mortality.to(DEVICE)
-            if _LABEL_SMOOTHING > 0.0 and isinstance(criterion, nn.BCEWithLogitsLoss):
-                # Apply label smoothing to targets
-                # For binary classification:
-                # target = 0 becomes 0 + label_smoothing / 2
-                # target = 1 becomes 1 - label_smoothing + label_smoothing / 2 = 1 - label_smoothing / 2
-                # Simplified: target * (1.0 - label_smoothing) + 0.5 * label_smoothing
-                # No, for BCE, it's: y_ls = y_true * (1 - eps) + eps / K where K is num_classes (2 for binary)
-                # So for y=0, y_ls = 0 * (1-eps) + eps/2 = eps/2
-                # For y=1, y_ls = 1 * (1-eps) + eps/2 = 1 - eps + eps/2 = 1 - eps/2
-                # This means (1-target) * eps/2 + target * (1-eps/2)
+            if label_smoothing_factor > 0.0 and isinstance(criterion, nn.BCEWithLogitsLoss):
                 target = target.float() # ensure float
-                target = (1.0 - target) * (_LABEL_SMOOTHING / 2.0) + target * (1.0 - _LABEL_SMOOTHING / 2.0)
-
+                target = (1.0 - target) * (label_smoothing_factor / 2.0) + target * (1.0 - label_smoothing_factor / 2.0)
             loss = criterion(out, target)
         elif task_name == "LoS":
             target = torch.log1p(train_data.y_los.to(DEVICE))
@@ -153,14 +145,17 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
             raise ValueError("Unknown task name")
 
         loss.backward()
-        if _CLIP_GRAD_NORM > 0: # Apply gradient clipping if configured
-            torch.nn.utils.clip_grad_norm_(model.parameters(), _CLIP_GRAD_NORM)
+        if clip_grad_norm_value > 0: # Apply gradient clipping if configured
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm_value)
         optimizer.step()
 
-        if scheduler and epoch > WARMUP_EPOCHS:
+        if scheduler and epoch > warmup_epochs_value: # Use passed warmup_epochs_value
             if isinstance(scheduler, CosineAnnealingWarmRestarts):
-                scheduler.step(epoch - WARMUP_EPOCHS)
+                scheduler.step(epoch - warmup_epochs_value) # Use passed warmup_epochs_value
             else:
+                # For other schedulers like ReduceLROnPlateau, they might not need warmup_epochs_value explicitly here
+                # or their step() is called with metric/loss later.
+                # This part of logic remains as is for CosineAnnealingWarmRestarts.
                 pass
 
         model.eval()
@@ -495,9 +490,12 @@ def main(run_config_from_sweep=None):
     optimizer_mortality = optim.AdamW(mortality_model.parameters(), lr=_LEARNING_RATE, weight_decay=_WEIGHT_DECAY)
     scheduler_mortality = CosineAnnealingWarmRestarts(optimizer_mortality, T_0=_COSINE_T_0, T_mult=_COSINE_T_MULT)
 
-    mortality_model, best_auroc_mortality = train_model(mortality_model, train_graph, val_graph, criterion_mortality,
-                                                        optimizer_mortality, scheduler_mortality, "Mortality",
-                                                        _EPOCHS, _PATIENCE_EARLY_STOPPING, MORTALITY_MODEL_PATH)
+    mortality_model, best_auroc_mortality = train_model(
+        model=mortality_model, train_data=train_graph, val_data=val_graph, criterion=criterion_mortality,
+        optimizer=optimizer_mortality, scheduler=scheduler_mortality, task_name="Mortality",
+        epochs=_EPOCHS, patience=_PATIENCE_EARLY_STOPPING, model_path=MORTALITY_MODEL_PATH,
+        label_smoothing_factor=_LABEL_SMOOTHING, clip_grad_norm_value=_CLIP_GRAD_NORM, warmup_epochs_value=_WARMUP_EPOCHS
+    )
     if USE_WANDB and wandb.run:
         wandb.summary["final_best_auroc_mortality"] = best_auroc_mortality
 
@@ -517,9 +515,13 @@ def main(run_config_from_sweep=None):
     optimizer_los = optim.AdamW(los_model.parameters(), lr=_LEARNING_RATE, weight_decay=_WEIGHT_DECAY)
     scheduler_los = CosineAnnealingWarmRestarts(optimizer_los, T_0=_COSINE_T_0, T_mult=_COSINE_T_MULT)
 
-    los_model, best_rmse_los = train_model(los_model, train_graph, val_graph, criterion_los,
-                                           optimizer_los, scheduler_los, "LoS",
-                                           _EPOCHS, _PATIENCE_EARLY_STOPPING, LOS_MODEL_PATH)
+    los_model, best_rmse_los = train_model(
+        model=los_model, train_data=train_graph, val_data=val_graph, criterion=criterion_los,
+        optimizer=optimizer_los, scheduler=scheduler_los, task_name="LoS",
+        epochs=_EPOCHS, patience=_PATIENCE_EARLY_STOPPING, model_path=LOS_MODEL_PATH,
+        label_smoothing_factor=0.0, # Label smoothing not typically used for MSE/regression
+        clip_grad_norm_value=_CLIP_GRAD_NORM, warmup_epochs_value=_WARMUP_EPOCHS
+    )
     if USE_WANDB and wandb.run:
         wandb.summary["final_best_rmse_los"] = best_rmse_los
 
