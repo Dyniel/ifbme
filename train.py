@@ -8,15 +8,13 @@ import numpy as np
 import pandas as pd
 import os
 import time
-import wandb # Dodano wandb
-import yaml # Do wczytywania konfiguracji sweepa
-import argparse # Do obsługi argumentów linii poleceń dla sweepów
+import wandb  # Dodano wandb
+import yaml  # Do wczytywania konfiguracji sweepa
+import argparse  # Do obsługi argumentów linii poleceń dla sweepów
 import io
 from PIL import Image
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve as sk_roc_curve, auc as sk_auc, confusion_matrix as sk_confusion_matrix
-
-
 
 from data_utils import load_and_preprocess_data
 from models import MortalityPredictor, LoSPredictor
@@ -33,14 +31,14 @@ VAL_CSV = 'data/valData.csv'
 DIM_HIDDEN = 128  # Hidden dimension for GraphGPS
 NUM_GPS_LAYERS = 3
 NUM_ATTN_HEADS = 4
-LAP_PE_K_DIM = 8    # Dimension for Laplacian PE (k eigenvectors)
-SIGN_PE_K_DIM = 0   # Dimension for SignNet features (set to 0 if not using/available)
+LAP_PE_K_DIM = 8  # Dimension for Laplacian PE (k eigenvectors)
+SIGN_PE_K_DIM = 0  # Dimension for SignNet features (set to 0 if not using/available)
 DROPOUT_RATE = 0.2
 
 # Training Hyperparameters
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-5
-EPOCHS = 100 # Max epochs, early stopping will likely intervene
+EPOCHS = 100  # Max epochs, early stopping will likely intervene
 PATIENCE_EARLY_STOPPING = 15
 COSINE_T_0 = 10
 COSINE_T_MULT = 2
@@ -52,8 +50,7 @@ LOS_MODEL_PATH = 'model_los.pt'
 
 # Wandb configuration
 WANDB_PROJECT = "ifbme-projekt"
-WANDB_ENTITY = None # Uzupełnij, jeśli używasz teamu w wandb
-
+WANDB_ENTITY = None  # Uzupełnij, jeśli używasz teamu w wandb
 
 
 # --- Helper Functions ---
@@ -75,8 +72,6 @@ def get_input_dim_from_data(sample_csv_path, lap_pe_k_dim, sign_pe_k_dim):
     if 'num' in preprocessor_sample.named_transformers_ and preprocessor_sample.named_transformers_['num'] != 'drop':
         num_numerical_features = len(preprocessor_sample.transformers_[0][2])
 
-
-
     num_onehot_features = 0
     if 'cat' in preprocessor_sample.named_transformers_ and preprocessor_sample.named_transformers_['cat'] != 'drop':
         cat_transformer = preprocessor_sample.named_transformers_['cat']
@@ -84,8 +79,8 @@ def get_input_dim_from_data(sample_csv_path, lap_pe_k_dim, sign_pe_k_dim):
         if hasattr(onehot_encoder, 'get_feature_names_out'):
             try:
                 num_onehot_features = len(onehot_encoder.get_feature_names_out(preprocessor_sample.transformers_[1][2]))
-            except Exception: # Fallback if categorical features were not present in sample
-                 num_onehot_features = 0
+            except Exception:  # Fallback if categorical features were not present in sample
+                num_onehot_features = 0
         elif hasattr(onehot_encoder, 'categories_'):
             for cats in onehot_encoder.categories_:
                 num_onehot_features += len(cats)
@@ -126,22 +121,24 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
         optimizer.step()
 
         if scheduler and epoch > WARMUP_EPOCHS:
-             if isinstance(scheduler, CosineAnnealingWarmRestarts):
+            if isinstance(scheduler, CosineAnnealingWarmRestarts):
                 scheduler.step(epoch - WARMUP_EPOCHS)
-             else:
+            else:
                 pass
 
         model.eval()
         with torch.no_grad():
             val_out = model(val_data.to(DEVICE))
-            log_plots_dict = {}
+
+            # Initialize a dictionary to hold all data for this epoch's wandb.log call
+            log_data_for_epoch = {}
+
             if task_name == "Mortality":
                 val_target = val_data.y_mortality.to(DEVICE)
                 val_loss = criterion(val_out, val_target)
-                val_probs_np = torch.sigmoid(val_out).cpu().numpy().flatten() # Spłaszczenie
-                val_target_cpu_np = val_target.cpu().numpy().flatten() # Spłaszczenie
+                val_probs_np = torch.sigmoid(val_out).cpu().numpy().flatten()  # Spłaszczenie
+                val_target_cpu_np = val_target.cpu().numpy().flatten()  # Spłaszczenie
                 val_metric = roc_auc_score(val_target_cpu_np, val_probs_np)
-
                 metric_name = "AUROC"
 
                 if wandb.run is not None:
@@ -158,12 +155,11 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
                         plt.ylabel('True Positive Rate')
                         plt.title(f'Receiver Operating Characteristic - {task_name}')
                         plt.legend(loc="lower right")
-
                         buf_roc = io.BytesIO()
                         plt.savefig(buf_roc, format='png')
                         buf_roc.seek(0)
                         roc_image = Image.open(buf_roc)
-                        wandb.log({f"{task_name}/roc_curve_image": wandb.Image(roc_image)}, step=epoch)
+                        log_data_for_epoch[f"{task_name}/roc_curve_image"] = wandb.Image(roc_image)
                         plt.close()
                         buf_roc.close()
 
@@ -183,19 +179,17 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
                         plt.title(f'Confusion Matrix - {task_name}')
                         for i in range(cm.shape[0]):
                             for j in range(cm.shape[1]):
-                                ax_cm.text(j, i, str(cm[i, j]), va='center', ha='center', color='black' if cm[i,j] < cm.max()/2 else 'white')
-
+                                ax_cm.text(j, i, str(cm[i, j]), va='center', ha='center',
+                                           color='black' if cm[i, j] < cm.max() / 2 else 'white')
                         buf_cm = io.BytesIO()
                         plt.savefig(buf_cm, format='png')
                         buf_cm.seek(0)
                         cm_image = Image.open(buf_cm)
-                        wandb.log({f"{task_name}/confusion_matrix_image": wandb.Image(cm_image)}, step=epoch)
+                        log_data_for_epoch[f"{task_name}/confusion_matrix_image"] = wandb.Image(cm_image)
                         plt.close(fig_cm)
                         buf_cm.close()
-
                     except Exception as e:
-                        print(f"Error logging wandb plots for Mortality: {e}")
-
+                        print(f"Error preparing wandb plots for Mortality: {e}")
 
             elif task_name == "LoS":
                 val_target_log = torch.log1p(val_data.y_los.to(DEVICE))
@@ -203,37 +197,35 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
                 val_preds_original_scale_np = torch.expm1(val_out).cpu().numpy().clip(min=0).flatten()
                 val_target_original_scale_np = val_data.y_los.cpu().numpy().flatten()
                 val_metric = np.sqrt(mean_squared_error(val_target_original_scale_np, val_preds_original_scale_np))
-
                 metric_name = "RMSE"
 
                 if wandb.run is not None:
                     try:
-                        # Konwersja na listy Pythona dla tabeli scatter
-                        data_scatter_list = [[float(true_val), float(pred_val)] for true_val, pred_val in zip(val_target_original_scale_np, val_preds_original_scale_np)]
+                        data_scatter_list = [[float(true_val), float(pred_val)] for true_val, pred_val in
+                                             zip(val_target_original_scale_np, val_preds_original_scale_np)]
                         table_scatter = wandb.Table(data=data_scatter_list, columns=["Actual LoS", "Predicted LoS"])
-                        # Wykres scatter powinien działać bez problemu, więc go nie zmieniam
-                        wandb.log({f"{task_name}/predictions_scatter": wandb.plot.scatter(
+                        log_data_for_epoch[f"{task_name}/predictions_scatter"] = wandb.plot.scatter(
                             table_scatter, "Actual LoS", "Predicted LoS", title="Actual vs. Predicted LoS"
-                        )}, step=epoch)
+                        )
                     except Exception as e:
-                        print(f"Error logging wandb plots for LoS: {e}")
-
+                        print(f"Error preparing wandb plots for LoS: {e}")
 
         epoch_duration = time.time() - start_time
-        print(f"Epoch {epoch}/{epochs} | Train Loss: {loss.item():.4f} | Val Loss: {val_loss.item():.4f} | Val {metric_name}: {val_metric:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f} | Time: {epoch_duration:.2f}s")
+        print(
+            f"Epoch {epoch}/{epochs} | Train Loss: {loss.item():.4f} | Val Loss: {val_loss.item():.4f} | Val {metric_name}: {val_metric:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f} | Time: {epoch_duration:.2f}s")
 
         if wandb.run is not None:
-            log_metrics_dict = {
-                #f"{task_name}/epoch": epoch, # Już logowane jako step
-
+            # Add scalar metrics to the dictionary
+            log_data_for_epoch.update({
                 f"{task_name}/train_loss": loss.item(),
                 f"{task_name}/val_loss": val_loss.item(),
                 f"{task_name}/val_{metric_name.lower()}": val_metric,
                 f"{task_name}/learning_rate": optimizer.param_groups[0]['lr'],
                 f"{task_name}/epoch_duration_sec": epoch_duration,
-            }
-            wandb.log(log_metrics_dict, step=epoch) # Logowanie metryk numerycznych
-
+            })
+            # Single log call for the epoch
+            if log_data_for_epoch:  # Ensure there's something to log
+                wandb.log(log_data_for_epoch, step=epoch)
 
         if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step(val_metric if task_name == "Mortality" else val_loss)
@@ -265,7 +257,7 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
     if wandb.run is not None:
         wandb.save(model_path)
         wandb.summary[f"best_val_{metric_name.lower()}_{task_name.lower()}"] = best_val_metric
-    return model, best_val_metric # Zwracamy również najlepszą metrykę
+    return model, best_val_metric  # Zwracamy również najlepszą metrykę
 
 
 # --- Main Training Execution ---
@@ -291,19 +283,17 @@ def main(run_config_from_sweep=None):
         run_name = f"run_{time.strftime('%Y%m%d-%H%M%S')}"
     else:
         current_run_config = run_config_from_sweep
-        wandb_mode = "online" # W trybie sweep wandb jest zawsze online
+        wandb_mode = "online"  # W trybie sweep wandb jest zawsze online
         # Nazwa dla sweep runa, agent wandb może ją nadpisać
         run_name = f"sweep_run_{wandb.run.id if wandb.run else time.strftime('%Y%m%d-%H%M%S')}"
-
 
     wandb.init(
         project=WANDB_PROJECT,
         entity=WANDB_ENTITY,
-        config=current_run_config, # Przekazujemy pełną konfigurację
+        config=current_run_config,  # Przekazujemy pełną konfigurację
         name=run_name,
         mode=wandb_mode
     )
-
 
     # Pobierz wartości z wandb.config (które jest kopią current_run_config)
     _LEARNING_RATE = wandb.config.learning_rate
@@ -341,10 +331,11 @@ def main(run_config_from_sweep=None):
         cat_transformer_fitted = preprocessor.named_transformers_['cat']
         onehot_encoder_fitted = cat_transformer_fitted.named_steps['onehot']
         if hasattr(onehot_encoder_fitted, 'get_feature_names_out'):
-            try: # Handle cases where categorical_features might be empty
-                num_onehot_features_fitted = len(onehot_encoder_fitted.get_feature_names_out(preprocessor.transformers_[1][2]))
+            try:  # Handle cases where categorical_features might be empty
+                num_onehot_features_fitted = len(
+                    onehot_encoder_fitted.get_feature_names_out(preprocessor.transformers_[1][2]))
             except Exception:
-                 num_onehot_features_fitted = 0 # If no cat features were passed to onehot
+                num_onehot_features_fitted = 0  # If no cat features were passed to onehot
         elif hasattr(onehot_encoder_fitted, 'categories_'):
             for cats in onehot_encoder_fitted.categories_:
                 num_onehot_features_fitted += len(cats)
@@ -357,7 +348,8 @@ def main(run_config_from_sweep=None):
         actual_lap_pe_dim = train_graph.lap_pe.shape[1]
         print(f"LapPE found in data with dimension: {actual_lap_pe_dim}")
         if actual_lap_pe_dim != _LAP_PE_K_DIM:
-            print(f"WARNING: Configured LAP_PE_K_DIM ({_LAP_PE_K_DIM}) differs from actual LapPE dim in data ({actual_lap_pe_dim}). Using actual: {actual_lap_pe_dim} for model init.")
+            print(
+                f"WARNING: Configured LAP_PE_K_DIM ({_LAP_PE_K_DIM}) differs from actual LapPE dim in data ({actual_lap_pe_dim}). Using actual: {actual_lap_pe_dim} for model init.")
             # Model should use actual_lap_pe_dim; wandb.config logs the intended _LAP_PE_K_DIM
     else:
         print("No LapPE found in data. LapPE dim for model will be 0.")
@@ -367,10 +359,11 @@ def main(run_config_from_sweep=None):
         actual_sign_pe_dim = train_graph.sign_pe.shape[1]
         print(f"SignPE found in data with dimension: {actual_sign_pe_dim}")
         if actual_sign_pe_dim != _SIGN_PE_K_DIM:
-             print(f"WARNING: Configured SIGN_PE_K_DIM ({_SIGN_PE_K_DIM}) differs from actual SignPE dim in data ({actual_sign_pe_dim}). Using actual: {actual_sign_pe_dim} for model init.")
+            print(
+                f"WARNING: Configured SIGN_PE_K_DIM ({_SIGN_PE_K_DIM}) differs from actual SignPE dim in data ({actual_sign_pe_dim}). Using actual: {actual_sign_pe_dim} for model init.")
     elif _SIGN_PE_K_DIM > 0:
-        print(f"WARNING: SIGN_PE_K_DIM is {_SIGN_PE_K_DIM} but no SignPE found in data. SignPE dim for model will be 0.")
-
+        print(
+            f"WARNING: SIGN_PE_K_DIM is {_SIGN_PE_K_DIM} but no SignPE found in data. SignPE dim for model will be 0.")
 
     print("Loading and preprocessing validation data...")
     val_graph, _ = load_and_preprocess_data(
@@ -386,18 +379,17 @@ def main(run_config_from_sweep=None):
     print("\nInitializing Mortality Predictor...")
     mortality_model = MortalityPredictor(
         dim_in=DIM_IN_FEATURES_FROM_DATA, dim_h=_DIM_HIDDEN, num_layers=_NUM_GPS_LAYERS,
-        num_heads=_NUM_ATTN_HEADS, lap_pe_dim=actual_lap_pe_dim, # Use actual dim from data
-        sign_pe_dim=actual_sign_pe_dim, dropout=_DROPOUT_RATE # Use actual dim from data
+        num_heads=_NUM_ATTN_HEADS, lap_pe_dim=actual_lap_pe_dim,  # Use actual dim from data
+        sign_pe_dim=actual_sign_pe_dim, dropout=_DROPOUT_RATE  # Use actual dim from data
     ).to(DEVICE)
 
     if wandb.run:
         wandb.config.update({
             "mortality_model_architecture": str(mortality_model),
             "input_features_dim_from_data": DIM_IN_FEATURES_FROM_DATA,
-            "actual_lap_pe_dim_from_data_for_model": actual_lap_pe_dim, # Log what model actually uses
-            "actual_sign_pe_dim_from_data_for_model": actual_sign_pe_dim # Log what model actually uses
+            "actual_lap_pe_dim_from_data_for_model": actual_lap_pe_dim,  # Log what model actually uses
+            "actual_sign_pe_dim_from_data_for_model": actual_sign_pe_dim  # Log what model actually uses
         }, allow_val_change=True)
-
 
     if train_graph.y_mortality is not None:
         num_positive = torch.sum(train_graph.y_mortality == 1)
@@ -422,8 +414,8 @@ def main(run_config_from_sweep=None):
     print("\nInitializing LoS Predictor...")
     los_model = LoSPredictor(
         dim_in=DIM_IN_FEATURES_FROM_DATA, dim_h=_DIM_HIDDEN, num_layers=_NUM_GPS_LAYERS,
-        num_heads=_NUM_ATTN_HEADS, lap_pe_dim=actual_lap_pe_dim, # Use actual dim from data
-        sign_pe_dim=actual_sign_pe_dim, dropout=_DROPOUT_RATE # Use actual dim from data
+        num_heads=_NUM_ATTN_HEADS, lap_pe_dim=actual_lap_pe_dim,  # Use actual dim from data
+        sign_pe_dim=actual_sign_pe_dim, dropout=_DROPOUT_RATE  # Use actual dim from data
     ).to(DEVICE)
 
     if wandb.run:
@@ -439,7 +431,6 @@ def main(run_config_from_sweep=None):
     if wandb.run:
         wandb.summary["final_best_rmse_los"] = best_rmse_los
 
-
     print("\nTraining finished. Models saved to:")
     print(f"Mortality Model: {MORTALITY_MODEL_PATH}")
     print(f"LoS Model: {LOS_MODEL_PATH}")
@@ -453,12 +444,13 @@ def main(run_config_from_sweep=None):
         # Lub prostsze: exp(-k * rmse)
         # Dla tej implementacji użyjemy: 1 / (1 + RMSE) jako "wynik" dla LoS, aby był w (0,1] i wyższy był lepszy.
         if best_rmse_los is not None and best_auroc_mortality is not None:
-            los_score_component = 1 / (1 + best_rmse_los) # Wyższy jest lepszy, zakres (0,1) dla RMSE > 0
+            los_score_component = 1 / (1 + best_rmse_los)  # Wyższy jest lepszy, zakres (0,1) dla RMSE > 0
             gl_score = best_auroc_mortality + los_score_component
 
             wandb.summary["los_score_component"] = los_score_component
             wandb.summary["GLscore"] = gl_score
-            print(f"GLscore calculated: {gl_score:.4f} (AUROC: {best_auroc_mortality:.4f}, LoS_component: {los_score_component:.4f} from RMSE: {best_rmse_los:.4f})")
+            print(
+                f"GLscore calculated: {gl_score:.4f} (AUROC: {best_auroc_mortality:.4f}, LoS_component: {los_score_component:.4f} from RMSE: {best_rmse_los:.4f})")
         else:
             print("Could not calculate GLscore because one or both primary metrics are missing.")
 
@@ -478,6 +470,8 @@ if __name__ == "__main__":
 
     if args.sweep_id:
         print(f"Starting wandb agent for sweep_id: {args.sweep_id}")
+
+
         # Funkcja `main` oczekuje argumentu `run_config_from_sweep`, ale wandb.agent przekaże config bezpośrednio.
         # Aby to pogodzić, możemy stworzyć prostą funkcję opakowującą (wrapper),
         # która przyjmie config od agenta i przekaże go do `main` pod oczekiwaną nazwą.
@@ -493,7 +487,9 @@ if __name__ == "__main__":
         def main_for_sweep(config_from_agent=None):
             main(run_config_from_sweep=config_from_agent)
 
-        wandb.agent(sweep_id=args.sweep_id, function=main_for_sweep, count=args.count, project=args.project, entity=args.entity)
+
+        wandb.agent(sweep_id=args.sweep_id, function=main_for_sweep, count=args.count, project=args.project,
+                    entity=args.entity)
     else:
         print("Starting a single training run (not a sweep agent).")
-        main() # Wywołanie z config=None, użyje domyślnych wartości
+        main()  # Wywołanie z config=None, użyje domyślnych wartości
