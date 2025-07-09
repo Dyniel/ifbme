@@ -1,14 +1,14 @@
 program: train.py
 
-method: bayes          # albo "random", "grid"
+method: bayes
 metric:
   name: "Mortality/val_auroc"
   goal: maximize
 
 parameters:
   learning_rate:
-    distribution: log_uniform_values    # zakres rzeczywisty, logarytmiczny
-    min: !!float 1e-5                   # YAML wymaga explicite float przy notacji naukowej :contentReference[oaicite:0]{index=0}
+    distribution: log_uniform_values
+    min: !!float 1e-5
     max: !!float 1e-2
 
   dim_hidden:
@@ -26,3 +26,8 @@ parameters:
     distribution: log_uniform_values
     min: !!float 1e-6
     max: !!float 1e-3
+
+command:
+  - "C:\\Program Files\\ifbme\\.venv\\Scripts\\python.exe"
+  - ${program}  # To odniesie się do wartości 'program: train.py' zdefiniowanej wyżej
+  - ${args}     # To przekaże wszystkie hiperparametry z sekcji 'parameters'
