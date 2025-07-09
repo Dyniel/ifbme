@@ -11,10 +11,19 @@ class GPSLayer(nn.Module):
     a local Transformer-style attention (e.g., MHA on nodes), and positional encodings.
     This is a simplified placeholder. A full GRIT/SAN implementation would be more complex.
     """
-    def __init__(self, dim_h, num_heads=4, dropout=0.1, attention_dropout=0.1, local_gnn_type='GCNConv'):
+    def __init__(self, dim_h, num_heads=4, dropout=0.1, attention_dropout=0.1, local_gnn_type='GCNConv', activation_fn_str='relu'):
         super().__init__()
         self.dim_h = dim_h
         self.num_heads = num_heads
+
+        if activation_fn_str == 'relu':
+            self.activation_fn = nn.ReLU()
+        elif activation_fn_str == 'gelu':
+            self.activation_fn = nn.GELU()
+        elif activation_fn_str == 'leaky_relu':
+            self.activation_fn = nn.LeakyReLU()
+        else:
+            raise ValueError(f"Unsupported activation_fn_str: {activation_fn_str}")
 
         # Local GNN part (Message Passing)
         if local_gnn_type == 'GCNConv':
@@ -39,7 +48,7 @@ class GPSLayer(nn.Module):
 
         self.ffn = nn.Sequential(
             nn.Linear(dim_h, dim_h * 2),
-            nn.ReLU(),
+            self.activation_fn, # Use the chosen activation function
             nn.Dropout(dropout),
             nn.Linear(dim_h * 2, dim_h)
         )
@@ -75,7 +84,7 @@ class GPSLayer(nn.Module):
 class GraphGPS(nn.Module):
     def __init__(self, dim_in, dim_h, dim_out_graph_level, num_layers, num_heads, # dim_out_graph_level for graph-level tasks
                  lap_pe_dim, sign_pe_dim, # These are the dimensions of PE features *provided in the Data object*
-
+                 activation_fn_str='relu', # Added activation function string
                  dropout=0.1, local_gnn_type='GCNConv', pool_type='mean'):
         super().__init__()
         self.dim_h = dim_h
@@ -93,7 +102,7 @@ class GraphGPS(nn.Module):
 
         self.gps_layers = nn.ModuleList()
         for _ in range(num_layers):
-            self.gps_layers.append(GPSLayer(dim_h, num_heads, dropout, dropout, local_gnn_type))
+            self.gps_layers.append(GPSLayer(dim_h, num_heads, dropout, dropout, local_gnn_type, activation_fn_str=activation_fn_str))
 
         self.pool_type = pool_type
         if self.pool_type: # Only define pool and graph-level head if pooling is specified
@@ -148,11 +157,12 @@ class GraphGPS(nn.Module):
 
 
 class MortalityPredictor(GraphGPS):
-    def __init__(self, dim_in, dim_h, num_layers, num_heads, lap_pe_dim, sign_pe_dim, dropout=0.1):
+    def __init__(self, dim_in, dim_h, num_layers, num_heads, lap_pe_dim, sign_pe_dim, dropout=0.1, activation_fn_str='relu'):
         # dim_out_graph_level for GraphGPS base is not used as pool_type is None
         super().__init__(dim_in=dim_in, dim_h=dim_h, dim_out_graph_level=1,
                          num_layers=num_layers, num_heads=num_heads,
                          lap_pe_dim=lap_pe_dim, sign_pe_dim=sign_pe_dim,
+                         activation_fn_str=activation_fn_str, # Pass activation
                          dropout=dropout, local_gnn_type='GATConv', pool_type=None) # No global pooling
         self.node_level_output_head = nn.Linear(dim_h, 1) # Specific head for this task
 
@@ -162,10 +172,11 @@ class MortalityPredictor(GraphGPS):
         return out
 
 class LoSPredictor(GraphGPS):
-    def __init__(self, dim_in, dim_h, num_layers, num_heads, lap_pe_dim, sign_pe_dim, dropout=0.1):
+    def __init__(self, dim_in, dim_h, num_layers, num_heads, lap_pe_dim, sign_pe_dim, dropout=0.1, activation_fn_str='relu'):
         super().__init__(dim_in=dim_in, dim_h=dim_h, dim_out_graph_level=1,
                          num_layers=num_layers, num_heads=num_heads,
                          lap_pe_dim=lap_pe_dim, sign_pe_dim=sign_pe_dim,
+                         activation_fn_str=activation_fn_str, # Pass activation
                          dropout=dropout, local_gnn_type='GATConv', pool_type=None) # No global pooling
         self.node_level_output_head = nn.Linear(dim_h, 1) # Specific head for this task
 

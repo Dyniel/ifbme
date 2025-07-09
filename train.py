@@ -19,6 +19,27 @@ from sklearn.metrics import roc_curve as sk_roc_curve, auc as sk_auc, confusion_
 from data_utils import load_and_preprocess_data
 from models import MortalityPredictor, LoSPredictor
 
+# --- Focal Loss Implementation ---
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean', pos_weight=None):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.pos_weight = pos_weight # For compatibility with BCEWithLogitsLoss usage pattern
+
+    def forward(self, inputs, targets):
+        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none', pos_weight=self.pos_weight)
+        pt = torch.exp(-BCE_loss)  # Prevents nans when BCE_loss is large
+        F_loss = self.alpha * (1 - pt)**self.gamma * BCE_loss
+
+        if self.reduction == 'mean':
+            return torch.mean(F_loss)
+        elif self.reduction == 'sum':
+            return torch.sum(F_loss)
+        else:
+            return F_loss
+
 # --- Configuration ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -51,6 +72,7 @@ LOS_MODEL_PATH = 'model_los.pt'
 # Wandb configuration
 WANDB_PROJECT = "ifbme-projekt"
 WANDB_ENTITY = None  # Uzupełnij, jeśli używasz teamu w wandb
+USE_WANDB = True # Default to using wandb, can be overridden by CLI
 
 
 # --- Helper Functions ---
@@ -110,6 +132,19 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
 
         if task_name == "Mortality":
             target = train_data.y_mortality.to(DEVICE)
+            if _LABEL_SMOOTHING > 0.0 and isinstance(criterion, nn.BCEWithLogitsLoss):
+                # Apply label smoothing to targets
+                # For binary classification:
+                # target = 0 becomes 0 + label_smoothing / 2
+                # target = 1 becomes 1 - label_smoothing + label_smoothing / 2 = 1 - label_smoothing / 2
+                # Simplified: target * (1.0 - label_smoothing) + 0.5 * label_smoothing
+                # No, for BCE, it's: y_ls = y_true * (1 - eps) + eps / K where K is num_classes (2 for binary)
+                # So for y=0, y_ls = 0 * (1-eps) + eps/2 = eps/2
+                # For y=1, y_ls = 1 * (1-eps) + eps/2 = 1 - eps + eps/2 = 1 - eps/2
+                # This means (1-target) * eps/2 + target * (1-eps/2)
+                target = target.float() # ensure float
+                target = (1.0 - target) * (_LABEL_SMOOTHING / 2.0) + target * (1.0 - _LABEL_SMOOTHING / 2.0)
+
             loss = criterion(out, target)
         elif task_name == "LoS":
             target = torch.log1p(train_data.y_los.to(DEVICE))
@@ -118,6 +153,8 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
             raise ValueError("Unknown task name")
 
         loss.backward()
+        if _CLIP_GRAD_NORM > 0: # Apply gradient clipping if configured
+            torch.nn.utils.clip_grad_norm_(model.parameters(), _CLIP_GRAD_NORM)
         optimizer.step()
 
         if scheduler and epoch > WARMUP_EPOCHS:
@@ -141,7 +178,7 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
                 val_metric = roc_auc_score(val_target_cpu_np, val_probs_np)
                 metric_name = "AUROC"
 
-                if wandb.run is not None:
+                if USE_WANDB and wandb.run is not None:
                     try:
                         # --- Ręczne generowanie krzywej ROC ---
                         fpr, tpr, _ = sk_roc_curve(val_target_cpu_np, val_probs_np)
@@ -199,7 +236,7 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
                 val_metric = np.sqrt(mean_squared_error(val_target_original_scale_np, val_preds_original_scale_np))
                 metric_name = "RMSE"
 
-                if wandb.run is not None:
+                if USE_WANDB and wandb.run is not None:
                     try:
                         data_scatter_list = [[float(true_val), float(pred_val)] for true_val, pred_val in
                                              zip(val_target_original_scale_np, val_preds_original_scale_np)]
@@ -214,7 +251,7 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
         print(
             f"Epoch {epoch}/{epochs} | Train Loss: {loss.item():.4f} | Val Loss: {val_loss.item():.4f} | Val {metric_name}: {val_metric:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f} | Time: {epoch_duration:.2f}s")
 
-        if wandb.run is not None:
+        if USE_WANDB and wandb.run is not None:
             # Add scalar metrics to the dictionary
             log_data_for_epoch.update({
                 f"{task_name}/train_loss": loss.item(),
@@ -254,7 +291,7 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
     print(f"Finished training for {task_name}. Best Val {metric_name}: {best_val_metric:.4f}")
     model.load_state_dict(torch.load(model_path))
 
-    if wandb.run is not None:
+    if USE_WANDB and wandb.run is not None:
         wandb.save(model_path)
         wandb.summary[f"best_val_{metric_name.lower()}_{task_name.lower()}"] = best_val_metric
     return model, best_val_metric  # Zwracamy również najlepszą metrykę
@@ -268,50 +305,79 @@ def main(run_config_from_sweep=None):
         run_config_from_sweep (dict, optional): Słownik konfiguracji z wandb sweep.
     """
     if run_config_from_sweep is None:
-        # Użyj domyślnych wartości, jeśli nie ma configu (np. przy standardowym uruchomieniu)
+        # Use command-line args for manual tuning if provided, otherwise script defaults
+        # This block is for non-sweep runs
         current_run_config = {
-            "learning_rate": LEARNING_RATE, "dim_hidden": DIM_HIDDEN,
-            "num_gps_layers": NUM_GPS_LAYERS, "num_attn_heads": NUM_ATTN_HEADS,
-            "dropout_rate": DROPOUT_RATE, "lap_pe_k_dim": LAP_PE_K_DIM,
-            "sign_pe_k_dim": SIGN_PE_K_DIM, "weight_decay": WEIGHT_DECAY,
-            "epochs": EPOCHS, "patience_early_stopping": PATIENCE_EARLY_STOPPING,
-            "cosine_t_0": COSINE_T_0, "cosine_t_mult": COSINE_T_MULT,
+            "learning_rate": args.lr if hasattr(args, 'lr') else LEARNING_RATE,
+            "dim_hidden": DIM_HIDDEN, # Keep other defaults or make them CLI args too if needed
+            "num_gps_layers": NUM_GPS_LAYERS,
+            "num_attn_heads": NUM_ATTN_HEADS,
+            "dropout_rate": args.dropout if hasattr(args, 'dropout') else DROPOUT_RATE,
+            "lap_pe_k_dim": LAP_PE_K_DIM,
+            "sign_pe_k_dim": SIGN_PE_K_DIM,
+            "weight_decay": args.wd if hasattr(args, 'wd') else WEIGHT_DECAY,
+            "epochs": EPOCHS,
+            "patience_early_stopping": PATIENCE_EARLY_STOPPING,
+            "cosine_t_0": COSINE_T_0,
+            "cosine_t_mult": COSINE_T_MULT,
             "warmup_epochs": WARMUP_EPOCHS,
+            "activation_fn": args.activation_fn if hasattr(args, 'activation_fn') else 'relu',
+            "clip_grad_norm": args.clip_grad_norm if hasattr(args, 'clip_grad_norm') else 0.0,
+            "label_smoothing": args.label_smoothing if hasattr(args, 'label_smoothing') else 0.0,
+            # "batch_size": args.batch_size if hasattr(args, 'batch_size') else 64 # If batch_size CLI arg is added
         }
-        wandb_mode = "online"
+        wandb_mode = "online" # or "disabled" if --no-wandb is also handled here
         # Prosta nazwa dla pojedynczego uruchomienia, wandb doda unikalne ID
         run_name = f"run_{time.strftime('%Y%m%d-%H%M%S')}"
-    else:
+        wandb_mode = "disabled" if not USE_WANDB else "online"
+    else: # This is a sweep run
         current_run_config = run_config_from_sweep
-        wandb_mode = "online"  # W trybie sweep wandb jest zawsze online
-        # Nazwa dla sweep runa, agent wandb może ją nadpisać
-        run_name = f"sweep_run_{wandb.run.id if wandb.run else time.strftime('%Y%m%d-%H%M%S')}"
+        wandb_mode = "online"  # Sweep agent always uses wandb online
+        run_name = f"sweep_run_{wandb.run.id if wandb.run else time.strftime('%Y%m%d-%H%M%S')}" # wandb.run should exist for agent
 
-    wandb.init(
-        project=WANDB_PROJECT,
-        entity=WANDB_ENTITY,
-        config=current_run_config,  # Przekazujemy pełną konfigurację
-        name=run_name,
-        mode=wandb_mode
-    )
+    effective_config = current_run_config
 
-    # Pobierz wartości z wandb.config (które jest kopią current_run_config)
-    _LEARNING_RATE = wandb.config.learning_rate
-    _DIM_HIDDEN = wandb.config.dim_hidden
-    _NUM_GPS_LAYERS = wandb.config.num_gps_layers
-    _NUM_ATTN_HEADS = wandb.config.num_attn_heads
-    _DROPOUT_RATE = wandb.config.dropout_rate
-    _LAP_PE_K_DIM = wandb.config.lap_pe_k_dim
-    _SIGN_PE_K_DIM = wandb.config.sign_pe_k_dim
-    _WEIGHT_DECAY = wandb.config.weight_decay
-    _EPOCHS = wandb.config.epochs
-    _PATIENCE_EARLY_STOPPING = wandb.config.patience_early_stopping
-    _COSINE_T_0 = wandb.config.cosine_t_0
-    _COSINE_T_MULT = wandb.config.cosine_t_mult
-    _WARMUP_EPOCHS = wandb.config.warmup_epochs
+    if USE_WANDB:
+        if wandb.run is None: # Only init if not already initialized by agent
+            wandb.init(
+                project=WANDB_PROJECT,
+                entity=WANDB_ENTITY,
+                config=current_run_config,  # Pass current_run_config, wandb makes a copy
+                name=run_name,
+                mode=wandb_mode # This will be 'online' for sweeps or default runs, 'disabled' if --no-wandb
+            )
+        # If wandb.init was called (either here or by agent), wandb.config will be populated
+        # For sweep runs, wandb.config is the source of truth provided by the controller.
+        # For single runs, wandb.config is a copy of current_run_config.
+        if wandb.run: # Check if init was successful or if run is active
+             effective_config = wandb.config # Use wandb's config as the primary source
+    else:
+        print("Weights & Biases is disabled. Using local configuration.")
+        # effective_config is already current_run_config
+
+    # Pobierz wartości z effective_config, using .get() for safety, especially for optional params
+    _LEARNING_RATE = effective_config.get("learning_rate", LEARNING_RATE)
+    _DIM_HIDDEN = effective_config.get("dim_hidden", DIM_HIDDEN)
+    _NUM_GPS_LAYERS = effective_config.get("num_gps_layers", NUM_GPS_LAYERS)
+    _NUM_ATTN_HEADS = effective_config.get("num_attn_heads", NUM_ATTN_HEADS)
+    _DROPOUT_RATE = effective_config.get("dropout_rate", DROPOUT_RATE)
+    _LAP_PE_K_DIM = effective_config.get("lap_pe_k_dim", LAP_PE_K_DIM)
+    _SIGN_PE_K_DIM = effective_config.get("sign_pe_k_dim", SIGN_PE_K_DIM)
+    _WEIGHT_DECAY = effective_config.get("weight_decay", WEIGHT_DECAY)
+    _EPOCHS = effective_config.get("epochs", EPOCHS)
+    _PATIENCE_EARLY_STOPPING = effective_config.get("patience_early_stopping", PATIENCE_EARLY_STOPPING)
+    _COSINE_T_0 = effective_config.get("cosine_t_0", COSINE_T_0)
+    _COSINE_T_MULT = effective_config.get("cosine_t_mult", COSINE_T_MULT)
+    _WARMUP_EPOCHS = effective_config.get("warmup_epochs", WARMUP_EPOCHS)
+    _BATCH_SIZE_PARAM = effective_config.get("batch_size", 64)
+    _ACTIVATION_FN = effective_config.get("activation_fn", "relu")
+    _CLIP_GRAD_NORM = effective_config.get("clip_grad_norm", 0.0)
+    _LABEL_SMOOTHING = effective_config.get("label_smoothing", 0.0)
 
     print("Starting main training script execution...")
-    print(f"Running with config: {wandb.config}")
+    print(f"Running with effective_config: {effective_config}")
+    # Note: _BATCH_SIZE_PARAM is available here but not directly used in the current GNN full-graph processing.
+    # It's made available for future modifications if subgraph batching is implemented.
 
     print("Loading and preprocessing training data for dimension inference and training...")
     train_graph, _, preprocessor = load_and_preprocess_data(
@@ -319,7 +385,7 @@ def main(run_config_from_sweep=None):
     )
     if train_graph is None:
         print("Failed to load training data. Exiting.")
-        if wandb.run: wandb.finish(exit_code=1)
+        if USE_WANDB and wandb.run: wandb.finish(exit_code=1)
         exit()
 
     num_numerical_features_fitted = 0
@@ -372,7 +438,7 @@ def main(run_config_from_sweep=None):
     )
     if val_graph is None:
         print("Failed to load validation data. Exiting.")
-        if wandb.run: wandb.finish(exit_code=1)
+        if USE_WANDB and wandb.run: wandb.finish(exit_code=1)
         exit()
 
     # --- Train Mortality Model ---
@@ -380,10 +446,11 @@ def main(run_config_from_sweep=None):
     mortality_model = MortalityPredictor(
         dim_in=DIM_IN_FEATURES_FROM_DATA, dim_h=_DIM_HIDDEN, num_layers=_NUM_GPS_LAYERS,
         num_heads=_NUM_ATTN_HEADS, lap_pe_dim=actual_lap_pe_dim,  # Use actual dim from data
-        sign_pe_dim=actual_sign_pe_dim, dropout=_DROPOUT_RATE  # Use actual dim from data
+        sign_pe_dim=actual_sign_pe_dim, dropout=_DROPOUT_RATE,  # Use actual dim from data
+        activation_fn_str=_ACTIVATION_FN
     ).to(DEVICE)
 
-    if wandb.run:
+    if USE_WANDB and wandb.run:
         wandb.config.update({
             "mortality_model_architecture": str(mortality_model),
             "input_features_dim_from_data": DIM_IN_FEATURES_FROM_DATA,
@@ -396,10 +463,34 @@ def main(run_config_from_sweep=None):
         num_negative = torch.sum(train_graph.y_mortality == 0)
         pos_weight_value = num_negative / (num_positive + 1e-6)
         print(f"Mortality: Negatives={num_negative}, Positives={num_positive}, Pos_weight={pos_weight_value:.2f}")
-        criterion_mortality = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight_value], device=DEVICE))
+
+        loss_fn_choice = args.loss_fn if hasattr(args, 'loss_fn') else 'bce' # Default to bce if not in args (e.g. during sweep)
+        if loss_fn_choice == 'focal':
+            print("Using FocalLoss for mortality task.")
+            # Alpha can be tuned, common values are 0.25 for positive class if it's rare, or 1-alpha for negative.
+            # Here, pos_weight is also passed for consistency, though alpha also addresses imbalance.
+            criterion_mortality = FocalLoss(alpha=0.25, gamma=2.0, pos_weight=torch.tensor([pos_weight_value], device=DEVICE))
+        else: # Default to BCEWithLogitsLoss
+            print(f"Using BCEWithLogitsLoss for mortality task with label smoothing: {_LABEL_SMOOTHING}")
+            criterion_mortality = nn.BCEWithLogitsLoss(
+                pos_weight=torch.tensor([pos_weight_value], device=DEVICE),
+            )
+            # For label smoothing with BCEWithLogitsLoss, we adjust targets directly if label_smoothing > 0
+            # The loss function itself in PyTorch doesn't have a direct label_smoothing param like nn.CrossEntropyLoss
+            # So, this will be handled during target creation or by a custom wrapper if a more standard way is needed.
+            # For now, we'll note that PyTorch's BCEWithLogitsLoss expects raw logits and hard targets (0 or 1).
+            # True label smoothing requires adjusting target values (e.g., 0 -> eps/N, 1 -> 1 - eps + eps/N).
+            # We will adjust targets if _LABEL_SMOOTHING > 0 before passing to criterion.
+            # This adjustment will be done in the train_model loop.
     else:
-        print("Warning: y_mortality not found in train_graph. Using unweighted BCEWithLogitsLoss.")
-        criterion_mortality = nn.BCEWithLogitsLoss()
+        print("Warning: y_mortality not found in train_graph. Using unweighted loss.")
+        loss_fn_choice = args.loss_fn if hasattr(args, 'loss_fn') else 'bce'
+        if loss_fn_choice == 'focal':
+            criterion_mortality = FocalLoss(alpha=0.25, gamma=2.0)
+        else:
+            print(f"Using BCEWithLogitsLoss (unweighted) with label smoothing: {_LABEL_SMOOTHING if _LABEL_SMOOTHING > 0 else 'N/A'}")
+            criterion_mortality = nn.BCEWithLogitsLoss()
+
 
     optimizer_mortality = optim.AdamW(mortality_model.parameters(), lr=_LEARNING_RATE, weight_decay=_WEIGHT_DECAY)
     scheduler_mortality = CosineAnnealingWarmRestarts(optimizer_mortality, T_0=_COSINE_T_0, T_mult=_COSINE_T_MULT)
@@ -407,7 +498,7 @@ def main(run_config_from_sweep=None):
     mortality_model, best_auroc_mortality = train_model(mortality_model, train_graph, val_graph, criterion_mortality,
                                                         optimizer_mortality, scheduler_mortality, "Mortality",
                                                         _EPOCHS, _PATIENCE_EARLY_STOPPING, MORTALITY_MODEL_PATH)
-    if wandb.run:
+    if USE_WANDB and wandb.run:
         wandb.summary["final_best_auroc_mortality"] = best_auroc_mortality
 
     # --- Train LoS Model ---
@@ -415,10 +506,11 @@ def main(run_config_from_sweep=None):
     los_model = LoSPredictor(
         dim_in=DIM_IN_FEATURES_FROM_DATA, dim_h=_DIM_HIDDEN, num_layers=_NUM_GPS_LAYERS,
         num_heads=_NUM_ATTN_HEADS, lap_pe_dim=actual_lap_pe_dim,  # Use actual dim from data
-        sign_pe_dim=actual_sign_pe_dim, dropout=_DROPOUT_RATE  # Use actual dim from data
+        sign_pe_dim=actual_sign_pe_dim, dropout=_DROPOUT_RATE,  # Use actual dim from data
+        activation_fn_str=_ACTIVATION_FN
     ).to(DEVICE)
 
-    if wandb.run:
+    if USE_WANDB and wandb.run:
         wandb.config.update({"los_model_architecture": str(los_model)}, allow_val_change=True)
 
     criterion_los = nn.MSELoss()
@@ -428,7 +520,7 @@ def main(run_config_from_sweep=None):
     los_model, best_rmse_los = train_model(los_model, train_graph, val_graph, criterion_los,
                                            optimizer_los, scheduler_los, "LoS",
                                            _EPOCHS, _PATIENCE_EARLY_STOPPING, LOS_MODEL_PATH)
-    if wandb.run:
+    if USE_WANDB and wandb.run:
         wandb.summary["final_best_rmse_los"] = best_rmse_los
 
     print("\nTraining finished. Models saved to:")
@@ -436,7 +528,7 @@ def main(run_config_from_sweep=None):
     print(f"LoS Model: {LOS_MODEL_PATH}")
 
     # Obliczanie i logowanie GLscore
-    if wandb.run is not None:
+    if USE_WANDB and wandb.run is not None:
         # Normalizacja RMSE (prosta, można dostosować)
         # Chcemy, aby wyższy wynik był lepszy, więc dla RMSE (gdzie niższy jest lepszy),
         # możemy użyć 1 - znormalizowany_rmse.
@@ -454,7 +546,8 @@ def main(run_config_from_sweep=None):
         else:
             print("Could not calculate GLscore because one or both primary metrics are missing.")
 
-        wandb.finish()
+        if USE_WANDB and wandb.run: # Ensure wandb.run exists before trying to finish it
+            wandb.finish()
 
 
 if __name__ == "__main__":
@@ -466,9 +559,32 @@ if __name__ == "__main__":
     parser.add_argument('--entity', type=str, default=WANDB_ENTITY, help='Wandb entity (user or team).')
     parser.add_argument('--count', type=int, default=None, help='Number of runs for the sweep agent.')
 
+    # Arguments for manual hyperparameter tuning
+    parser.add_argument('--lr', type=float, default=LEARNING_RATE, help=f'Learning rate (default: {LEARNING_RATE})')
+    parser.add_argument('--wd', type=float, default=WEIGHT_DECAY, help=f'Weight decay (default: {WEIGHT_DECAY})')
+    parser.add_argument('--dropout', type=float, default=DROPOUT_RATE, help=f'Dropout rate (default: {DROPOUT_RATE})')
+    # Note: Batch size is complex for current GNN setup, added as a placeholder in config if needed later.
+    # parser.add_argument('--batch_size', type=int, default=64, help='Batch size (default: 64)')
+    parser.add_argument('--loss_fn', type=str, default='bce', choices=['bce', 'focal'], help='Loss function for mortality task (bce or focal, default: bce)')
+    parser.add_argument('--activation_fn', type=str, default='relu', choices=['relu', 'gelu', 'leaky_relu'], help='Activation function for GNN layers (default: relu)')
+    parser.add_argument('--clip_grad_norm', type=float, default=0.0, help='Max norm for gradient clipping (0.0 to disable, default: 0.0)')
+    parser.add_argument('--label_smoothing', type=float, default=0.0, help='Label smoothing factor for BCE loss (default: 0.0, no smoothing)')
+    parser.add_argument('--no-wandb', action='store_true', help='Disable Weights & Biases logging.')
+
+
     args = parser.parse_args()
 
+    # Declare global USE_WANDB at the beginning of the block if we intend to modify the module-level one.
+    global USE_WANDB
+
+    if args.no_wandb:
+        USE_WANDB = False
+        print("Weights & Biases logging explicitly disabled via --no-wandb flag.")
+
     if args.sweep_id:
+        if not USE_WANDB: # If --no-wandb was set, but a sweep is also requested
+            print("WARNING: --no-wandb was set, but sweep functionality relies on W&B. W&B will be re-enabled for the sweep agent.")
+            USE_WANDB = True # Force enable for sweep agent as it needs W&B
         print(f"Starting wandb agent for sweep_id: {args.sweep_id}")
 
 
