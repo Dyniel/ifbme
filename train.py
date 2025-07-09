@@ -137,6 +137,7 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
             if label_smoothing_factor > 0.0 and isinstance(criterion, nn.BCEWithLogitsLoss):
                 target = target.float() # ensure float
                 target = (1.0 - target) * (label_smoothing_factor / 2.0) + target * (1.0 - label_smoothing_factor / 2.0)
+
             loss = criterion(out, target)
         elif task_name == "LoS":
             target = torch.log1p(train_data.y_los.to(DEVICE))
@@ -147,6 +148,7 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
         loss.backward()
         if clip_grad_norm_value > 0: # Apply gradient clipping if configured
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm_value)
+
         optimizer.step()
 
         if scheduler and epoch > warmup_epochs_value: # Use passed warmup_epochs_value
@@ -496,6 +498,7 @@ def main(run_config_from_sweep=None):
         epochs=_EPOCHS, patience=_PATIENCE_EARLY_STOPPING, model_path=MORTALITY_MODEL_PATH,
         label_smoothing_factor=_LABEL_SMOOTHING, clip_grad_norm_value=_CLIP_GRAD_NORM, warmup_epochs_value=_WARMUP_EPOCHS
     )
+
     if USE_WANDB and wandb.run:
         wandb.summary["final_best_auroc_mortality"] = best_auroc_mortality
 
@@ -522,6 +525,7 @@ def main(run_config_from_sweep=None):
         label_smoothing_factor=0.0, # Label smoothing not typically used for MSE/regression
         clip_grad_norm_value=_CLIP_GRAD_NORM, warmup_epochs_value=_WARMUP_EPOCHS
     )
+
     if USE_WANDB and wandb.run:
         wandb.summary["final_best_rmse_los"] = best_rmse_los
 
@@ -564,6 +568,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=LEARNING_RATE, help=f'Learning rate (default: {LEARNING_RATE})')
     parser.add_argument('--wd', type=float, default=WEIGHT_DECAY, help=f'Weight decay (default: {WEIGHT_DECAY})')
     parser.add_argument('--dropout', type=float, default=DROPOUT_RATE, help=f'Dropout rate (default: {DROPOUT_RATE})')
+
     parser.add_argument('--loss_fn', type=str, default='bce', choices=['bce', 'focal'], help='Loss function for mortality task (bce or focal, default: bce)')
     parser.add_argument('--activation_fn', type=str, default='relu', choices=['relu', 'gelu', 'leaky_relu'], help='Activation function for GNN layers (default: relu)')
     parser.add_argument('--clip_grad_norm', type=float, default=0.0, help='Max norm for gradient clipping (0.0 to disable, default: 0.0)')
@@ -575,6 +580,7 @@ if __name__ == "__main__":
     # This is the correct place for `global` if we intend to modify the module-level USE_WANDB
     # However, the script structure is such that main() reads the global USE_WANDB.
     # We only need to ensure USE_WANDB is set correctly before main() is called.
+
 
     # Modify the module-level USE_WANDB based on args.no_wandb
     if args.no_wandb:
