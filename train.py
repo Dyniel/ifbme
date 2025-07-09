@@ -3,11 +3,13 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score, mean_squared_error
+from sklearn.metrics import roc_auc_score, mean_squared_error, confusion_matrix
 import numpy as np
 import pandas as pd
 import os
 import time
+import wandb # Dodano wandb
+import yaml # Do wczytywania konfiguracji sweepa
 
 from data_utils import load_and_preprocess_data
 from models import MortalityPredictor, LoSPredictor
@@ -40,6 +42,11 @@ WARMUP_EPOCHS = 5
 # File names for saved models
 MORTALITY_MODEL_PATH = 'model_dt.pt'
 LOS_MODEL_PATH = 'model_los.pt'
+
+# Wandb configuration
+WANDB_PROJECT = "ifbme-projekt" # Możesz zmienić nazwę projektu
+WANDB_ENTITY = None # Uzupełnij, jeśli używasz teamu w wandb, inaczej None
+
 
 # --- Helper Functions ---
 def get_input_dim_from_data(sample_csv_path, lap_pe_k_dim, sign_pe_k_dim):
@@ -136,19 +143,64 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
                 val_loss = criterion(val_out, val_target)
                 # Apply sigmoid for AUROC calculation
                 val_probs = torch.sigmoid(val_out).cpu().numpy()
-                val_metric = roc_auc_score(val_target.cpu().numpy(), val_probs)
+                val_target_cpu = val_target.cpu().numpy()
+                val_metric = roc_auc_score(val_target_cpu, val_probs)
                 metric_name = "AUROC"
+
+                # Wizualizacje dla zadania Mortality
+                if wandb.run is not None:
+                    try:
+                        # Krzywa ROC
+                        wandb.log({f"{task_name}/roc_curve": wandb.plot.roc_curve(val_target_cpu, np.stack((1-val_probs, val_probs), axis=-1))}, step=epoch)
+
+                        # Macierz Konfuzji
+                        # Przewidywane klasy (0 lub 1) na podstawie progu 0.5
+                        val_preds_classes = (val_probs > 0.5).astype(int)
+                        wandb.log({f"{task_name}/confusion_matrix": wandb.plot.confusion_matrix(
+                            preds=val_preds_classes,
+                            y_true=val_target_cpu,
+                            class_names=['Survival', 'Death']
+                        )}, step=epoch)
+                    except Exception as e:
+                        print(f"Error logging wandb plots for Mortality: {e}")
+
             elif task_name == "LoS":
                 val_target_log = torch.log1p(val_data.y_los.to(DEVICE))
                 val_loss = criterion(val_out, val_target_log)
                 # Inverse transform for RMSE: exp(preds) - 1
-                val_preds_original_scale = torch.expm1(val_out).cpu().numpy()
+                val_preds_original_scale = torch.expm1(val_out).cpu().numpy().clip(min=0) # clip(min=0) dodane
                 val_target_original_scale = val_data.y_los.cpu().numpy()
-                val_metric = np.sqrt(mean_squared_error(val_target_original_scale, val_preds_original_scale.clip(min=0)))
+                val_metric = np.sqrt(mean_squared_error(val_target_original_scale, val_preds_original_scale)) # usunięto clip z predykcji tutaj, bo jest wyżej
                 metric_name = "RMSE"
+
+                # Wizualizacje dla zadania LoS
+                if wandb.run is not None:
+                    try:
+                        # Wykres rozrzutu predykcji vs rzeczywiste wartości
+                        data_scatter = [[true_val, pred_val] for true_val, pred_val in zip(val_target_original_scale.flatten(), val_preds_original_scale.flatten())]
+                        table_scatter = wandb.Table(data=data_scatter, columns=["Actual LoS", "Predicted LoS"])
+                        wandb.log({f"{task_name}/predictions_scatter": wandb.plot.scatter(
+                            table_scatter, "Actual LoS", "Predicted LoS", title="Actual vs. Predicted LoS"
+                        )}, step=epoch)
+                    except Exception as e:
+                        print(f"Error logging wandb plots for LoS: {e}")
+
 
         epoch_duration = time.time() - start_time
         print(f"Epoch {epoch}/{epochs} | Train Loss: {loss.item():.4f} | Val Loss: {val_loss.item():.4f} | Val {metric_name}: {val_metric:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f} | Time: {epoch_duration:.2f}s")
+
+        # Log to wandb (metryki numeryczne)
+        if wandb.run is not None:
+            log_dict_metrics = {
+                f"{task_name}/epoch": epoch, # To już jest logowane jako `step` dla plotów
+                f"{task_name}/train_loss": loss.item(),
+                f"{task_name}/val_loss": val_loss.item(),
+                f"{task_name}/val_{metric_name.lower()}": val_metric,
+                f"{task_name}/learning_rate": optimizer.param_groups[0]['lr'],
+                f"{task_name}/epoch_duration_sec": epoch_duration,
+            }
+            wandb.log(log_dict_metrics, step=epoch) # Używamy step=epoch dla wszystkich logów
+
 
         if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step(val_metric if task_name == "Mortality" else val_loss) # AUROC higher is better, RMSE lower is better
@@ -177,11 +229,77 @@ def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
 
     print(f"Finished training for {task_name}. Best Val {metric_name}: {best_val_metric:.4f}")
     model.load_state_dict(torch.load(model_path)) # Load best model
+
+    # Log best model to wandb
+    if wandb.run is not None:
+        wandb.save(model_path)
+        wandb.summary[f"best_val_{metric_name.lower()}_{task_name.lower()}"] = best_val_metric
+
     return model
 
 # --- Main Training Execution ---
-if __name__ == "__main__":
+def main(config=None): # Zmieniono na funkcję akceptującą config dla sweepów
+    """
+    Główna funkcja trenująca modele.
+    Args:
+        config (dict, optional): Słownik konfiguracji z wandb sweep.
+    """
+    if config is None:
+        # Użyj domyślnych wartości, jeśli nie ma configu (np. przy standardowym uruchomieniu)
+        run_config = {
+            "learning_rate": LEARNING_RATE,
+            "dim_hidden": DIM_HIDDEN,
+            "num_gps_layers": NUM_GPS_LAYERS,
+            "num_attn_heads": NUM_ATTN_HEADS,
+            "dropout_rate": DROPOUT_RATE,
+            "lap_pe_k_dim": LAP_PE_K_DIM,
+            "sign_pe_k_dim": SIGN_PE_K_DIM,
+            "weight_decay": WEIGHT_DECAY,
+            "epochs": EPOCHS,
+            "patience_early_stopping": PATIENCE_EARLY_STOPPING,
+            "cosine_t_0": COSINE_T_0,
+            "cosine_t_mult": COSINE_T_MULT,
+            "warmup_epochs": WARMUP_EPOCHS,
+            # Można dodać więcej parametrów, jeśli mają być przeszukiwane
+        }
+        wandb_mode = "online"
+    else:
+        run_config = config
+        wandb_mode = "online" # W trybie sweep wandb jest zawsze online
+
+    # Inicjalizacja wandb
+    run_name = f"run_{time.strftime('%Y%m%d-%H%M%S')}"
+    if config: # Jeśli jest config, to jesteśmy w sweepie, dostosuj nazwę runa
+        run_name = f"sweep_{task_name_wandb}_{wandb.run.id if wandb.run else 'local'}"
+
+
+    wandb.init(
+        project=WANDB_PROJECT,
+        entity=WANDB_ENTITY,
+        config=run_config,
+        name=run_name, # Można ustawić bardziej opisową nazwę
+        mode=wandb_mode # "online", "offline" lub "disabled"
+    )
+
+    # Pobierz wartości z wandb.config, jeśli są dostępne (dla sweepów)
+    # W przeciwnym razie użyj wartości zdefiniowanych globalnie
+    _LEARNING_RATE = wandb.config.learning_rate if hasattr(wandb.config, 'learning_rate') else LEARNING_RATE
+    _DIM_HIDDEN = wandb.config.dim_hidden if hasattr(wandb.config, 'dim_hidden') else DIM_HIDDEN
+    _NUM_GPS_LAYERS = wandb.config.num_gps_layers if hasattr(wandb.config, 'num_gps_layers') else NUM_GPS_LAYERS
+    _NUM_ATTN_HEADS = wandb.config.num_attn_heads if hasattr(wandb.config, 'num_attn_heads') else NUM_ATTN_HEADS
+    _DROPOUT_RATE = wandb.config.dropout_rate if hasattr(wandb.config, 'dropout_rate') else DROPOUT_RATE
+    _LAP_PE_K_DIM = wandb.config.lap_pe_k_dim if hasattr(wandb.config, 'lap_pe_k_dim') else LAP_PE_K_DIM
+    _SIGN_PE_K_DIM = wandb.config.sign_pe_k_dim if hasattr(wandb.config, 'sign_pe_k_dim') else SIGN_PE_K_DIM
+    _WEIGHT_DECAY = wandb.config.weight_decay if hasattr(wandb.config, 'weight_decay') else WEIGHT_DECAY
+    _EPOCHS = wandb.config.epochs if hasattr(wandb.config, 'epochs') else EPOCHS
+    _PATIENCE_EARLY_STOPPING = wandb.config.patience_early_stopping if hasattr(wandb.config, 'patience_early_stopping') else PATIENCE_EARLY_STOPPING
+    _COSINE_T_0 = wandb.config.cosine_t_0 if hasattr(wandb.config, 'cosine_t_0') else COSINE_T_0
+    _COSINE_T_MULT = wandb.config.cosine_t_mult if hasattr(wandb.config, 'cosine_t_mult') else COSINE_T_MULT
+    _WARMUP_EPOCHS = wandb.config.warmup_epochs if hasattr(wandb.config, 'warmup_epochs') else WARMUP_EPOCHS
+
     print("Starting main training script execution...")
+    print(f"Running with config: {wandb.config}")
+
 
     # Infer input dimension from data (IMPORTANT: ensure this matches model's dim_in)
     # This requires preprocessing a small part of the data to know the number of features
@@ -232,14 +350,27 @@ if __name__ == "__main__":
     if hasattr(train_graph, 'lap_pe') and train_graph.lap_pe is not None:
         actual_lap_pe_dim = train_graph.lap_pe.shape[1]
         print(f"LapPE found in data with dimension: {actual_lap_pe_dim}")
-        if actual_lap_pe_dim != LAP_PE_K_DIM:
-            print(f"WARNING: LAP_PE_K_DIM ({LAP_PE_K_DIM}) in train script config differs from actual LapPE dim ({actual_lap_pe_dim}) in data. Using actual: {actual_lap_pe_dim}")
-            # LAP_PE_K_DIM = actual_lap_pe_dim # Use the dimension from data
+        if actual_lap_pe_dim != _LAP_PE_K_DIM: # Używamy _LAP_PE_K_DIM z konfiguracji wandb
+            print(f"WARNING: LAP_PE_K_DIM ({_LAP_PE_K_DIM}) in train script config/wandb differs from actual LapPE dim ({actual_lap_pe_dim}) in data. Using actual: {actual_lap_pe_dim}")
+            # _LAP_PE_K_DIM = actual_lap_pe_dim # Use the dimension from data - to może być problematyczne dla sweepów, lepiej, żeby dane były spójne
     else:
         print("No LapPE found in data. lap_pe_dim will be effectively 0 for the model if not provided.")
-        LAP_PE_K_DIM = 0 # Ensure model knows no LapPE is coming if not in data.
+        # _LAP_PE_K_DIM = 0 # Nie nadpisujemy _LAP_PE_K_DIM, model powinien dostać to co w konfiguracji
+        actual_lap_pe_dim = 0 # Jeśli nie ma w danych, to rzeczywisty wymiar to 0
 
-    # SIGN_PE_K_DIM is already 0 by default. If it were > 0, we'd need data.sign_pe
+    # _SIGN_PE_K_DIM is already 0 by default. If it were > 0, we'd need data.sign_pe
+    # Podobnie jak z LapPE, model powinien dostać to co w konfiguracji, a dane powinny to odzwierciedlać
+    actual_sign_pe_dim = 0
+    if hasattr(train_graph, 'sign_pe') and train_graph.sign_pe is not None:
+        actual_sign_pe_dim = train_graph.sign_pe.shape[1]
+        print(f"SignPE found in data with dimension: {actual_sign_pe_dim}")
+        if actual_sign_pe_dim != _SIGN_PE_K_DIM:
+             print(f"WARNING: SIGN_PE_K_DIM ({_SIGN_PE_K_DIM}) in train script config/wandb differs from actual SignPE dim ({actual_sign_pe_dim}) in data. Using actual: {actual_sign_pe_dim}")
+    elif _SIGN_PE_K_DIM > 0:
+        print(f"WARNING: SIGN_PE_K_DIM is {_SIGN_PE_K_DIM} but no SignPE found in data. Model will expect it.")
+        # actual_sign_pe_dim pozostaje 0, model dostanie _SIGN_PE_K_DIM z configu
+
+
 
     print("Loading and preprocessing validation data...")
     val_graph, val_targets_df = load_and_preprocess_data(
@@ -257,13 +388,23 @@ if __name__ == "__main__":
     print("\nInitializing Mortality Predictor...")
     mortality_model = MortalityPredictor(
         dim_in=DIM_IN_FEATURES_FROM_DATA,  # Features from ColumnTransformer
-        dim_h=DIM_HIDDEN,
-        num_layers=NUM_GPS_LAYERS,
-        num_heads=NUM_ATTN_HEADS,
-        lap_pe_dim=actual_lap_pe_dim, # Dimension of LapPE provided in Data object
-        sign_pe_dim=SIGN_PE_K_DIM,  # Dimension of SignNet PE provided in Data object
-        dropout=DROPOUT_RATE
+        dim_h=_DIM_HIDDEN, # Używamy wartości z configu
+        num_layers=_NUM_GPS_LAYERS, # Używamy wartości z configu
+        num_heads=_NUM_ATTN_HEADS, # Używamy wartości z configu
+        lap_pe_dim=actual_lap_pe_dim, # Rzeczywisty wymiar z danych, model powinien to obsłużyć
+        sign_pe_dim=actual_sign_pe_dim,  # Rzeczywisty wymiar z danych
+        dropout=_DROPOUT_RATE # Używamy wartości z configu
     ).to(DEVICE)
+
+    if wandb.run: # Logowanie architektury modelu
+        # Można dodać bardziej szczegółowe logowanie, np. liczby parametrów
+        wandb.config.update({
+            "mortality_model_architecture": str(mortality_model),
+            "input_features_dim_from_data": DIM_IN_FEATURES_FROM_DATA,
+            "actual_lap_pe_dim_from_data": actual_lap_pe_dim,
+            "actual_sign_pe_dim_from_data": actual_sign_pe_dim
+        }, allow_val_change=True)
+
 
     # Weighted BCE loss for imbalanced classification
     # Calculate pos_weight for mortality
@@ -277,33 +418,103 @@ if __name__ == "__main__":
         print("Warning: y_mortality not found in train_graph. Using unweighted BCEWithLogitsLoss.")
         criterion_mortality = nn.BCEWithLogitsLoss()
 
-    optimizer_mortality = optim.AdamW(mortality_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler_mortality = CosineAnnealingWarmRestarts(optimizer_mortality, T_0=COSINE_T_0, T_mult=COSINE_T_MULT)
+    optimizer_mortality = optim.AdamW(mortality_model.parameters(), lr=_LEARNING_RATE, weight_decay=_WEIGHT_DECAY) # Używamy wartości z configu
+    scheduler_mortality = CosineAnnealingWarmRestarts(optimizer_mortality, T_0=_COSINE_T_0, T_mult=_COSINE_T_MULT) # Używamy wartości z configu
+
+    # Zmienna globalna do przekazania nazwy zadania do wandb.init w sweepie
+    global task_name_wandb
+    task_name_wandb = "Mortality"
+
 
     mortality_model = train_model(mortality_model, train_graph, val_graph, criterion_mortality,
                                   optimizer_mortality, scheduler_mortality, "Mortality",
-                                  EPOCHS, PATIENCE_EARLY_STOPPING, MORTALITY_MODEL_PATH)
+                                  _EPOCHS, _PATIENCE_EARLY_STOPPING, MORTALITY_MODEL_PATH)
 
     # --- Train LoS Model ---
     print("\nInitializing LoS Predictor...")
     los_model = LoSPredictor(
         dim_in=DIM_IN_FEATURES_FROM_DATA, # Features from ColumnTransformer
-        dim_h=DIM_HIDDEN,
-        num_layers=NUM_GPS_LAYERS,
-        num_heads=NUM_ATTN_HEADS,
-        lap_pe_dim=actual_lap_pe_dim, # Dimension of LapPE provided in Data object
-        sign_pe_dim=SIGN_PE_K_DIM,  # Dimension of SignNet PE provided in Data object
-        dropout=DROPOUT_RATE
+        dim_h=_DIM_HIDDEN, # Używamy wartości z configu
+        num_layers=_NUM_GPS_LAYERS, # Używamy wartości z configu
+        num_heads=_NUM_ATTN_HEADS, # Używamy wartości z configu
+        lap_pe_dim=actual_lap_pe_dim, # Rzeczywisty wymiar z danych
+        sign_pe_dim=actual_sign_pe_dim,  # Rzeczywisty wymiar z danych
+        dropout=_DROPOUT_RATE # Używamy wartości z configu
     ).to(DEVICE)
 
+    if wandb.run: # Logowanie architektury modelu
+        wandb.config.update({
+            "los_model_architecture": str(los_model),
+        }, allow_val_change=True)
+
     criterion_los = nn.MSELoss() # Target will be log-transformed
-    optimizer_los = optim.AdamW(los_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler_los = CosineAnnealingWarmRestarts(optimizer_los, T_0=COSINE_T_0, T_mult=COSINE_T_MULT)
+    optimizer_los = optim.AdamW(los_model.parameters(), lr=_LEARNING_RATE, weight_decay=_WEIGHT_DECAY) # Używamy wartości z configu
+    scheduler_los = CosineAnnealingWarmRestarts(optimizer_los, T_0=_COSINE_T_0, T_mult=_COSINE_T_MULT) # Używamy wartości z configu
+
+    task_name_wandb = "LoS"
 
     los_model = train_model(los_model, train_graph, val_graph, criterion_los,
                             optimizer_los, scheduler_los, "LoS",
-                            EPOCHS, PATIENCE_EARLY_STOPPING, LOS_MODEL_PATH)
+                            _EPOCHS, _PATIENCE_EARLY_STOPPING, LOS_MODEL_PATH)
 
     print("\nTraining finished. Models saved to:")
     print(f"Mortality Model: {MORTALITY_MODEL_PATH}")
     print(f"LoS Model: {LOS_MODEL_PATH}")
+
+    if wandb.run is not None:
+        wandb.finish()
+
+
+if __name__ == "__main__":
+    # Domyślnie uruchamiamy funkcję main bez argumentów (użyje globalnych hiperparametrów)
+    # Aby uruchomić sweep, ta część zostanie zmodyfikowana lub wywołana inaczej przez agenta wandb
+
+    # Sprawdzenie, czy skrypt jest uruchamiany przez agenta sweep wandb
+    # Agent wandb zazwyczaj ustawia pewne zmienne środowiskowe lub przekazuje argumenty
+    # Tutaj prostsze podejście: jeśli chcemy uruchomić sweep, dodajemy argument np. --sweep
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--sweep_id', type=str, default=None, help='Wandb sweep ID to run an agent for.')
+    parser.add_argument('--sweep_config', type=str, default='sweep.yaml', help='Path to the sweep configuration file.')
+    parser.add_argument('--project', type=str, default=WANDB_PROJECT, help='Wandb project name.')
+    parser.add_argument('--entity', type=str, default=WANDB_ENTITY, help='Wandb entity (user or team).')
+    parser.add_argument('--count', type=int, default=None, help='Number of runs for the sweep agent.')
+
+
+    args = parser.parse_args()
+
+    if args.sweep_id:
+        print(f"Starting wandb agent for sweep_id: {args.sweep_id}")
+        wandb.agent(sweep_id=args.sweep_id, function=main, count=args.count, project=args.project, entity=args.entity)
+    else:
+        # Standardowe uruchomienie pojedynczego treningu
+        # Można też dodać opcję tworzenia nowego sweepa stąd
+        print("Starting a single training run (not a sweep agent).")
+        main()
+
+
+# Funkcja do tworzenia i uruchamiania sweepa (opcjonalnie, jeśli chcemy to robić z poziomu skryptu)
+# def run_sweep(sweep_config_path='sweep.yaml', project=WANDB_PROJECT, entity=WANDB_ENTITY, count=5):
+#     """
+#     Tworzy sweep w wandb i uruchamia agenta.
+#     """
+#     with open(sweep_config_path, 'r') as f:
+#         sweep_config_dict = yaml.safe_load(f)
+#
+#     sweep_id = wandb.sweep(sweep=sweep_config_dict, project=project, entity=entity)
+#     print(f"Sweep created with ID: {sweep_id}. Starting agent...")
+#     wandb.agent(sweep_id, function=main, count=count, project=project, entity=entity)
+#
+# if __name__ == "__main__":
+#     # Aby uruchomić sweep:
+#     # 1. Zaloguj się do wandb: `wandb login`
+#     # 2. Utwórz sweep z pliku sweep.yaml w UI wandb lub przez CLI: `wandb sweep sweep.yaml`
+#     #    To polecenie wypisze SWEEP_ID.
+#     # 3. Uruchom agenta: `python train.py --sweep_id YOUR_SWEEP_ID`
+#     #
+#     # Alternatywnie, odkomentuj poniższe i uruchom `python train.py` (upewnij się, że WANDB_PROJECT i WANDB_ENTITY są poprawne)
+#     # print("Creating and running a new sweep...")
+#     # run_sweep(count=5) # Uruchomi 5 prób w sweepie
+#
+#     # Standardowe uruchomienie bez sweepa:
+#     # main()
