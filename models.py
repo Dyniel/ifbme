@@ -229,7 +229,7 @@ if __name__ == '__main__':
         print(f"Mortality model output shape: {mortality_output.shape}")
         assert mortality_output.shape == (num_nodes, 1)
         print(f"Mortality model output sample (first 5):\n{mortality_output[:5]}")
-n
+
     except Exception as e:
         print(f"Error during MortalityPredictor forward pass: {e}")
         import traceback
