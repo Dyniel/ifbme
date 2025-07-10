@@ -67,15 +67,20 @@ def load_raw_data(config, base_data_path="data/"):
         df_full = df_train
         logger.info("Using only training data as full data (validation data not loaded/found).")
 
+    # ---- DEBUG PRINT ----
+    logger.info(f"Available columns in the loaded DataFrame (df_full): {df_full.columns.tolist()}")
+    # ---- END DEBUG PRINT ----
+
     if target_column not in df_full.columns:
-        logger.error(f"Target column '{target_column}' not found in the loaded data.")
-        raise ValueError(f"Target column '{target_column}' not found.")
+        logger.error(f"Target column '{target_column}' (specified in config) not found in the loaded data.")
+        logger.error(f"Please ensure the 'target_column' in your config matches one of the available columns listed above.")
+        raise ValueError(f"Target column '{target_column}' not found in DataFrame columns: {df_full.columns.tolist()}")
 
     X_full = df_full.drop(columns=[target_column])
     y_full = df_full[target_column]
 
     logger.info(f"Data loading complete. X_full shape: {X_full.shape}, y_full shape: {y_full.shape}")
-    return X_full.to_numpy(), y_full.to_numpy() # Or return DataFrames if preferred
+    return X_full, y_full # Return DataFrames
 
 # Example usage (conceptual, would be in train.py)
 # if __name__ == '__main__':

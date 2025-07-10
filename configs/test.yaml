@@ -1,0 +1,94 @@
+random_seed: 42
+use_gpu: True # Set to False if you don't have a CUDA-enabled GPU or want to use CPU
+
+# --- W&B Configuration ---
+wandb:
+  project: "ifbme-project-example" # Replace with your W&B project name
+  # tags: ["baseline", "LGBM", "XGBoostMeta"]
+
+# --- Data Configuration ---
+# dummy_data_train_samples: 1000 # Used if actual data loader is not implemented
+# dummy_data_val_samples: 200   # Used if actual data loader is not implemented
+# dummy_data_features: 20       # Used if actual data loader is not implemented
+# dummy_data_classes: 2         # Used if actual data loader is not implemented
+# dummy_data_train_weights: [0.9, 0.1] # To simulate imbalanced data
+# dummy_data_val_weights: [0.8, 0.2]
+
+# --- Actual Data Paths (IMPORTANT: Replace with your data paths) ---
+# data:
+#   train_path: "path/to/your/train_data.csv"
+#   val_path: "path/to/your/validation_data.csv"
+#   test_path: "path/to/your/test_data.csv" # If you have a separate test set for final eval
+  # loader_params: {} # Parameters for YourDataLoader if you implement it
+
+# --- Balancing Configuration ---
+balancing:
+  use_rsmote_gan_in_cv: True # Apply RSMOTE-GAN within CV folds
+  rsmote_gan_params:
+    k: 5
+    minority_upsample_factor: 3.0 # As per spec for AUROC
+
+# --- Loss Function (Primarily for DL models if used directly, not heavily used by current ensemble script) ---
+loss_function:
+  type: ClassBalancedFocalLoss
+  beta: 0.9999 # As per spec for AUROC
+  gamma: 2.0    # As per spec for AUROC
+
+# --- Optimizer (Primarily for DL models) ---
+optimizer:
+  name: Adam
+  lr: 0.001
+
+# --- Ensemble Configuration ---
+ensemble:
+  n_folds_for_oof: 5 # Number of folds for Out-of-Fold predictions for meta-learner
+  train_lgbm: True
+  train_teco: True  # Set to False if TECO is not yet implemented or not desired
+  train_stm_gnn: True # Set to False if STM-GNN is not yet implemented or not desired
+  train_meta_learner: True
+
+  lgbm_params:
+    num_leaves: 10000 # As per spec for AUROC
+    class_weight: 'balanced'
+    num_boost_round: 1000 # Max boosting rounds for LGBM
+    early_stopping_rounds: 50 # Early stopping for LGBM
+    # model_specific_params: # Optional: pass other LGBM native params here
+    #   learning_rate: 0.05
+    #   feature_fraction: 0.8
+    # save_path: 'models/lgbm_final_model.joblib' # Conceptual path for saving final model
+
+  teco_params: # Conceptual, as TECO is not fully implemented in the script
+    input_feature_dim: 20 # Should match dummy_data_features or your actual data
+    d_model: 512
+    num_encoder_layers: 4
+    nhead: 8
+    dim_feedforward: 2048
+    dropout: 0.1
+    num_classes: 2 # Should match dummy_data_classes or your actual data
+    max_seq_len: 100
+    # save_path: 'models/teco_final.pth'
+
+  stm_gnn_params: # Conceptual, as STM-GNN is not fully implemented
+    num_node_features: 20 # Should match dummy_data_features or your actual data
+    layer_hidden_dim: 256
+    gnn_output_dim: 256
+    num_gnn_layers: 5
+    global_memory_dim: 128
+    num_memory_slots: 10
+    num_heads: 8
+    dropout: 0.1
+    num_classes: 2 # Should match dummy_data_classes or your actual data
+    # save_path: 'models/stm_gnn_final.pth'
+
+  meta_learner_xgb_params:
+    depth: 3 # As per spec for AUROC
+    num_boost_round: 200 # Max boosting rounds for XGBoost meta-learner
+    early_stopping_rounds: 20 # Early stopping for XGBoost
+    # model_specific_params: # Optional: pass other XGBoost native params here
+    #   eta: 0.01 # learning_rate for XGBoost
+    # save_path: 'models/meta_learner_xgb.joblib'
+
+  soft_vote_weights: # Weights for soft voting ensemble
+    stm_gnn: 0.5
+    lgbm: 0.3
+    teco: 0.2

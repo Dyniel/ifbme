@@ -233,4 +233,3 @@ if __name__ == '__main__':
         print(f"Cleaned up {model_path}.")
 
     print("\n--- LightGBMModel Example Finished ---")
-```

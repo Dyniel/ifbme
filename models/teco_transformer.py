@@ -218,4 +218,3 @@ if __name__ == '__main__':
     print(f"\nModel output (sequence embeddings) shape: {sequence_embeddings.shape}") # (batch, seq, d_model)
 
     print("\n--- TECO-Transformer Example Finished ---")
-```
