@@ -12,7 +12,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 import os # For checking file existence
 
-def load_and_preprocess_data(csv_path, preprocessor=None, fit_preprocessor=False, target_cols=None, k_neighbors=10):
+def load_and_preprocess_data(csv_path, preprocessor=None, fit_preprocessor=False, target_cols=None, k_neighbors=10, exclude_features=None):
     """
     Loads data from CSV, preprocesses features, and constructs a graph.
 
@@ -42,6 +42,28 @@ def load_and_preprocess_data(csv_path, preprocessor=None, fit_preprocessor=False
     print(f"Initial data shape: {df.shape}")
     print(f"Initial columns: {df.columns.tolist()}")
     print(f"Data types before any processing:\n{df.dtypes}")
+
+    # --- Date Feature Engineering ---
+    date_cols = ['requestDate', 'admissionDate']
+    for col in date_cols:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+
+    if 'admissionDate' in df.columns and 'requestDate' in df.columns:
+        # Calculate stay_duration in days
+        df['stay_duration_days'] = (df['admissionDate'] - df['requestDate']).dt.days
+        # Fill potential NaNs if one date is missing or invalid, or if requestDate is after admissionDate
+        df['stay_duration_days'] = df['stay_duration_days'].fillna(0).clip(lower=0)
+        print("Created 'stay_duration_days'.")
+
+    if 'admissionDate' in df.columns:
+        df['admission_day_of_week'] = df['admissionDate'].dt.dayofweek
+        df['admission_month'] = df['admissionDate'].dt.month
+        df['admission_day_of_year'] = df['admissionDate'].dt.dayofyear
+        # Fill NaNs for date components with a placeholder (e.g., -1 or median/mode if preferred)
+        for col in ['admission_day_of_week', 'admission_month', 'admission_day_of_year']:
+            df[col] = df[col].fillna(-1) # Using -1 for missing date parts
+        print("Created 'admission_day_of_week', 'admission_month', 'admission_day_of_year'.")
 
     # --- Basic Cleaning & Initial Feature Engineering ---
     # 1. OutcomeType to numeric
@@ -100,33 +122,92 @@ def load_and_preprocess_data(csv_path, preprocessor=None, fit_preprocessor=False
     temp_target_cols = target_cols if target_cols else []
 
     # Identify numerical features robustly
-    numerical_features = []
+    # Define features based on typical expectations for this dataset
+    # New date-derived features are numerical by default here, can be moved to categorical if needed (e.g. month as category)
+    explicit_numerical_features = [
+        'patientAge', 'glasgowScale', 'hematocrit', 'hemoglobin', 'leucocitos',
+        'lymphocytes', 'urea', 'creatinine', 'platelets', 'diuresis',
+        'systolicPressure', 'diastolicPressure',
+        'stay_duration_days', # New date feature
+        'admission_day_of_week', 'admission_month', 'admission_day_of_year' # New date features
+    ]
+
+    explicit_categorical_features = [
+        'requestType', 'admissionBedType', 'admissionHealthUnit',
+        'patientGender', 'patientFfederalUnit', 'icdCode_group'
+        # 'requestBedType' is often missing or inconsistent, handle its potential absence
+    ]
+    if 'requestBedType' in df.columns: # Add if column exists
+        explicit_categorical_features.append('requestBedType')
+
+
+    # Filter defined features to only those present in the current DataFrame
+    numerical_features = [col for col in explicit_numerical_features if col in df.columns]
+    categorical_features = [col for col in explicit_categorical_features if col in df.columns]
+
+    # Ensure all columns are covered and handle 'Not applicable' more broadly
+    all_defined_features = numerical_features + categorical_features
     for col in df.columns:
-        if col not in temp_target_cols:
-            try:
-                _ = pd.to_numeric(df[col])
-                if df[col].dtype != 'object' and df[col].dtype != 'bool': # Exclude already encoded or boolean if any
-                     if not all(df[col].dropna().isin([0, 1])): # Exclude binary columns that might be categorical
-                        numerical_features.append(col)
-            except (ValueError, TypeError):
-                continue
+        if col not in all_defined_features and col not in temp_target_cols:
+            # Convert 'Not applicable' etc. to NaN for all feature columns not yet processed by specific rules
+            # This is a broader sweep than the initial cols_to_check_na
+            if df[col].dtype == 'object': # only for object columns that might contain these strings
+                df[col] = df[col].replace(['Not applicable', 'NA', 'NaN', 'nan', 'Not Applicable', 'Não aplicavel', 'Not informed'], np.nan)
+                # Attempt conversion to numeric if it seems plausible after NA replacement
+                # This helps catch numeric cols that were not in explicit_numerical_features but became numeric
+                # if col not in categorical_features: # Don't try to convert explicitly categorical ones
+                #    df[col] = pd.to_numeric(df[col], errors='ignore')
 
-    # Identify categorical features (non-numeric and not targets)
-    categorical_features = [col for col in df.select_dtypes(include=['object', 'category']).columns if col not in temp_target_cols]
-    # Add icdCode_group if it's not already picked up and exists
-    if 'icdCode_group' in df.columns and 'icdCode_group' not in categorical_features and 'icdCode_group' not in temp_target_cols:
-        categorical_features.append('icdCode_group')
 
-    # Ensure no overlap and remove any misclassified binary numericals that are actually categorical representations
-    # For example, if 'patientGender' was 0/1 already
-    potential_binary_cats = [col for col in numerical_features if df[col].dropna().isin([0,1]).all() and df[col].nunique() <=2]
-    if potential_binary_cats:
-        print(f"Potential binary columns in numerical_features to re-evaluate: {potential_binary_cats}")
-        # Decision: For now, keep them as numerical if they passed the numeric checks.
-        # One-hot encoding will handle distinct values if they are truly categorical.
+    # Refined identification:
+    # Numerical: must be in numerical_features list AND have a numeric dtype after processing
+    # Categorical: must be in categorical_features list OR have an object/category dtype
+    final_numerical_features = []
+    for col in numerical_features:
+        # Try to convert to numeric one last time, in case some 'Not applicable' were missed or column was purely object before
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        if pd.api.types.is_numeric_dtype(df[col]):
+            final_numerical_features.append(col)
+        else:
+            print(f"Warning: Column {col} was in explicit_numerical_features but is not numeric. Moving to categorical or dropping if not in explicit_categorical_features.")
+            if col not in categorical_features: # If not also defined as categorical, it might be problematic
+                 # Decide: add to categorical, or log warning and it will be dropped by ColumnTransformer if not in either
+                 categorical_features.append(col) # Safest: treat as categorical if numeric conversion failed
 
-    print(f"Identified Numerical Features: {numerical_features}")
-    print(f"Identified Categorical Features: {categorical_features}")
+    final_categorical_features = []
+    for col in categorical_features:
+        if col in df.columns: # Ensure column still exists
+            final_categorical_features.append(col)
+
+    # Add any remaining object/category columns not explicitly listed but also not targets
+    for col in df.select_dtypes(include=['object', 'category']).columns:
+        if col not in final_categorical_features and col not in temp_target_cols and col not in final_numerical_features:
+            print(f"Automatically adding column '{col}' of type {df[col].dtype} to categorical features.")
+            final_categorical_features.append(col)
+
+    # Remove duplicates that might have occurred if a col was in both lists or added multiple times
+    final_numerical_features = sorted(list(set(final_numerical_features)))
+    final_categorical_features = sorted(list(set(final_categorical_features)))
+
+    # Ensure no overlap between final numerical and categorical lists
+    common_cols = set(final_numerical_features).intersection(set(final_categorical_features))
+    if common_cols:
+        print(f"Warning: Columns {common_cols} are in both numerical and categorical lists. Removing from numerical.")
+        final_numerical_features = [col for col in final_numerical_features if col not in common_cols]
+
+
+    print(f"Final Numerical Features: {final_numerical_features}")
+    print(f"Final Categorical Features: {final_categorical_features}")
+    numerical_features = final_numerical_features
+    categorical_features = final_categorical_features
+
+    # --- Feature Exclusion ---
+    if exclude_features:
+        print(f"Excluding features based on exclude_features list: {exclude_features}")
+        numerical_features = [col for col in numerical_features if col not in exclude_features]
+        categorical_features = [col for col in categorical_features if col not in exclude_features]
+        print(f"Numerical Features after exclusion: {numerical_features}")
+        print(f"Categorical Features after exclusion: {categorical_features}")
 
     # Extract targets if specified
     if target_cols:
@@ -308,12 +389,18 @@ if __name__ == '__main__':
 
     print("Starting example usage of load_and_preprocess_data...")
 
+    # Example of features to exclude
+    features_to_exclude_example = ['lymphocytes', 'admission_day_of_year']
+    print(f"\n--- Example: Excluding features: {features_to_exclude_example} ---")
+
+
     print("\n--- Processing training data (fitting preprocessor) ---")
     train_graph_data, train_targets, fitted_preprocessor = load_and_preprocess_data(
         'data/trainData.csv',
         fit_preprocessor=True,
         target_cols=['outcomeType', 'lengthofStay'],
-        k_neighbors=5 # Smaller k for smaller dummy data
+        k_neighbors=5, # Smaller k for smaller dummy data
+        exclude_features=features_to_exclude_example
     )
     if train_graph_data:
         print(f"Train graph: {train_graph_data}")
