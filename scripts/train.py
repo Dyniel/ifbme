@@ -14,26 +14,49 @@ from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, precision_s
 import torch.optim as optim
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
+import logging # For structured logging
 
-# Project-specific imports (will be refined)
-# from data_utils.loader import YourDataLoader # Replace with actual data loader
+# Project-specific imports
 from data_utils.balancing import RSMOTEGAN
-from data_utils.losses import ClassBalancedFocalLoss
-# from models.your_model import YourModel # Replace with actual model
-from models import LightGBMModel, XGBoostMetaLearner # Adjusted imports
+# from data_utils.losses import ClassBalancedFocalLoss # Not directly used at top level after NCV refactor
+from models import LightGBMModel, XGBoostMetaLearner
 from models.teco_transformer import TECOTransformerModel
 from data_utils.sequence_loader import TabularSequenceDataset, basic_collate_fn
-import torch.nn as nn # Added for TECO loss
-from torch.utils.data import DataLoader # Added for TECO DataLoader
-import pandas as pd # Added for TECO data handling
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import pandas as pd
+
+# --- Logger Setup ---
+# Configure logger for the script
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
+    stream=sys.stdout # Log to console
+)
+logger = logging.getLogger(__name__)
+
 
 def load_config(config_path):
-    """Loads YAML configuration file."""
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config
+    """
+    Loads YAML configuration file.
+    Includes basic error handling for file operations.
+    """
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        logger.info(f"Configuration loaded successfully from {config_path}")
+        return config
+    except FileNotFoundError:
+        logger.error(f"Configuration file not found at {config_path}")
+        raise
+    except yaml.YAMLError as e:
+        logger.error(f"Error parsing YAML configuration file {config_path}: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"An unexpected error occurred while loading config {config_path}: {e}")
+        raise
 
-def get_samples_per_class(y_train):
+def get_samples_per_class(y_train): # This helper might still be used if ClassBalancedFocalLoss is used for TECO
     """Helper function to count samples per class from training labels."""
     if isinstance(y_train, torch.Tensor):
         y_train = y_train.cpu().numpy()
@@ -63,10 +86,11 @@ def main(config_path):
     )
     # Update wandb config with the loaded config (in case init did not take it all)
     # wandb.config.update(config) # Already done by passing config to wandb.init
+    logger.info(f"W&B initialized for project '{wandb_config.get('project', 'ifbme-project')}'")
 
     # --- Setup ---
     device = torch.device("cuda" if torch.cuda.is_available() and config.get('use_gpu', True) else "cpu")
-    print(f"Using device: {device}")
+    logger.info(f"Using device: {device}")
 
     # Seed for reproducibility
     seed = config.get('random_seed', 42)
@@ -74,547 +98,498 @@ def main(config_path):
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    logger.info(f"Random seed set to {seed}")
 
     # --- Data Loading and Preprocessing ---
-    print("Conceptual: Loading data...")
-    # Replace with actual data loading logic
-    # X_train_raw, y_train_raw = YourDataLoader(config['data']['train_path'], ...).load()
-    # X_val_raw, y_val_raw = YourDataLoader(config['data']['val_path'], ...).load()
+    logger.info("Starting data loading and preprocessing for NCV...")
 
-    # Dummy data for now
-    num_samples_train = config.get('dummy_data_train_samples', 1000)
-    num_samples_val = config.get('dummy_data_val_samples', 200)
+    # --- Conceptual Data Loading using data_utils.data_loader ---
+    # In a real scenario, X_full_raw and y_full_raw would be loaded here.
+    # from data_utils.data_loader import load_raw_data
+    # try:
+    #     # Assuming config has 'data_paths' and 'target_column' correctly set up
+    #     # X_full_raw_df, y_full_raw_series = load_raw_data(config) # If load_raw_data returns df/series
+    #     # X_full_raw = X_full_raw_df.to_numpy() # Convert to numpy as expected by current code
+    #     # y_full_raw = y_full_raw_series.to_numpy()
+    #     logger.info("Conceptual: Real data loading would occur here.")
+    # except Exception as e:
+    #     logger.critical(f"Failed to load raw data: {e}. Exiting.")
+    #     sys.exit(1)
+    # For this conceptual step, we continue with dummy data generation if real loading fails or is bypassed.
+    logger.info("Using dummy data generation for this run.")
+    num_samples_train_orig = config.get('dummy_data_train_samples', 400) # Adjusted for dummy config
+    num_samples_val_orig = config.get('dummy_data_val_samples', 100)  # Adjusted for dummy config
+    num_total_samples = num_samples_train_orig + num_samples_val_orig
     num_features = config.get('dummy_data_features', 20)
-    num_classes = config.get('dummy_data_classes', 2)
 
-    # Create imbalanced dummy data
-    weights_train = config.get('dummy_data_train_weights', [0.9, 0.1])
-    # Ensure weights sum to 1 for np.random.choice
-    p_train = np.array(weights_train) / np.sum(weights_train)
-    y_train_raw = np.random.choice(num_classes, num_samples_train, p=p_train)
-    X_train_raw = np.random.rand(num_samples_train, num_features)
+    # Determine num_classes from config first to ensure consistency
+    # This was previously derived from y_train_raw later, which is fine, but for NCV setup,
+    # it's good to have it early.
+    num_classes_config = config.get('dummy_data_classes', 2)
+    if num_classes_config < 2:
+        raise ValueError(f"dummy_data_classes in config must be at least 2. Found {num_classes_config}.")
 
-    weights_val = config.get('dummy_data_val_weights', [0.9, 0.1])
-    p_val = np.array(weights_val) / np.sum(weights_val)
-    y_val_raw = np.random.choice(num_classes, num_samples_val, p=p_val)
-    X_val_raw = np.random.rand(num_samples_val, num_features)
+    # Create imbalanced dummy data for the combined dataset
+    # Use weights from original train config for simplicity, or define new combined weights
+    weights_combined = config.get('dummy_data_train_weights', [0.9, 0.1]) # Or new 'dummy_data_combined_weights'
+    p_combined = np.array(weights_combined) / np.sum(weights_combined)
 
-    print(f"Original training data shape: X={X_train_raw.shape}, y={y_train_raw.shape}")
-    print(f"Original training class distribution: {np.bincount(y_train_raw)}")
+    # Generate features for the entire dataset
+    X_full_raw = np.random.rand(num_total_samples, num_features)
+    # Generate labels for the entire dataset
+    y_full_raw = np.random.choice(num_classes_config, num_total_samples, p=p_combined)
 
+    logger.info(f"Full raw data shape for NCV: X={X_full_raw.shape}, y={y_full_raw.shape}")
+    logger.info(f"Full raw data class distribution: {np.bincount(y_full_raw)}")
 
-    # --- Data Balancing (RSMOTE-GAN) ---
-    if config.get('balancing', {}).get('use_rsmote_gan', False):
-        print("Applying RSMOTE-GAN...")
-        rsmote_config = config['balancing'].get('rsmote_gan_params', {})
-        rsmote_gan = RSMOTEGAN(
-            k_neighbors=rsmote_config.get('k', 5),
-            minority_upsample_factor=rsmote_config.get('minority_upsample_factor', 3.0),
-            random_state=seed
-        )
-        X_train, y_train = rsmote_gan.fit_resample(X_train_raw, y_train_raw)
-        print(f"Resampled training data shape: X={X_train.shape}, y={y_train.shape}")
-        print(f"Resampled training class distribution: {np.bincount(y_train)}")
-    else:
-        X_train, y_train = X_train_raw, y_train_raw
+    # The initial top-level balancing (e.g., config.get('balancing', {}).get('use_rsmote_gan', False))
+    # is removed from this top level. Balancing, if used, should primarily happen:
+    # 1. Inside the inner CV loop on its specific training folds (controlled by 'use_rsmote_gan_in_cv').
+    # 2. Optionally, on the outer loop's training portion (X_outer_train) before the inner CV loop begins.
+    #    This would require a new configuration flag, e.g., 'use_rsmote_gan_on_outer_train'.
+    #    For now, we rely on 'use_rsmote_gan_in_cv' for balancing within the inner folds.
 
-    # Convert data to PyTorch tensors
-    X_train_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
-    y_train_tensor = torch.tensor(y_train, dtype=torch.long).to(device)
-    X_val_tensor = torch.tensor(X_val_raw, dtype=torch.float32).to(device)
-    y_val_tensor = torch.tensor(y_val_raw, dtype=torch.long).to(device)
+    # The direct conversion to torch tensors and model definition/loss/optimizer for a single model
+    # (previously done here) is no longer relevant at this top level, as all model training
+    # now occurs inside the Nested Cross-Validation structure.
 
+    logger.info("Starting Nested Cross-Validation ensemble training process...")
 
-    # --- Model Definition ---
-    print("Conceptual: Defining model...")
-    # model = YourModel(input_dim=X_train_tensor.shape[1], **config['model_params']).to(device)
-    # Dummy model for now
-    model = torch.nn.Linear(num_features, num_classes).to(device) # Example: Simple Linear model
-    print(model)
+    # --- Nested Cross-Validation Setup ---
+    # Number of folds for the outer loop (evaluating the entire pipeline)
+    n_outer_folds = config.get('ensemble', {}).get('n_outer_folds', 5)
+    # Number of folds for the inner loop (generating OOF predictions for meta-learner training)
+    n_inner_folds = config.get('ensemble', {}).get('n_inner_folds_for_oof', 5) # Renamed from n_folds_for_oof
 
-    # --- Loss Function (Class-Balanced Focal Loss) ---
-    loss_config = config.get('loss_function', {})
-    if loss_config.get('type') == 'ClassBalancedFocalLoss':
-        print("Using Class-Balanced Focal Loss.")
-        # Get samples per class from the original (before balancing) or resampled training labels
-        # The paper "Class-Balanced Loss Based on Effective Number of Samples" calculates weights
-        # based on the original label distribution.
-        # If using RSMOTE-GAN, the distribution is already altered.
-        # For this example, let's use the distribution of y_train_raw if balancing is applied,
-        # or y_train if no balancing, to determine the 'natural' frequencies for weighting.
-        # The choice here depends on the strategy: balance via data, via loss, or both.
-        # The prompt says "RSMOTE/GAN-SMOTE + Class-Balanced Focal Loss", suggesting both.
-        # The CBFL paper suggests using original distribution for calculating weights.
+    outer_skf = StratifiedKFold(n_splits=n_outer_folds, shuffle=True, random_state=seed)
 
-        samples_per_class_for_loss = get_samples_per_class(y_train_raw) # Based on original distribution
-        print(f"Samples per class (for CBFL weights): {samples_per_class_for_loss}")
+    # Store metrics from each outer fold
+    outer_fold_metrics_meta = {'accuracy': [], 'auroc': [], 'f1': [], 'precision': [], 'recall': []}
+    outer_fold_metrics_soft_vote = {'accuracy': [], 'auroc': [], 'f1': [], 'precision': [], 'recall': []}
 
-        criterion = ClassBalancedFocalLoss(
-            beta=loss_config.get('beta', 0.9999),
-            gamma=loss_config.get('gamma', 2.0),
-            samples_per_class=samples_per_class_for_loss,
-            reduction='mean'
-        )
-    else:
-        print("Using standard CrossEntropyLoss.")
-        criterion = torch.nn.CrossEntropyLoss()
-    print(criterion)
-
-    # --- Optimizer ---
-    optimizer_config = config.get('optimizer', {})
-    opt_name = optimizer_config.get('name', 'Adam')
-    lr = optimizer_config.get('lr', 1e-3)
-
-    if opt_name.lower() == 'adam':
-        optimizer = optim.Adam(model.parameters(), lr=lr)
-    elif opt_name.lower() == 'sgd':
-        optimizer = optim.SGD(model.parameters(), lr=lr, momentum=optimizer_config.get('momentum', 0.9))
-    else:
-        raise ValueError(f"Unsupported optimizer: {opt_name}")
-    print(optimizer)
-
-    # --- Model Training ---
-    # This will now be more complex to handle base models and meta-learner for ensemble.
-    # The plan specifies: "Soft-vote (0.5 STM-GNN / 0.3 LGBM / 0.2 TECO) + meta-learner XGBoost"
-    # This usually means:
-    # 1. Train base models.
-    # 2. Get their predictions (often OOF for meta-learner training data).
-    # 3. For final prediction: either soft-vote OR use meta-learner. The "+" suggests both might be options
-    #    or meta-learner is trained on OOF, and final output is meta-learner's output.
-    #    Let's assume meta-learner is the primary way to combine, trained on OOF.
-    #    The soft-vote weights (0.5/0.3/0.2) might be an alternative way to combine, or perhaps
-    #    they are feature weights if base model outputs are concatenated before meta-learner.
-    #    The spec "Soft-vote (0.5 / 0.3 / 0.2) + meta-learner podbija zwykle +0,02 AUROC"
-    #    suggests these are two separate strategies or soft-vote is an input to meta.
-    #    Let's assume meta-learner trains on OOF predictions of base models.
-
-    print("Starting ensemble training process...")
-
-    # Convert all data to PyTorch tensors for deep learning models first
-    # (LGBM/XGBoost wrappers will handle numpy/pandas)
-    # X_train_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
-    # y_train_tensor = torch.tensor(y_train, dtype=torch.long).to(device)
-    # X_val_tensor = torch.tensor(X_val_raw, dtype=torch.float32).to(device) # Using X_val_raw for DL model val
-    # y_val_tensor = torch.tensor(y_val_raw, dtype=torch.long).to(device)
-
-
-    # --- Cross-validation for generating OOF predictions for Meta-Learner ---
-    n_folds = config.get('ensemble', {}).get('n_folds_for_oof', 5)
-    # Use original X_train_raw, y_train_raw for CV splitting before any initial balancing
-    # Balancing should happen INSIDE the CV fold if it's data-dependent.
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-
-    # Placeholders for OOF predictions from each base model
-    # These will store predictions on the validation part of each fold.
-    # Dimensions: (num_train_samples, num_classes_base_model_output)
-    # For LGBM/XGBoost, this is num_classes. For DL models, also num_classes (after softmax).
-
-    # Determine num_classes from the data (used for OOF arrays and metric calculations)
-    # Ensure this is done BEFORE it's first used by oof_preds or logging.
-    # Using y_train_raw as it represents the original class structure for OOF.
-    unique_classes_train_raw = np.unique(y_train_raw)
-    num_classes = len(unique_classes_train_raw)
-    print(f"Determined number of classes: {num_classes} from y_train_raw unique values: {unique_classes_train_raw}")
+    # Determine num_classes from the full dataset's labels
+    # This is crucial for initializing OOF arrays and metrics correctly throughout the NCV process.
+    unique_classes_full_raw = np.unique(y_full_raw)
+    num_classes = len(unique_classes_full_raw) # This 'num_classes' will be used globally within main()
+    logger.info(f"Determined number of classes for NCV: {num_classes} from y_full_raw unique values: {unique_classes_full_raw}")
     if num_classes < 2:
-        raise ValueError(f"Number of classes must be at least 2. Found {num_classes} in y_train_raw.")
+        logger.error(f"Number of classes must be at least 2 for classification. Found {num_classes} in y_full_raw for NCV.")
+        raise ValueError(f"Number of classes must be at least 2. Found {num_classes} in y_full_raw for NCV.")
 
 
-    oof_preds = {
-        'lgbm': np.zeros((len(y_train_raw), num_classes)),
-        'teco': np.zeros((len(y_train_raw), num_classes)),
-        'stm_gnn': np.zeros((len(y_train_raw), num_classes))
-    }
+    # --- Outer Cross-Validation Loop ---
+    # This loop iterates through the outer folds. In each iteration:
+    # - The data is split into an outer training set (X_outer_train, y_outer_train) and an outer test set (X_outer_test, y_outer_test).
+    # - The inner CV loop runs on X_outer_train to train base models and generate OOFs for the meta-learner.
+    # - The meta-learner is trained on these OOFs.
+    # - The entire ensemble (base models + meta-learner) is then evaluated on X_outer_test.
+    for outer_fold_idx, (outer_train_idx, outer_test_idx) in enumerate(outer_skf.split(X_full_raw, y_full_raw)):
+        logger.info(f"===== Starting Outer Fold {outer_fold_idx + 1}/{n_outer_folds} =====")
+        X_outer_train_raw_fold, y_outer_train_fold = X_full_raw[outer_train_idx], y_full_raw[outer_train_idx]
+        X_outer_test_raw_fold, y_outer_test_fold = X_full_raw[outer_test_idx], y_full_raw[outer_test_idx]
+        logger.debug(f"Outer Fold {outer_fold_idx+1}: X_outer_train_raw_fold shape {X_outer_train_raw_fold.shape}, X_outer_test_raw_fold shape {X_outer_test_raw_fold.shape}")
 
-    # Placeholders for test predictions from each base model (averaged over folds)
-    test_preds_sum = {
-        'lgbm': np.zeros((len(y_val_raw), num_classes)), # Using y_val_raw as stand-in for test set size
-        'teco': np.zeros((len(y_val_raw), num_classes)),
-        'stm_gnn': np.zeros((len(y_val_raw), num_classes))
-    }
-
-    # Actual test set (using X_val_raw, y_val_raw as a proxy for a true test set here)
-    X_test_for_base_models = X_val_raw
-    y_test_for_base_models = y_val_raw
-
-
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_raw, y_train_raw)):
-        print(f"\n--- Fold {fold+1}/{n_folds} ---")
-        X_fold_train, y_fold_train = X_train_raw[train_idx], y_train_raw[train_idx]
-        X_fold_val, y_fold_val = X_train_raw[val_idx], y_train_raw[val_idx]
-
-        # --- Optional: Apply RSMOTE-GAN to (X_fold_train, y_fold_train) ---
-        if config.get('balancing', {}).get('use_rsmote_gan_in_cv', True): # New config flag
-            print(f"Fold {fold+1}: Applying RSMOTE-GAN to fold training data...")
-            rsmote_cv_config = config['balancing'].get('rsmote_gan_params', {})
-            rsmote_gan_cv = RSMOTEGAN(
-                k_neighbors=rsmote_cv_config.get('k', 5),
-                minority_upsample_factor=rsmote_cv_config.get('minority_upsample_factor', 3.0),
-                random_state=seed + fold # Vary seed per fold
-            )
-            X_fold_train_balanced, y_fold_train_balanced = rsmote_gan_cv.fit_resample(X_fold_train, y_fold_train)
-            print(f"Fold {fold+1}: Resampled training data shape: X={X_fold_train_balanced.shape}")
-        else:
-            X_fold_train_balanced, y_fold_train_balanced = X_fold_train, y_fold_train
-
-
-        # --- 1. Train LightGBM on (X_fold_train_balanced, y_fold_train_balanced) ---
-        if config.get('ensemble', {}).get('train_lgbm', True):
-            print(f"\nFold {fold+1}: Training LightGBM...")
-            lgbm_config = config.get('ensemble', {}).get('lgbm_params', {})
-            lgbm_fold_model = LightGBMModel(
-                params=lgbm_config.get('model_specific_params'), # e.g., learning_rate, n_estimators
-                num_leaves=lgbm_config.get('num_leaves', 10000),
-                class_weight=lgbm_config.get('class_weight', 'balanced')
-            )
-            lgbm_fold_model.train(X_fold_train_balanced, y_fold_train_balanced,
-                                  X_fold_val, y_fold_val, # Use original fold val for early stopping
-                                  num_boost_round=lgbm_config.get('num_boost_round', 1000),
-                                  early_stopping_rounds=lgbm_config.get('early_stopping_rounds', 50))
-
-            oof_preds['lgbm'][val_idx] = lgbm_fold_model.predict_proba(X_fold_val)
-            test_preds_sum['lgbm'] += lgbm_fold_model.predict_proba(X_test_for_base_models) / n_folds
-            # lgbm_fold_model.save_model(f"lgbm_fold_{fold+1}.joblib") # Optional: save fold model
-
-            # Log LGBM fold metrics
-            y_fold_val_pred_lgbm = lgbm_fold_model.predict(X_fold_val)
-            y_fold_val_proba_lgbm = oof_preds['lgbm'][val_idx]
-
-            fold_accuracy_lgbm = accuracy_score(y_fold_val, y_fold_val_pred_lgbm)
-            fold_f1_lgbm = f1_score(y_fold_val, y_fold_val_pred_lgbm, average='weighted' if num_classes > 2 else 'binary')
-            fold_precision_lgbm = precision_score(y_fold_val, y_fold_val_pred_lgbm, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
-            fold_recall_lgbm = recall_score(y_fold_val, y_fold_val_pred_lgbm, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
-
-            fold_auroc_lgbm = -1 # Placeholder if not calculable
-            try:
-                if num_classes == 2:
-                    fold_auroc_lgbm = roc_auc_score(y_fold_val, y_fold_val_proba_lgbm[:, 1])
-                else:
-                    fold_auroc_lgbm = roc_auc_score(y_fold_val, y_fold_val_proba_lgbm, multi_class='ovr', average='weighted')
-            except ValueError as e:
-                print(f"Fold {fold+1} LGBM AUROC calculation error: {e}")
-
-            wandb.log({
-                f"fold_{fold+1}/lgbm_accuracy": fold_accuracy_lgbm,
-                f"fold_{fold+1}/lgbm_auroc": fold_auroc_lgbm,
-                f"fold_{fold+1}/lgbm_f1": fold_f1_lgbm,
-                f"fold_{fold+1}/lgbm_precision": fold_precision_lgbm,
-                f"fold_{fold+1}/lgbm_recall": fold_recall_lgbm,
-                "fold": fold + 1
-            })
-            print(f"Fold {fold+1} LGBM Val Accuracy: {fold_accuracy_lgbm:.4f}, AUROC: {fold_auroc_lgbm:.4f}")
+        # --- Conceptual General Preprocessing ---
+        # from data_utils.preprocess import get_preprocessor
+        # numerical_cols = config.get('preprocessing',{}).get('numerical_cols', []) # Define in config
+        # categorical_cols = config.get('preprocessing',{}).get('categorical_cols', []) # Define in config
+        # preproc_config = config.get('preprocessing', {})
+        #
+        # preprocessor = get_preprocessor(
+        #     numerical_cols=numerical_cols, categorical_cols=categorical_cols,
+        #     imputation_strategy=preproc_config.get('imputation_strategy', 'median'),
+        #     scale_numerics=preproc_config.get('scale_numerics', True),
+        #     handle_unknown_categorical=preproc_config.get('onehot_handle_unknown', 'ignore')
+        # )
+        #
+        # try:
+        #     logger.info(f"Outer Fold {outer_fold_idx+1}: Fitting preprocessor on X_outer_train_raw_fold...")
+        #     X_outer_train_processed = preprocessor.fit_transform(pd.DataFrame(X_outer_train_raw_fold, columns=[f'feature_{i}' for i in range(X_outer_train_raw_fold.shape[1])])) # Assuming feature names for DataFrame conversion
+        #     X_outer_test_processed = preprocessor.transform(pd.DataFrame(X_outer_test_raw_fold, columns=[f'feature_{i}' for i in range(X_outer_test_raw_fold.shape[1])]))
+        #     y_outer_train = y_outer_train_fold # Labels usually don't need this kind of preprocessing
+        #     y_outer_test = y_outer_test_fold
+        #     logger.info(f"Outer Fold {outer_fold_idx+1}: Preprocessing complete. X_outer_train_processed shape {X_outer_train_processed.shape}, X_outer_test_processed shape {X_outer_test_processed.shape}")
+        # except Exception as e:
+        #     logger.error(f"Outer Fold {outer_fold_idx+1}: Error during general preprocessing: {e}. Using raw data for this outer fold.")
+        #     X_outer_train_processed = X_outer_train_raw_fold
+        #     X_outer_test_processed = X_outer_test_raw_fold
+        #     y_outer_train = y_outer_train_fold
+        #     y_outer_test = y_outer_test_fold
+        # For dummy data and current conceptual models, we'll bypass actual preprocessing and use raw splits.
+        X_outer_train, y_outer_train = X_outer_train_raw_fold, y_outer_train_fold
+        X_outer_test, y_outer_test = X_outer_test_raw_fold, y_outer_test_fold
+        # --- End Conceptual General Preprocessing ---
 
 
-        # --- 2. Train TECO-Transformer (Conceptual) ---
-        if config.get('ensemble', {}).get('train_teco', True):
-            print(f"\nFold {fold+1}: Training TECO-Transformer...")
-            teco_config = config.get('ensemble', {}).get('teco_params', {})
+        # --- Inner Cross-Validation for OOF generation on X_outer_train ---
+        # This loop trains base models on folds of X_outer_train (processed) and collects their OOF predictions.
+        # It also averages predictions from these base models on X_outer_test (processed).
+        inner_skf = StratifiedKFold(n_splits=n_inner_folds, shuffle=True, random_state=seed + outer_fold_idx) # Vary seed for robustness
 
-            # Data Preparation for TECO
-            # Assuming X_fold_train_balanced, X_fold_val, X_test_for_base_models are numpy arrays of features
-            # We need feature names. For now, assume they are 'feature_0', 'feature_1', ...
-            # This should be configured properly via `teco_feature_columns` in config.
-            num_fold_features = X_fold_train_balanced.shape[1]
-            # Use generic feature names if not specified in config, this is a fallback.
-            teco_feature_columns = teco_config.get('feature_columns_teco', [f'feature_{i}' for i in range(num_fold_features)])
+        # Placeholders for OOF predictions from base models on X_outer_train
+        oof_preds_inner = {
+            'lgbm': np.zeros((len(y_outer_train), num_classes)),
+            'teco': np.zeros((len(y_outer_train), num_classes)),
+            'stm_gnn': np.zeros((len(y_outer_train), num_classes))
+        }
 
-            # Ensure feature_columns used for DataFrame creation match the actual number of features
-            if len(teco_feature_columns) != num_fold_features:
-                print(f"Warning: Mismatch between teco_feature_columns ({len(teco_feature_columns)}) and actual features ({num_fold_features}). Using generic names.")
-                teco_feature_columns = [f'feature_{i}' for i in range(num_fold_features)]
+        # Placeholders for base model predictions on X_outer_test (averaged over inner folds)
+        base_model_preds_on_outer_test_sum = {
+            'lgbm': np.zeros((len(y_outer_test), num_classes)),
+            'teco': np.zeros((len(y_outer_test), num_classes)),
+            'stm_gnn': np.zeros((len(y_outer_test), num_classes))
+        }
 
-            df_fold_train = pd.DataFrame(X_fold_train_balanced, columns=teco_feature_columns)
-            df_fold_val = pd.DataFrame(X_fold_val, columns=teco_feature_columns)
-            df_test_teco = pd.DataFrame(X_test_for_base_models, columns=teco_feature_columns)
+        for inner_fold_idx, (inner_train_idx, inner_val_idx) in enumerate(inner_skf.split(X_outer_train, y_outer_train)):
+            logger.info(f"--- Starting Inner Fold {inner_fold_idx + 1}/{n_inner_folds} (Outer Fold {outer_fold_idx+1}) ---")
+            X_inner_fold_train, y_inner_fold_train = X_outer_train[inner_train_idx], y_outer_train[inner_train_idx]
+            X_inner_fold_val, y_inner_fold_val = X_outer_train[inner_val_idx], y_outer_train[inner_val_idx]
+            logger.debug(f"Inner Fold {inner_fold_idx+1}: X_inner_fold_train shape {X_inner_fold_train.shape}, X_inner_fold_val shape {X_inner_fold_val.shape}")
 
-            # For TECO, let's assume the target is binary classification (e.g., 'outcomeType')
-            # The y_fold_train_balanced, y_fold_val are already available.
-            # The TabularSequenceDataset will handle mapping if target is string.
-            # For simplicity, we'll use the 'outcomeType' as the target column name,
-            # and the dataset will map 'Survival'/'Death' if needed.
-            teco_target_column = teco_config.get('target_column_teco', 'outcomeType_teco') # Example, should be in config
-
-            train_teco_dataset = TabularSequenceDataset(
-                csv_file_path=None, df_data=df_fold_train, y_data=y_fold_train_balanced,
-                feature_columns=teco_feature_columns, target_column=teco_target_column
-            )
-            val_teco_dataset = TabularSequenceDataset(
-                csv_file_path=None, df_data=df_fold_val, y_data=y_fold_val,
-                feature_columns=teco_feature_columns, target_column=teco_target_column
-            )
-            test_teco_dataset = TabularSequenceDataset( # y_data can be dummy/None for test set if only predicting
-                csv_file_path=None, df_data=df_test_teco, y_data=np.zeros(len(df_test_teco)), # Dummy y for test
-                feature_columns=teco_feature_columns, target_column=teco_target_column
-            )
-
-            batch_size_teco = teco_config.get('batch_size_teco', 32)
-            train_teco_loader = DataLoader(train_teco_dataset, batch_size=batch_size_teco, shuffle=True, collate_fn=basic_collate_fn)
-            val_teco_loader = DataLoader(val_teco_dataset, batch_size=batch_size_teco, shuffle=False, collate_fn=basic_collate_fn)
-            test_teco_loader = DataLoader(test_teco_dataset, batch_size=batch_size_teco, shuffle=False, collate_fn=basic_collate_fn)
-
-            teco_model = TECOTransformerModel(
-                input_feature_dim=len(teco_feature_columns),
-                d_model=teco_config.get('d_model', 128), # Smaller default for faster dummy runs
-                num_encoder_layers=teco_config.get('num_encoder_layers', 2),
-                nhead=teco_config.get('nhead', 4),
-                dim_feedforward=teco_config.get('dim_feedforward', 512),
-                dropout=teco_config.get('dropout', 0.1),
-                num_classes=num_classes, # num_classes derived from y_train_raw
-                max_seq_len=teco_config.get('max_seq_len', 50) # For positional encoding, though current seq_len is 1
-            ).to(device)
-
-            teco_criterion = nn.CrossEntropyLoss()
-            teco_optimizer = optim.Adam(teco_model.parameters(), lr=teco_config.get('lr_teco', 1e-4))
-
-            epochs_teco = teco_config.get('epochs_teco', 5) # Small number of epochs for example
-
-            for epoch in range(epochs_teco):
-                teco_model.train()
-                train_loss_sum = 0
-                for batch in train_teco_loader:
-                    sequences = batch['sequence'].to(device)
-                    padding_masks = batch['padding_mask'].to(device)
-                    targets = batch['target'].to(device)
-
-                    teco_optimizer.zero_grad()
-                    outputs = teco_model(sequences, src_padding_mask=padding_masks)
-                    loss = teco_criterion(outputs, targets)
-                    loss.backward()
-                    teco_optimizer.step()
-                    train_loss_sum += loss.item()
-                avg_train_loss = train_loss_sum / len(train_teco_loader)
-                print(f"Fold {fold+1}, TECO Epoch {epoch+1}/{epochs_teco}, Train Loss: {avg_train_loss:.4f}")
-
-            # Evaluation and OOF predictions for TECO
-            teco_model.eval()
-            fold_val_preds_teco_list = []
-            with torch.no_grad():
-                for batch in val_teco_loader:
-                    sequences = batch['sequence'].to(device)
-                    padding_masks = batch['padding_mask'].to(device)
-                    outputs = teco_model(sequences, src_padding_mask=padding_masks)
-                    probabilities = torch.softmax(outputs, dim=1)
-                    fold_val_preds_teco_list.append(probabilities.cpu().numpy())
-
-            fold_val_preds_teco = np.concatenate(fold_val_preds_teco_list, axis=0)
-            if fold_val_preds_teco.shape[1] != num_classes: # Basic sanity check
-                 # If num_classes is 2, but model outputs 1 logit for BCE, adjust.
-                 # Current TECO with CrossEntropyLoss for num_classes=2 outputs 2 logits.
-                 print(f"Warning: TECO output prob shape {fold_val_preds_teco.shape} mismatch with num_classes {num_classes}")
-
-            oof_preds['teco'][val_idx] = fold_val_preds_teco[:, :num_classes] # Ensure correct shape
-
-            # Test set predictions for TECO
-            fold_test_preds_teco_list = []
-            with torch.no_grad():
-                for batch in test_teco_loader:
-                    sequences = batch['sequence'].to(device)
-                    padding_masks = batch['padding_mask'].to(device)
-                    outputs = teco_model(sequences, src_padding_mask=padding_masks)
-                    probabilities = torch.softmax(outputs, dim=1)
-                    fold_test_preds_teco_list.append(probabilities.cpu().numpy())
-
-            fold_test_preds_teco = np.concatenate(fold_test_preds_teco_list, axis=0)
-            test_preds_sum['teco'] += fold_test_preds_teco[:, :num_classes] / n_folds
-
-            # Log TECO fold metrics
-            y_fold_val_pred_teco_labels = np.argmax(oof_preds['teco'][val_idx], axis=1)
-            fold_accuracy_teco = accuracy_score(y_fold_val, y_fold_val_pred_teco_labels)
-            fold_f1_teco = f1_score(y_fold_val, y_fold_val_pred_teco_labels, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
-            fold_precision_teco = precision_score(y_fold_val, y_fold_val_pred_teco_labels, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
-            fold_recall_teco = recall_score(y_fold_val, y_fold_val_pred_teco_labels, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
-
-            fold_auroc_teco = -1
-            try:
-                if num_classes == 2:
-                    fold_auroc_teco = roc_auc_score(y_fold_val, oof_preds['teco'][val_idx][:, 1])
-                else:
-                    fold_auroc_teco = roc_auc_score(y_fold_val, oof_preds['teco'][val_idx], multi_class='ovr', average='weighted')
-            except ValueError as e:
-                print(f"Fold {fold+1} TECO AUROC calculation error: {e}")
-
-            wandb.log({
-                f"fold_{fold+1}/teco_accuracy": fold_accuracy_teco,
-                f"fold_{fold+1}/teco_auroc": fold_auroc_teco,
-                f"fold_{fold+1}/teco_f1": fold_f1_teco,
-                f"fold_{fold+1}/teco_precision": fold_precision_teco,
-                f"fold_{fold+1}/teco_recall": fold_recall_teco,
-                "fold": fold + 1
-            })
-            print(f"Fold {fold+1} TECO Val Accuracy: {fold_accuracy_teco:.4f}, AUROC: {fold_auroc_teco:.4f}")
-
-        # --- 3. Train STM-GNN (Conceptual) ---
-        if config.get('ensemble', {}).get('train_stm_gnn', True):
-            print(f"\nFold {fold+1}: Training STM-GNN (Conceptual)...")
-            # This requires graph snapshot data. Assuming X_fold_train_balanced can be used/transformed.
-            # Or, specific graph data loader is needed. For now, conceptual.
-            # stm_gnn_config = config.get('ensemble', {}).get('stm_gnn_params', {})
-            # stm_gnn_model = STMGNN(...)
-            # ... training loop for STM-GNN ...
-            # oof_preds['stm_gnn'][val_idx] = stm_gnn_model.predict_proba(X_fold_val_graphs)
-            # test_preds_sum['stm_gnn'] += stm_gnn_model.predict_proba(X_test_graphs) / n_folds
-            # For dummy run:
-            class_probs_sim = np.bincount(y_train_raw) / len(y_train_raw)
-            num_val_samples_fold = len(y_fold_val)
-            oof_preds['stm_gnn'][val_idx] = np.random.multinomial(1, class_probs_sim, size=num_val_samples_fold) * 0.85 + \
-                                            np.random.rand(num_val_samples_fold, num_classes) * 0.15 # Add noise
-            oof_preds['stm_gnn'][val_idx] = oof_preds['stm_gnn'][val_idx] / np.sum(oof_preds['stm_gnn'][val_idx], axis=1, keepdims=True)
-
-            num_test_samples_fold = len(y_test_for_base_models)
-            test_preds_sum['stm_gnn'] += (np.random.multinomial(1, class_probs_sim, size=num_test_samples_fold) * 0.85 + \
-                                         np.random.rand(num_test_samples_fold, num_classes) * 0.15) / n_folds
-            test_preds_sum['stm_gnn'] = np.clip(test_preds_sum['stm_gnn'], 0, 1)
-
-            # Log STM-GNN fold metrics (conceptual)
-            y_fold_val_pred_stm_gnn = np.argmax(oof_preds['stm_gnn'][val_idx], axis=1) # Dummy prediction
-            fold_accuracy_stm_gnn = accuracy_score(y_fold_val, y_fold_val_pred_stm_gnn)
-            fold_auroc_stm_gnn = -1
-            try:
-                if num_classes == 2:
-                    fold_auroc_stm_gnn = roc_auc_score(y_fold_val, oof_preds['stm_gnn'][val_idx][:, 1])
-                else:
-                    fold_auroc_stm_gnn = roc_auc_score(y_fold_val, oof_preds['stm_gnn'][val_idx], multi_class='ovr', average='weighted')
-            except ValueError as e:
-                print(f"Fold {fold+1} STM-GNN AUROC calculation error (conceptual): {e}")
-
-            wandb.log({
-                f"fold_{fold+1}/stm_gnn_accuracy": fold_accuracy_stm_gnn,
-                f"fold_{fold+1}/stm_gnn_auroc": fold_auroc_stm_gnn,
-                "fold": fold + 1
-            })
-            print(f"Fold {fold+1} STM-GNN Val Accuracy (conceptual): {fold_accuracy_stm_gnn:.4f}, AUROC (conceptual): {fold_auroc_stm_gnn:.4f}")
-
-
-    print("\n--- Finished generating OOF predictions for base models ---")
-    # At this point, oof_preds contains predictions from each base model for the entire training set.
-    # These will be the features for the meta-learner.
-
-    # Concatenate OOF predictions to form training data for meta-learner
-    meta_features_train_list = []
-    if config.get('ensemble', {}).get('train_lgbm', True):
-        meta_features_train_list.append(oof_preds['lgbm'])
-    if config.get('ensemble', {}).get('train_teco', True):
-        meta_features_train_list.append(oof_preds['teco'])
-    if config.get('ensemble', {}).get('train_stm_gnn', True):
-        meta_features_train_list.append(oof_preds['stm_gnn'])
-
-    if not meta_features_train_list:
-        raise ValueError("No base models were trained or included for meta-learner input.")
-
-    X_meta_train = np.concatenate(meta_features_train_list, axis=1)
-    y_meta_train = y_train_raw # Meta-learner is trained on original labels
-
-    print(f"Meta-learner training features shape: {X_meta_train.shape}") # (num_train_samples, num_base_models * num_classes)
-
-    # --- Train XGBoost Meta-Learner ---
-    if config.get('ensemble', {}).get('train_meta_learner', True):
-        print("\n--- Training XGBoost Meta-Learner ---")
-        meta_config = config.get('ensemble', {}).get('meta_learner_xgb_params', {})
-        xgb_meta_model = XGBoostMetaLearner(
-            params=meta_config.get('model_specific_params'),
-            depth=meta_config.get('depth', 3)
-        )
-        # For meta-learner, we might not have a separate validation set easily if all data used for OOF.
-        # Could split X_meta_train or use a portion of it. For now, train on all OOF.
-        # Or, could perform another CV loop for meta-learner training (complex).
-        # Simplest: train on all OOF, use early stopping if a small val split is made from OOF.
-        xgb_meta_model.train(X_meta_train, y_meta_train,
-                             num_boost_round=meta_config.get('num_boost_round', 200),
-                             early_stopping_rounds=meta_config.get('early_stopping_rounds', 20) # Requires validation set
-                            )
-        # xgb_meta_model.save_model(config['ensemble']['meta_learner_save_path'])
-        print("XGBoost Meta-Learner trained.")
-
-        # --- Final Prediction using Meta-Learner (on the proxy test set) ---
-        # Create test features for meta-learner
-        meta_features_test_list = []
-        if config.get('ensemble', {}).get('train_lgbm', True):
-            meta_features_test_list.append(test_preds_sum['lgbm']) # Averaged test preds
-        if config.get('ensemble', {}).get('train_teco', True):
-            meta_features_test_list.append(test_preds_sum['teco'])
-        if config.get('ensemble', {}).get('train_stm_gnn', True):
-            meta_features_test_list.append(test_preds_sum['stm_gnn'])
-
-        X_meta_test = np.concatenate(meta_features_test_list, axis=1)
-
-        final_predictions_meta_proba = xgb_meta_model.predict_proba(X_meta_test)
-        final_predictions_meta_labels = xgb_meta_model.predict(X_meta_test)
-        print(f"Meta-learner predictions on test set (proxy) - Proba shape: {final_predictions_meta_proba.shape}")
-
-        # Evaluate meta-learner (example)
-        accuracy_meta = accuracy_score(y_test_for_base_models, final_predictions_meta_labels)
-        f1_meta = f1_score(y_test_for_base_models, final_predictions_meta_labels, average='weighted' if num_classes > 2 else 'binary')
-        precision_meta = precision_score(y_test_for_base_models, final_predictions_meta_labels, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
-        recall_meta = recall_score(y_test_for_base_models, final_predictions_meta_labels, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
-
-        auroc_meta = -1
-        try:
-            if num_classes == 2:
-                auroc_meta = roc_auc_score(y_test_for_base_models, final_predictions_meta_proba[:, 1])
+            # Apply RSMOTE-GAN to (X_inner_fold_train, y_inner_fold_train) if configured
+            # This balancing step is applied only to the training part of the current inner fold.
+            if config.get('balancing', {}).get('use_rsmote_gan_in_cv', True):
+                logger.info(f"Inner Fold {inner_fold_idx+1}: Applying RSMOTE-GAN to inner fold training data...")
+                rsmote_cv_config = config['balancing'].get('rsmote_gan_params', {})
+                rsmote_gan_cv = RSMOTEGAN(
+                    k_neighbors=rsmote_cv_config.get('k', 5),
+                    minority_upsample_factor=rsmote_cv_config.get('minority_upsample_factor', 3.0),
+                    random_state=seed + outer_fold_idx + inner_fold_idx # Vary seed
+                )
+                try:
+                    X_inner_fold_train_balanced, y_inner_fold_train_balanced = rsmote_gan_cv.fit_resample(X_inner_fold_train, y_inner_fold_train)
+                    logger.info(f"Inner Fold {inner_fold_idx+1}: RSMOTE-GAN completed. New shape: {X_inner_fold_train_balanced.shape}")
+                except Exception as e:
+                    logger.error(f"Inner Fold {inner_fold_idx+1}: Error during RSMOTE-GAN: {e}. Proceeding without balancing for this fold.")
+                    X_inner_fold_train_balanced, y_inner_fold_train_balanced = X_inner_fold_train, y_inner_fold_train
             else:
-                auroc_meta = roc_auc_score(y_test_for_base_models, final_predictions_meta_proba, multi_class='ovr', average='weighted')
-        except ValueError as e:
-            print(f"Meta-learner AUROC calculation error: {e}")
+                X_inner_fold_train_balanced, y_inner_fold_train_balanced = X_inner_fold_train, y_inner_fold_train
 
-        wandb.log({
-            "meta_learner/test_accuracy": accuracy_meta,
-            "meta_learner/test_auroc": auroc_meta,
-            "meta_learner/test_f1": f1_meta,
-            "meta_learner/test_precision": precision_meta,
-            "meta_learner/test_recall": recall_meta,
-        })
-        print(f"Meta-Learner Test Accuracy (proxy): {accuracy_meta:.4f}, AUROC: {auroc_meta:.4f}")
+            # --- 1. Train LightGBM (Inner Fold) ---
+            if config.get('ensemble', {}).get('train_lgbm', True):
+                logger.info(f"Inner Fold {inner_fold_idx+1}: Training LightGBM...")
+                try:
+                lgbm_config = config.get('ensemble', {}).get('lgbm_params', {})
+                lgbm_inner_fold_model = LightGBMModel(
+                    params=lgbm_config.get('model_specific_params'),
+                    num_leaves=lgbm_config.get('num_leaves', 10000),
+                    class_weight=lgbm_config.get('class_weight', 'balanced')
+                )
+                lgbm_inner_fold_model.train(
+                    X_inner_fold_train_balanced, y_inner_fold_train_balanced,
+                    X_inner_fold_val, y_inner_fold_val, # Use inner val for early stopping
+                    num_boost_round=lgbm_config.get('num_boost_round', 1000),
+                    early_stopping_rounds=lgbm_config.get('early_stopping_rounds', 50),
+                    verbose=False # Reduce verbosity for inner loops
+                )
+                oof_preds_inner['lgbm'][inner_val_idx] = lgbm_inner_fold_model.predict_proba(X_inner_fold_val)
+                base_model_preds_on_outer_test_sum['lgbm'] += lgbm_inner_fold_model.predict_proba(X_outer_test) / n_inner_folds
+                logger.info(f"Inner Fold {inner_fold_idx+1}: LightGBM training and prediction complete.")
+                except Exception as e:
+                    logger.error(f"Inner Fold {inner_fold_idx+1}: Error during LightGBM training or prediction: {e}")
+                    # Ensure downstream processes can handle missing predictions if necessary,
+                    # or fill with a default (e.g., zeros, though this might skew results).
+                    # For now, if a model fails, its OOF/test predictions might remain zero.
+                    pass # Continue to next model/fold
 
-    # --- Soft Voting (Alternative/Complementary) ---
-    # Weights: STM-GNN 0.5, LightGBM 0.3, TECO-Transformer 0.2
-    soft_vote_weights = config.get('ensemble', {}).get('soft_vote_weights', {})
-    if soft_vote_weights:
-        print("\n--- Performing Soft Voting (on proxy test set predictions) ---")
-        final_predictions_soft_vote_proba = np.zeros_like(test_preds_sum['lgbm']) # Init with one shape
+            # --- 2. Train TECO-Transformer (Inner Fold - Conceptual) ---
+            if config.get('ensemble', {}).get('train_teco', True):
+                logger.info(f"Inner Fold {inner_fold_idx+1}: Training TECO-Transformer...")
+                try:
+                teco_config = config.get('ensemble', {}).get('teco_params', {})
+                num_inner_fold_features = X_inner_fold_train_balanced.shape[1]
+                teco_feature_columns = teco_config.get('feature_columns_teco', [f'feature_{i}' for i in range(num_inner_fold_features)])
+                if len(teco_feature_columns) != num_inner_fold_features: # Fallback
+                    teco_feature_columns = [f'feature_{i}' for i in range(num_inner_fold_features)]
 
-        total_weight = 0
-        if config.get('ensemble', {}).get('train_lgbm', True) and 'lgbm' in soft_vote_weights:
-            final_predictions_soft_vote_proba += soft_vote_weights['lgbm'] * test_preds_sum['lgbm']
-            total_weight += soft_vote_weights['lgbm']
-        if config.get('ensemble', {}).get('train_teco', True) and 'teco' in soft_vote_weights:
-            final_predictions_soft_vote_proba += soft_vote_weights['teco'] * test_preds_sum['teco']
-            total_weight += soft_vote_weights['teco']
-        if config.get('ensemble', {}).get('train_stm_gnn', True) and 'stm_gnn' in soft_vote_weights:
-            final_predictions_soft_vote_proba += soft_vote_weights['stm_gnn'] * test_preds_sum['stm_gnn']
-            total_weight += soft_vote_weights['stm_gnn']
+                df_inner_fold_train = pd.DataFrame(X_inner_fold_train_balanced, columns=teco_feature_columns)
+                df_inner_fold_val = pd.DataFrame(X_inner_fold_val, columns=teco_feature_columns)
+                df_outer_test_teco = pd.DataFrame(X_outer_test, columns=teco_feature_columns)
+                teco_target_column = teco_config.get('target_column_teco', 'outcomeType_teco')
 
-        if total_weight > 0:
-             # Normalize if weights don't sum to 1 (though they should ideally)
-            # final_predictions_soft_vote_proba /= total_weight
-            final_predictions_soft_vote_labels = np.argmax(final_predictions_soft_vote_proba, axis=1)
-            print(f"Soft-vote predictions on test set (proxy) - Proba shape: {final_predictions_soft_vote_proba.shape}")
+                train_teco_dataset_inner = TabularSequenceDataset(None, df_inner_fold_train, y_inner_fold_train_balanced, teco_feature_columns, teco_target_column)
+                val_teco_dataset_inner = TabularSequenceDataset(None, df_inner_fold_val, y_inner_fold_val, teco_feature_columns, teco_target_column)
+                outer_test_teco_dataset = TabularSequenceDataset(None, df_outer_test_teco, np.zeros(len(df_outer_test_teco)), teco_feature_columns, teco_target_column) # Dummy y
 
-            accuracy_soft_vote = accuracy_score(y_test_for_base_models, final_predictions_soft_vote_labels)
-            f1_soft_vote = f1_score(y_test_for_base_models, final_predictions_soft_vote_labels, average='weighted' if num_classes > 2 else 'binary')
-            precision_soft_vote = precision_score(y_test_for_base_models, final_predictions_soft_vote_labels, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
-            recall_soft_vote = recall_score(y_test_for_base_models, final_predictions_soft_vote_labels, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+                batch_size_teco = teco_config.get('batch_size_teco', 32)
+                train_teco_loader_inner = DataLoader(train_teco_dataset_inner, batch_size_teco, shuffle=True, collate_fn=basic_collate_fn)
+                val_teco_loader_inner = DataLoader(val_teco_dataset_inner, batch_size_batch_size_teco, shuffle=False, collate_fn=basic_collate_fn)
+                outer_test_teco_loader = DataLoader(outer_test_teco_dataset, batch_size_teco, shuffle=False, collate_fn=basic_collate_fn)
 
-            auroc_soft_vote = -1
-            try:
-                if num_classes == 2:
-                    auroc_soft_vote = roc_auc_score(y_test_for_base_models, final_predictions_soft_vote_proba[:, 1])
-                else:
-                    auroc_soft_vote = roc_auc_score(y_test_for_base_models, final_predictions_soft_vote_proba, multi_class='ovr', average='weighted')
-            except ValueError as e:
-                print(f"Soft-vote AUROC calculation error: {e}")
+                teco_model_inner = TECOTransformerModel(
+                    input_feature_dim=len(teco_feature_columns),
+                    d_model=teco_config.get('d_model', 64), # Smaller for faster NCV
+                    num_encoder_layers=teco_config.get('num_encoder_layers', 1),
+                    nhead=teco_config.get('nhead', 2),
+                    dim_feedforward=teco_config.get('dim_feedforward', 128),
+                    dropout=teco_config.get('dropout', 0.1),
+                    num_classes=num_classes,
+                    max_seq_len=teco_config.get('max_seq_len', 50)
+                ).to(device)
+                teco_criterion_inner = nn.CrossEntropyLoss()
+                teco_optimizer_inner = optim.Adam(teco_model_inner.parameters(), lr=teco_config.get('lr_teco', 1e-4))
+                epochs_teco_inner = teco_config.get('epochs_teco_inner', 3) # Fewer epochs for inner loop
 
-            wandb.log({
-                "soft_vote/test_accuracy": accuracy_soft_vote,
-                "soft_vote/test_auroc": auroc_soft_vote,
-                "soft_vote/test_f1": f1_soft_vote,
-                "soft_vote/test_precision": precision_soft_vote,
-                "soft_vote/test_recall": recall_soft_vote,
-            })
-            print(f"Soft-Vote Test Accuracy (proxy): {accuracy_soft_vote:.4f}, AUROC: {auroc_soft_vote:.4f}")
+                for _ in range(epochs_teco_inner): # Simplified training loop for brevity
+                    teco_model_inner.train()
+                    for batch in train_teco_loader_inner:
+                        teco_optimizer_inner.zero_grad()
+                        loss = teco_criterion_inner(teco_model_inner(batch['sequence'].to(device), batch['padding_mask'].to(device)), batch['target'].to(device))
+                        loss.backward()
+                        teco_optimizer_inner.step()
+                        epoch_loss_sum += loss.item()
+                    logger.debug(f"Inner Fold {inner_fold_idx+1}, TECO Epoch {epoch+1}/{epochs_teco_inner}, Avg Train Loss: {epoch_loss_sum/len(train_teco_loader_inner):.4f}")
+
+                teco_model_inner.eval()
+                inner_val_preds_teco_list = []
+                with torch.no_grad():
+                    for batch in val_teco_loader_inner:
+                        outputs = teco_model_inner(batch['sequence'].to(device), batch['padding_mask'].to(device))
+                        inner_val_preds_teco_list.append(torch.softmax(outputs, dim=1).cpu().numpy())
+                oof_preds_inner['teco'][inner_val_idx] = np.concatenate(inner_val_preds_teco_list, axis=0)[:, :num_classes]
+
+                outer_test_preds_teco_list = []
+                with torch.no_grad():
+                    for batch in outer_test_teco_loader:
+                        outputs = teco_model_inner(batch['sequence'].to(device), batch['padding_mask'].to(device))
+                        outer_test_preds_teco_list.append(torch.softmax(outputs, dim=1).cpu().numpy())
+                base_model_preds_on_outer_test_sum['teco'] += np.concatenate(outer_test_preds_teco_list, axis=0)[:, :num_classes] / n_inner_folds
+                logger.info(f"Inner Fold {inner_fold_idx+1}: TECO-Transformer training and prediction complete.")
+                except Exception as e:
+                    logger.error(f"Inner Fold {inner_fold_idx+1}: Error during TECO-Transformer training or prediction: {e}")
+                    pass # Continue
+
+            # --- 3. Train STM-GNN (Inner Fold - Conceptual Placeholder) ---
+            if config.get('ensemble', {}).get('train_stm_gnn', True):
+                logger.info(f"Inner Fold {inner_fold_idx+1}: Training STM-GNN (Conceptual)...")
+                try:
+                    # Simplified dummy predictions for STM-GNN
+                    class_probs_sim_inner = np.bincount(y_inner_fold_train) / len(y_inner_fold_train) if len(y_inner_fold_train) > 0 else np.full(num_classes, 1/num_classes)
+                    if len(class_probs_sim_inner) != num_classes:
+                        temp_probs = np.zeros(num_classes)
+                        # Ensure class_probs_sim_inner indices are valid for temp_probs
+                        valid_indices = np.unique(y_inner_fold_train) # Classes present in y_inner_fold_train
+                        for i, cls_idx in enumerate(valid_indices):
+                            if cls_idx < num_classes: # Check boundary
+                                temp_probs[cls_idx] = (np.sum(y_inner_fold_train == cls_idx) / len(y_inner_fold_train)) if len(y_inner_fold_train) > 0 else 0
+                        class_probs_sim_inner = temp_probs / np.sum(temp_probs) if np.sum(temp_probs) > 0 else np.full(num_classes, 1/num_classes)
+
+
+                num_val_samples_inner_fold = len(y_inner_fold_val)
+                dummy_stm_oof = np.random.multinomial(1, class_probs_sim_inner, size=num_val_samples_inner_fold) * 0.85 + \
+                                np.random.rand(num_val_samples_inner_fold, num_classes) * 0.15
+                oof_preds_inner['stm_gnn'][inner_val_idx] = dummy_stm_oof / np.sum(dummy_stm_oof, axis=1, keepdims=True)
+
+                num_outer_test_samples = len(y_outer_test)
+                dummy_stm_test = (np.random.multinomial(1, class_probs_sim_inner, size=num_outer_test_samples) * 0.85 + \
+                                 np.random.rand(num_outer_test_samples, num_classes) * 0.15)
+                    current_sum = np.sum(dummy_stm_test, axis=1, keepdims=True)
+                    current_sum[current_sum == 0] = 1 # Avoid division by zero if all probs are zero for a sample
+                    base_model_preds_on_outer_test_sum['stm_gnn'] += (dummy_stm_test / current_sum) / n_inner_folds
+                    logger.info(f"Inner Fold {inner_fold_idx+1}: STM-GNN (conceptual) prediction complete.")
+                except Exception as e:
+                    logger.error(f"Inner Fold {inner_fold_idx+1}: Error during STM-GNN (conceptual) prediction: {e}")
+                    pass # Continue
+
+
+        # --- Inner CV Loop Finished for Outer Fold {outer_fold_idx+1} ---
+        logger.info(f"Outer Fold {outer_fold_idx+1}: Finished generating OOF predictions from inner CV.")
+
+        # Concatenate OOF predictions from inner loop to form training data for meta-learner
+        # These OOFs are from validating on X_inner_fold_val sets.
+        meta_features_train_outer_list = []
+        if config.get('ensemble', {}).get('train_lgbm', True): meta_features_train_outer_list.append(oof_preds_inner['lgbm'])
+        if config.get('ensemble', {}).get('train_teco', True): meta_features_train_outer_list.append(oof_preds_inner['teco'])
+        if config.get('ensemble', {}).get('train_stm_gnn', True): meta_features_train_outer_list.append(oof_preds_inner['stm_gnn'])
+
+        if not meta_features_train_outer_list:
+            logger.error(f"Outer Fold {outer_fold_idx+1}: No base models were successfully trained or included for meta-learner input. Skipping meta-learner for this fold.")
+            # Optionally, append NaN or skip metrics for this fold to avoid errors in averaging later
         else:
-            print("No valid models/weights for soft voting.")
+            X_meta_train_outer = np.concatenate(meta_features_train_outer_list, axis=1)
+            y_meta_train_outer = y_outer_train # Labels for meta-learner are from the outer train set
+            logger.info(f"Outer Fold {outer_fold_idx+1}: Meta-learner training features shape: {X_meta_train_outer.shape}")
 
-    wandb.finish() # Ensure wandb run is closed
-    print("\nEnsemble training conceptual run finished.")
+            # --- Train XGBoost Meta-Learner on X_meta_train_outer ---
+            if config.get('ensemble', {}).get('train_meta_learner', True):
+                logger.info(f"Outer Fold {outer_fold_idx+1}: Training XGBoost Meta-Learner...")
+                try:
+            meta_config = config.get('ensemble', {}).get('meta_learner_xgb_params', {})
+            xgb_meta_model_outer = XGBoostMetaLearner(
+                params=meta_config.get('model_specific_params'),
+                depth=meta_config.get('depth', 3)
+            )
+            # No validation set for meta-learner here; it's trained on all OOFs from inner loop
+            # Early stopping for meta-learner in NCV needs careful consideration.
+            # For now, train without it or use a small split from X_meta_train_outer if desired.
+            xgb_meta_model_outer.train(
+                X_meta_train_outer, y_meta_train_outer,
+                num_boost_round=meta_config.get('num_boost_round', 100), # Reduced for NCV speed
+                        early_stopping_rounds=None # Or a small portion of X_meta_train_outer for ES
+                    )
+                    logger.info(f"Outer Fold {outer_fold_idx+1}: XGBoost Meta-Learner trained.")
+
+                    # --- Prediction with Meta-Learner on X_outer_test ---
+                    # X_outer_test predictions are formed from averaged base model predictions on X_outer_test
+                    meta_features_test_outer_list = []
+                    if config.get('ensemble', {}).get('train_lgbm', True): meta_features_test_outer_list.append(base_model_preds_on_outer_test_sum['lgbm'])
+                    if config.get('ensemble', {}).get('train_teco', True): meta_features_test_outer_list.append(base_model_preds_on_outer_test_sum['teco'])
+                    if config.get('ensemble', {}).get('train_stm_gnn', True): meta_features_test_outer_list.append(base_model_preds_on_outer_test_sum['stm_gnn'])
+
+                    X_meta_test_outer = np.concatenate(meta_features_test_outer_list, axis=1)
+                    logger.debug(f"Outer Fold {outer_fold_idx+1}: Meta-learner test features shape: {X_meta_test_outer.shape}")
+
+                    final_preds_meta_proba_outer = xgb_meta_model_outer.predict_proba(X_meta_test_outer)
+                    final_preds_meta_labels_outer = xgb_meta_model_outer.predict(X_meta_test_outer)
+
+                    # Evaluate meta-learner for this outer fold
+                    acc_meta_outer = accuracy_score(y_outer_test, final_preds_meta_labels_outer)
+                    f1_meta_outer = f1_score(y_outer_test, final_preds_meta_labels_outer, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+                    prec_meta_outer = precision_score(y_outer_test, final_preds_meta_labels_outer, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+                    rec_meta_outer = recall_score(y_outer_test, final_preds_meta_labels_outer, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+                    auroc_meta_outer = -1.0 # Default for error cases
+                    try:
+                        # Ensure correct probability column is used for binary case
+                        probas_for_auc = final_preds_meta_proba_outer[:, 1] if num_classes == 2 and final_preds_meta_proba_outer.ndim == 2 and final_preds_meta_proba_outer.shape[1] >=2 else final_preds_meta_proba_outer
+                        auroc_meta_outer = roc_auc_score(y_outer_test, probas_for_auc, multi_class='ovr', average='weighted')
+                    except ValueError as e:
+                        logger.warning(f"Outer Fold {outer_fold_idx+1} Meta AUROC calculation error: {e}. Proba shape: {final_preds_meta_proba_outer.shape}")
+
+                    outer_fold_metrics_meta['accuracy'].append(acc_meta_outer)
+                    outer_fold_metrics_meta['auroc'].append(auroc_meta_outer)
+                    outer_fold_metrics_meta['f1'].append(f1_meta_outer)
+                    outer_fold_metrics_meta['precision'].append(prec_meta_outer)
+                    outer_fold_metrics_meta['recall'].append(rec_meta_outer)
+
+                    wandb.log({
+                        f"outer_fold_{outer_fold_idx+1}/meta_accuracy": acc_meta_outer,
+                        f"outer_fold_{outer_fold_idx+1}/meta_auroc": auroc_meta_outer,
+                        f"outer_fold_{outer_fold_idx+1}/meta_f1": f1_meta_outer,
+                        f"outer_fold_{outer_fold_idx+1}/meta_precision": prec_meta_outer,
+                        f"outer_fold_{outer_fold_idx+1}/meta_recall": rec_meta_outer,
+                        "outer_fold": outer_fold_idx + 1
+                    })
+                    logger.info(f"Outer Fold {outer_fold_idx+1} Meta-Learner: Acc={acc_meta_outer:.4f}, AUROC={auroc_meta_outer:.4f}, F1={f1_meta_outer:.4f}")
+                except Exception as e:
+                    logger.error(f"Outer Fold {outer_fold_idx+1}: Error during Meta-Learner training or evaluation: {e}")
+                    # Append NaNs or default values if meta-learner fails for a fold
+                    for key in outer_fold_metrics_meta.keys(): outer_fold_metrics_meta[key].append(np.nan)
+
+
+        # --- Soft Voting on X_outer_test (Alternative/Complementary) ---
+        # This uses the averaged predictions from base models on the outer test set.
+        soft_vote_weights = config.get('ensemble', {}).get('soft_vote_weights', {})
+        if soft_vote_weights and any(config.get('ensemble', {}).get(f'train_{model_key}', False) for model_key in soft_vote_weights):
+            logger.info(f"Outer Fold {outer_fold_idx+1}: Performing Soft Voting...")
+            try:
+                final_preds_soft_vote_proba_outer = np.zeros((len(y_outer_test), num_classes)) # Initialize correctly
+                total_weight = 0
+
+                active_models_for_sv = 0
+                if config.get('ensemble', {}).get('train_lgbm', True) and 'lgbm' in soft_vote_weights:
+                    final_preds_soft_vote_proba_outer += soft_vote_weights['lgbm'] * base_model_preds_on_outer_test_sum['lgbm']
+                    total_weight += soft_vote_weights['lgbm']
+                    active_models_for_sv +=1
+                if config.get('ensemble', {}).get('train_teco', True) and 'teco' in soft_vote_weights:
+                    final_preds_soft_vote_proba_outer += soft_vote_weights['teco'] * base_model_preds_on_outer_test_sum['teco']
+                    total_weight += soft_vote_weights['teco']
+                    active_models_for_sv +=1
+                if config.get('ensemble', {}).get('train_stm_gnn', True) and 'stm_gnn' in soft_vote_weights:
+                    final_preds_soft_vote_proba_outer += soft_vote_weights['stm_gnn'] * base_model_preds_on_outer_test_sum['stm_gnn']
+                    total_weight += soft_vote_weights['stm_gnn']
+                    active_models_for_sv +=1
+
+                if active_models_for_sv > 0 and total_weight > 0: # Ensure there were models and weights
+                    # Normalize probabilities if weights don't sum to 1 (or if only some models contributed)
+                    # final_preds_soft_vote_proba_outer /= total_weight # Only if weights are not pre-normalized.
+                    # Ensure probabilities sum to 1 per sample after weighting
+                    row_sums = final_preds_soft_vote_proba_outer.sum(axis=1, keepdims=True)
+                    row_sums[row_sums == 0] = 1 # Avoid division by zero if all preds are 0
+                    final_preds_soft_vote_proba_outer = final_preds_soft_vote_proba_outer / row_sums
+
+                    final_preds_soft_vote_labels_outer = np.argmax(final_preds_soft_vote_proba_outer, axis=1)
+
+                    acc_sv_outer = accuracy_score(y_outer_test, final_preds_soft_vote_labels_outer)
+                    f1_sv_outer = f1_score(y_outer_test, final_preds_soft_vote_labels_outer, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+                    prec_sv_outer = precision_score(y_outer_test, final_preds_soft_vote_labels_outer, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+                    rec_sv_outer = recall_score(y_outer_test, final_preds_soft_vote_labels_outer, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+                    auroc_sv_outer = -1.0
+                    try:
+                        probas_for_auc_sv = final_preds_soft_vote_proba_outer[:, 1] if num_classes == 2 and final_preds_soft_vote_proba_outer.ndim == 2 and final_preds_soft_vote_proba_outer.shape[1] >=2 else final_preds_soft_vote_proba_outer
+                        auroc_sv_outer = roc_auc_score(y_outer_test, probas_for_auc_sv, multi_class='ovr', average='weighted')
+                    except ValueError as e:
+                        logger.warning(f"Outer Fold {outer_fold_idx+1} SoftVote AUROC calculation error: {e}. Proba shape: {final_preds_soft_vote_proba_outer.shape}")
+
+                    outer_fold_metrics_soft_vote['accuracy'].append(acc_sv_outer)
+                    outer_fold_metrics_soft_vote['auroc'].append(auroc_sv_outer)
+                    outer_fold_metrics_soft_vote['f1'].append(f1_sv_outer)
+                    outer_fold_metrics_soft_vote['precision'].append(prec_sv_outer)
+                    outer_fold_metrics_soft_vote['recall'].append(rec_sv_outer)
+
+                    wandb.log({
+                        f"outer_fold_{outer_fold_idx+1}/sv_accuracy": acc_sv_outer,
+                        f"outer_fold_{outer_fold_idx+1}/sv_auroc": auroc_sv_outer,
+                        f"outer_fold_{outer_fold_idx+1}/sv_f1": f1_sv_outer,
+                        # ... other sv metrics ...
+                        "outer_fold": outer_fold_idx + 1
+                    })
+                    logger.info(f"Outer Fold {outer_fold_idx+1} Soft Vote: Acc={acc_sv_outer:.4f}, AUROC={auroc_sv_outer:.4f}, F1={f1_sv_outer:.4f}")
+                else:
+                    logger.warning(f"Outer Fold {outer_fold_idx+1}: Soft Voting not performed due to no active models or zero total weight.")
+                    for key in outer_fold_metrics_soft_vote.keys(): outer_fold_metrics_soft_vote[key].append(np.nan)
+            except Exception as e:
+                logger.error(f"Outer Fold {outer_fold_idx+1}: Error during Soft Voting: {e}")
+                for key in outer_fold_metrics_soft_vote.keys(): outer_fold_metrics_soft_vote[key].append(np.nan)
+
+
+    # --- Nested Cross-Validation Finished ---
+    logger.info("===== Nested Cross-Validation Summary =====")
+    if config.get('ensemble', {}).get('train_meta_learner', True) and len(outer_fold_metrics_meta['auroc']) > 0 :
+        # Use np.nanmean and np.nanstd to handle folds where metrics might be NaN (e.g., if a model failed)
+        avg_meta_acc = np.nanmean(outer_fold_metrics_meta['accuracy'])
+        avg_meta_auroc = np.nanmean(outer_fold_metrics_meta['auroc'])
+        std_meta_auroc = np.nanstd(outer_fold_metrics_meta['auroc'])
+        avg_meta_f1 = np.nanmean(outer_fold_metrics_meta['f1'])
+        avg_meta_precision = np.nanmean(outer_fold_metrics_meta['precision'])
+        avg_meta_recall = np.nanmean(outer_fold_metrics_meta['recall'])
+
+        logger.info(f"Meta-Learner Average Accuracy: {avg_meta_acc:.4f}")
+        logger.info(f"Meta-Learner Average AUROC: {avg_meta_auroc:.4f} +/- {std_meta_auroc:.4f}")
+        logger.info(f"Meta-Learner Average F1: {avg_meta_f1:.4f}")
+        logger.info(f"Meta-Learner Average Precision: {avg_meta_precision:.4f}")
+        logger.info(f"Meta-Learner Average Recall: {avg_meta_recall:.4f}")
+        wandb.log({
+            "ncv_summary/meta_avg_accuracy": avg_meta_acc,
+            "ncv_summary/meta_avg_auroc": avg_meta_auroc,
+            "ncv_summary/meta_std_auroc": std_meta_auroc,
+            "ncv_summary/meta_avg_f1": avg_meta_f1,
+            "ncv_summary/meta_avg_precision": avg_meta_precision,
+            "ncv_summary/meta_avg_recall": avg_meta_recall,
+        })
+
+    if soft_vote_weights and sum(soft_vote_weights.values()) > 0 and len(outer_fold_metrics_soft_vote['auroc']) > 0:
+        avg_sv_acc = np.nanmean(outer_fold_metrics_soft_vote['accuracy'])
+        avg_sv_auroc = np.nanmean(outer_fold_metrics_soft_vote['auroc'])
+        std_sv_auroc = np.nanstd(outer_fold_metrics_soft_vote['auroc'])
+        avg_sv_f1 = np.nanmean(outer_fold_metrics_soft_vote['f1'])
+        avg_sv_precision = np.nanmean(outer_fold_metrics_soft_vote['precision'])
+        avg_sv_recall = np.nanmean(outer_fold_metrics_soft_vote['recall'])
+
+        logger.info(f"Soft Voting Average Accuracy: {avg_sv_acc:.4f}")
+        logger.info(f"Soft Voting Average AUROC: {avg_sv_auroc:.4f} +/- {std_sv_auroc:.4f}")
+        logger.info(f"Soft Voting Average F1: {avg_sv_f1:.4f}")
+        wandb.log({
+            "ncv_summary/sv_avg_accuracy": avg_sv_acc,
+            "ncv_summary/sv_avg_auroc": avg_sv_auroc,
+            "ncv_summary/sv_std_auroc": std_sv_auroc,
+            "ncv_summary/sv_avg_f1": avg_sv_f1,
+            "ncv_summary/sv_avg_precision": avg_sv_precision,
+            "ncv_summary/sv_avg_recall": avg_sv_recall,
+        })
+
+
+    wandb.finish()
+    logger.info("Nested Cross-Validation ensemble training run finished successfully.")
 
 
 if __name__ == '__main__':
