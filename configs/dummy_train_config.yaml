@@ -9,7 +9,7 @@ data_paths:
   train: "trainData.csv"
   val: "valData.csv"
   # test: "testData.csv" # Not used in NCV training script directly
-  target_column: "Mortality" # Name of the target variable column in your CSVs
+  target_column: "outcomeType" # Name of the target variable column in your CSVs
 
 # Dummy data settings (only used if use_dummy_data_for_full_run is true)
 dummy_data_total_samples: 1000 # Total samples for the combined (train+val) dummy dataset
@@ -42,7 +42,7 @@ ensemble:
 
   train_lgbm: true
   train_teco: true
-  train_stm_gnn: true # STM-GNN is conceptual; will use placeholder predictions
+  train_stm_gnn: false # STM-GNN is conceptual and has been removed from training script
   train_meta_learner: true
 
   lgbm_params:
@@ -97,10 +97,9 @@ ensemble:
     # model_specific_params: { 'eta': 0.01, 'gamma': 0.1, 'subsample': 0.8, 'colsample_bytree': 0.8 } # Example
     save_path: 'models_output/meta_learner_xgb_ncv_trained.joblib'
 
-  soft_vote_weights: # As per AUROC spec
-    stm_gnn: 0.5
-    lgbm: 0.3
-    teco: 0.2
+  soft_vote_weights: # As per AUROC spec (STM-GNN removed)
+    lgbm: 0.6 # Adjusted after removing STM-GNN, ensure weights make sense
+    teco: 0.4 # Adjusted after removing STM-GNN
 
 # --- W&B Logging ---
 wandb:

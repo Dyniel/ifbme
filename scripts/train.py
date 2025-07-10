@@ -25,7 +25,7 @@ from data_utils.data_loader import load_raw_data
 from data_utils.preprocess import get_preprocessor
 from models import LightGBMModel, XGBoostMetaLearner
 from models.teco_transformer import TECOTransformerModel
-from models.stm_gnn import STMGNN  # Assuming STMGNN is the main class
+# from models.stm_gnn import STMGNN  # STM-GNN Removed
 from data_utils.sequence_loader import TabularSequenceDataset, basic_collate_fn  # For TECO
 
 # For STM-GNN, data loading might be more complex (graph snapshots)
@@ -149,10 +149,36 @@ def main(config_path):
     outer_fold_metrics_soft_vote = {'accuracy': [], 'auroc': [], 'f1': [], 'precision': [], 'recall': []}
 
     # Convert to NumPy for SKFold if not already (assuming X_full_raw_df and y_full_raw_series are pandas)
-    X_full_for_split = X_full_raw_df.to_numpy() if isinstance(X_full_raw_df, pd.DataFrame) else X_full_raw_df
-    y_full_for_split = y_full_raw_series.to_numpy() if isinstance(y_full_raw_series, pd.Series) else y_full_raw_series
+    X_full_for_split = X_full_raw_df # Keep as DataFrame for now, will be converted after preproc if needed or by models
+
+    # --- Target Variable Encoding ---
+    from sklearn.preprocessing import LabelEncoder
+    le = LabelEncoder()
+    y_full_raw_series_encoded = pd.Series(le.fit_transform(y_full_raw_series), name=y_full_raw_series.name, index=y_full_raw_series.index)
+    class_mapping = dict(zip(le.classes_, le.transform(le.classes_)))
+    logger.info(f"Target variable '{y_full_raw_series.name}' encoded. Mapping: {class_mapping}. Unique values after encoding: {y_full_raw_series_encoded.unique()}")
+    # Use the encoded series for splitting
+    y_full_for_split = y_full_raw_series_encoded
+    # --- End Target Variable Encoding ---
+
+    # Ensure X_full_for_split is numpy if required by StratifiedKFold and X_full_raw_df was not DataFrame
+    # However, StratifiedKFold can often handle pandas DataFrames/Series directly for splitting indices.
+    # Let's assume X_full_raw_df is a DataFrame as per data_loader.py
+
+    # If X_full_raw_df is used directly by skf.split, it's fine.
+    # If it needs to be numpy:
+    # X_full_for_split_np = X_full_raw_df.to_numpy() if isinstance(X_full_raw_df, pd.DataFrame) else X_full_raw_df
+    # y_full_for_split_np = y_full_for_split.to_numpy() if isinstance(y_full_for_split, pd.Series) else y_full_for_split
 
     for outer_fold_idx, (outer_train_idx, outer_test_idx) in enumerate(
+            outer_skf.split(X_full_raw_df, y_full_for_split)): # Use X_full_raw_df for splitting indices
+        logger.info(f"===== Starting Outer Fold {outer_fold_idx + 1}/{n_outer_folds} =====")
+
+        # Get DataFrame/Series slices for this outer fold
+        X_outer_train_raw_fold_df = X_full_raw_df.iloc[outer_train_idx]
+        y_outer_train_fold_series = y_full_for_split.iloc[outer_train_idx] # Use encoded y
+        X_outer_test_raw_fold_df = X_full_raw_df.iloc[outer_test_idx]
+        y_outer_test_fold_series = y_full_for_split.iloc[outer_test_idx]   # Use encoded y
             outer_skf.split(X_full_for_split, y_full_for_split)):
         logger.info(f"===== Starting Outer Fold {outer_fold_idx + 1}/{n_outer_folds} =====")
 
@@ -208,13 +234,13 @@ def main(config_path):
         inner_skf = StratifiedKFold(n_splits=n_inner_folds, shuffle=True, random_state=seed + outer_fold_idx)
         oof_preds_inner = {
             'lgbm': np.zeros((len(y_outer_train), num_classes)),
-            'teco': np.zeros((len(y_outer_train), num_classes)),
-            'stm_gnn': np.zeros((len(y_outer_train), num_classes))
+            'teco': np.zeros((len(y_outer_train), num_classes))
+            # 'stm_gnn': np.zeros((len(y_outer_train), num_classes)) # STM-GNN Removed
         }
         base_model_preds_on_outer_test_sum = {
             'lgbm': np.zeros((len(y_outer_test), num_classes)),
-            'teco': np.zeros((len(y_outer_test), num_classes)),
-            'stm_gnn': np.zeros((len(y_outer_test), num_classes))
+            'teco': np.zeros((len(y_outer_test), num_classes))
+            # 'stm_gnn': np.zeros((len(y_outer_test), num_classes)) # STM-GNN Removed
         }
 
         for inner_fold_idx, (inner_train_idx, inner_val_idx) in enumerate(
@@ -259,8 +285,7 @@ def main(config_path):
                         X_inner_fold_train_balanced, y_inner_fold_train_balanced,
                         X_inner_fold_val, y_inner_fold_val,
                         num_boost_round=lgbm_config.get('num_boost_round', 1000),  # Full run params
-                        early_stopping_rounds=lgbm_config.get('early_stopping_rounds', 50),  # Full run params
-                        verbose=False
+                        early_stopping_rounds=lgbm_config.get('early_stopping_rounds', 50)  # Full run params
                     )
                     oof_preds_inner['lgbm'][inner_val_idx] = lgbm_inner_fold_model.predict_proba(X_inner_fold_val)
                     base_model_preds_on_outer_test_sum['lgbm'] += lgbm_inner_fold_model.predict_proba(
@@ -378,47 +403,47 @@ def main(config_path):
                     base_model_preds_on_outer_test_sum['teco'] += np.full((len(y_outer_test), num_classes),
                                                                           1 / num_classes) / n_inner_folds
 
-            # --- 3. Train STM-GNN (Inner Fold - Conceptual: Needs real data loader and graph features) ---
-            if config.get('ensemble', {}).get('train_stm_gnn', True):
-                logger.info(f"Inner Fold {inner_fold_idx + 1}: Training STM-GNN (Conceptual - requires graph data)...")
-                # STM-GNN requires graph-structured data (node features, edge indices per snapshot)
-                # This part needs a dedicated graph data loader and feature engineering pipeline.
-                # For now, we'll use placeholder predictions as in the original script.
-                try:
-                    stm_gnn_config = config.get('ensemble', {}).get('stm_gnn_params', {})
-                    # This is a placeholder. Real STM-GNN training is complex.
-                    # 1. Prepare graph data for STM-GNN (e.g., from X_inner_fold_train_balanced)
-                    #    This would involve creating graph snapshots.
-                    #    num_node_features_stm = X_inner_fold_train_balanced.shape[1] # if using tabular as node features
-
-                    # For this conceptual run, simulate predictions based on class distribution
-                    class_probs_stm = np.bincount(y_inner_fold_train_balanced) / len(
-                        y_inner_fold_train_balanced) if len(y_inner_fold_train_balanced) > 0 else np.full(num_classes,
-                                                                                                          1 / num_classes)
-                    if len(class_probs_stm) < num_classes:  # Ensure correct shape if some classes are missing
-                        temp_p = np.full(num_classes, 1e-6)  # Small probability for missing classes
-                        temp_p[:len(class_probs_stm)] = class_probs_stm
-                        class_probs_stm = temp_p / np.sum(temp_p)
-
-                    num_val_samples_stm = len(y_inner_fold_val)
-                    dummy_stm_oof = np.random.multinomial(1, class_probs_stm, size=num_val_samples_stm) * 0.8 + \
-                                    np.random.rand(num_val_samples_stm, num_classes) * 0.2
-                    oof_preds_inner['stm_gnn'][inner_val_idx] = dummy_stm_oof / np.sum(dummy_stm_oof, axis=1,
-                                                                                       keepdims=True)
-
-                    num_outer_test_samples_stm = len(y_outer_test)
-                    dummy_stm_test = np.random.multinomial(1, class_probs_stm, size=num_outer_test_samples_stm) * 0.8 + \
-                                     np.random.rand(num_outer_test_samples_stm, num_classes) * 0.2
-                    base_model_preds_on_outer_test_sum['stm_gnn'] += (dummy_stm_test / np.sum(dummy_stm_test, axis=1,
-                                                                                              keepdims=True)) / n_inner_folds
-                    logger.info(
-                        f"Inner Fold {inner_fold_idx + 1}: STM-GNN (conceptual placeholder) prediction complete.")
-                except Exception as e:
-                    logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during STM-GNN (conceptual): {e}")
-                    oof_preds_inner['stm_gnn'][inner_val_idx] = np.full((len(inner_val_idx), num_classes),
-                                                                        1 / num_classes)
-                    base_model_preds_on_outer_test_sum['stm_gnn'] += np.full((len(y_outer_test), num_classes),
-                                                                             1 / num_classes) / n_inner_folds
+            # --- 3. Train STM-GNN (Inner Fold - Conceptual: Needs real data loader and graph features) --- STM-GNN REMOVED ---
+            # if config.get('ensemble', {}).get('train_stm_gnn', True):
+            #     logger.info(f"Inner Fold {inner_fold_idx + 1}: Training STM-GNN (Conceptual - requires graph data)...")
+            #     # STM-GNN requires graph-structured data (node features, edge indices per snapshot)
+            #     # This part needs a dedicated graph data loader and feature engineering pipeline.
+            #     # For now, we'll use placeholder predictions as in the original script.
+            #     try:
+            #         stm_gnn_config = config.get('ensemble', {}).get('stm_gnn_params', {})
+            #         # This is a placeholder. Real STM-GNN training is complex.
+            #         # 1. Prepare graph data for STM-GNN (e.g., from X_inner_fold_train_balanced)
+            #         #    This would involve creating graph snapshots.
+            #         #    num_node_features_stm = X_inner_fold_train_balanced.shape[1] # if using tabular as node features
+            #
+            #         # For this conceptual run, simulate predictions based on class distribution
+            #         class_probs_stm = np.bincount(y_inner_fold_train_balanced) / len(
+            #             y_inner_fold_train_balanced) if len(y_inner_fold_train_balanced) > 0 else np.full(num_classes,
+            #                                                                                               1 / num_classes)
+            #         if len(class_probs_stm) < num_classes:  # Ensure correct shape if some classes are missing
+            #             temp_p = np.full(num_classes, 1e-6)  # Small probability for missing classes
+            #             temp_p[:len(class_probs_stm)] = class_probs_stm
+            #             class_probs_stm = temp_p / np.sum(temp_p)
+            #
+            #         num_val_samples_stm = len(y_inner_fold_val)
+            #         dummy_stm_oof = np.random.multinomial(1, class_probs_stm, size=num_val_samples_stm) * 0.8 + \
+            #                         np.random.rand(num_val_samples_stm, num_classes) * 0.2
+            #         oof_preds_inner['stm_gnn'][inner_val_idx] = dummy_stm_oof / np.sum(dummy_stm_oof, axis=1,
+            #                                                                            keepdims=True)
+            #
+            #         num_outer_test_samples_stm = len(y_outer_test)
+            #         dummy_stm_test = np.random.multinomial(1, class_probs_stm, size=num_outer_test_samples_stm) * 0.8 + \
+            #                          np.random.rand(num_outer_test_samples_stm, num_classes) * 0.2
+            #         base_model_preds_on_outer_test_sum['stm_gnn'] += (dummy_stm_test / np.sum(dummy_stm_test, axis=1,
+            #                                                                                   keepdims=True)) / n_inner_folds
+            #         logger.info(
+            #             f"Inner Fold {inner_fold_idx + 1}: STM-GNN (conceptual placeholder) prediction complete.")
+            #     except Exception as e:
+            #         logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during STM-GNN (conceptual): {e}")
+            #         oof_preds_inner['stm_gnn'][inner_val_idx] = np.full((len(inner_val_idx), num_classes),
+            #                                                             1 / num_classes)
+            #         base_model_preds_on_outer_test_sum['stm_gnn'] += np.full((len(y_outer_test), num_classes),
+            #                                                                  1 / num_classes) / n_inner_folds
 
         # --- Meta-Learner Training and Evaluation for Outer Fold ---
         logger.info(f"Outer Fold {outer_fold_idx + 1}: Finished generating OOF predictions from inner CV.")
@@ -427,8 +452,8 @@ def main(config_path):
             oof_preds_inner['lgbm'])
         if config.get('ensemble', {}).get('train_teco', True): meta_features_train_outer_list.append(
             oof_preds_inner['teco'])
-        if config.get('ensemble', {}).get('train_stm_gnn', True): meta_features_train_outer_list.append(
-            oof_preds_inner['stm_gnn'])
+        # if config.get('ensemble', {}).get('train_stm_gnn', True): meta_features_train_outer_list.append( # STM-GNN Removed
+        #     oof_preds_inner['stm_gnn'])
 
         if not meta_features_train_outer_list:
             logger.error(f"Outer Fold {outer_fold_idx + 1}: No base models for meta-learner. Skipping.")
@@ -458,8 +483,8 @@ def main(config_path):
                         base_model_preds_on_outer_test_sum['lgbm'])
                     if config.get('ensemble', {}).get('train_teco', True): meta_features_test_outer_list.append(
                         base_model_preds_on_outer_test_sum['teco'])
-                    if config.get('ensemble', {}).get('train_stm_gnn', True): meta_features_test_outer_list.append(
-                        base_model_preds_on_outer_test_sum['stm_gnn'])
+                    # if config.get('ensemble', {}).get('train_stm_gnn', True): meta_features_test_outer_list.append( # STM-GNN Removed
+                    #     base_model_preds_on_outer_test_sum['stm_gnn'])
 
                     X_meta_test_outer = np.concatenate(meta_features_test_outer_list, axis=1)
                     final_preds_meta_proba_outer = xgb_meta_model_outer.predict_proba(X_meta_test_outer)
@@ -520,11 +545,11 @@ def main(config_path):
                     final_preds_soft_vote_proba_outer += weight * base_model_preds_on_outer_test_sum['teco']
                     total_weight += weight
                     active_models_count += 1
-                if config.get('ensemble', {}).get('train_stm_gnn', True) and 'stm_gnn' in soft_vote_weights:
-                    weight = soft_vote_weights['stm_gnn']
-                    final_preds_soft_vote_proba_outer += weight * base_model_preds_on_outer_test_sum['stm_gnn']
-                    total_weight += weight
-                    active_models_count += 1
+                # if config.get('ensemble', {}).get('train_stm_gnn', True) and 'stm_gnn' in soft_vote_weights: # STM-GNN Removed
+                #     weight = soft_vote_weights['stm_gnn']
+                #     final_preds_soft_vote_proba_outer += weight * base_model_preds_on_outer_test_sum['stm_gnn']
+                #     total_weight += weight
+                #     active_models_count += 1
 
                 if active_models_count > 0 and total_weight > 1e-6:  # Avoid division by zero or tiny weights
                     # Normalize if weights don't sum to 1 (or if only some models contributed)

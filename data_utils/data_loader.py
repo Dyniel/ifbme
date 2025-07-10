@@ -79,6 +79,28 @@ def load_raw_data(config, base_data_path="data/"):
     X_full = df_full.drop(columns=[target_column])
     y_full = df_full[target_column]
 
+    # --- Date Column Conversion ---
+    # Identify potential date columns and convert them to numerical (e.g., Unix timestamp)
+    # Add more columns if other date-like columns exist
+    date_columns_to_convert = ['requestDate', 'admissionDate']
+    for col_name in date_columns_to_convert:
+        if col_name in X_full.columns:
+            try:
+                # Convert to datetime, then to Unix timestamp (seconds since epoch)
+                # Errors='coerce' will turn unparseable dates into NaT (Not a Time), which then become NaN
+                X_full[col_name] = pd.to_datetime(X_full[col_name], errors='coerce')
+                # Fill NaT/NaN with a specific value if desired, or let imputation handle it later.
+                # For timestamp, a common fill might be 0 or median/mean of other timestamps.
+                # Here, we convert to Unix timestamp (float). NaT will become NaN.
+                X_full[col_name] = (X_full[col_name] - pd.Timestamp("1970-01-01")) // pd.Timedelta('1s')
+                # Alternative: X_full[col_name] = X_full[col_name].astype(np.int64) // 10**9 # if using .values.astype(np.int64)
+                logger.info(f"Converted column '{col_name}' to Unix timestamp.")
+            except Exception as e:
+                logger.warning(f"Could not convert date column '{col_name}' to numeric: {e}. It might remain as object type or cause errors downstream if not handled.")
+        else:
+            logger.warning(f"Date column '{col_name}' specified for conversion not found in X_full.")
+    # --- End Date Column Conversion ---
+
     logger.info(f"Data loading complete. X_full shape: {X_full.shape}, y_full shape: {y_full.shape}")
     return X_full, y_full # Return DataFrames
 
