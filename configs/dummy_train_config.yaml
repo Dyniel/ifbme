@@ -1,0 +1,98 @@
+random_seed: 42
+use_gpu: true
+dummy_data_train_samples: 500
+dummy_data_val_samples: 100
+dummy_data_features: 10 # This will define the number of features for LGBM and conceptually for TECO/STM-GNN
+dummy_data_classes: 2 # Assuming binary classification for all models
+dummy_data_train_weights: [0.9, 0.1]
+dummy_data_val_weights: [0.8, 0.2]
+
+balancing:
+  use_rsmote_gan_in_cv: true
+  rsmote_gan_params:
+    k: 5
+    minority_upsample_factor: 3.0
+
+# General loss/optimizer for any primary DL model training (less used by ensemble script directly)
+loss_function:
+  type: ClassBalancedFocalLoss
+  beta: 0.9999
+  gamma: 2.0
+optimizer:
+  name: Adam
+  lr: 0.001
+
+# General training params (less used by ensemble script directly for base models)
+training:
+  num_epochs: 5 # General epoch count, specific models can override
+
+ensemble:
+  n_folds_for_oof: 5
+  train_lgbm: true
+  train_teco: true
+  train_stm_gnn: true # Will still use dummy/conceptual predictions
+  train_meta_learner: true
+
+  lgbm_params:
+    num_leaves: 10000
+    class_weight: 'balanced'
+    num_boost_round: 100 # Reduced for faster dummy run
+    early_stopping_rounds: 20 # Reduced
+    # model_specific_params: {learning_rate: 0.05}
+    save_path: 'lgbm_final.joblib'
+
+  teco_params:
+    # Data related for TECO - feature_columns_teco should list actual column names from preprocessed data
+    # For dummy data with dummy_data_features=10, this would be ['feature_0', ..., 'feature_9']
+    # This needs to be set based on the actual preprocessing output.
+    feature_columns_teco: ['feature_0', 'feature_1', 'feature_2', 'feature_3', 'feature_4', 'feature_5', 'feature_6', 'feature_7', 'feature_8', 'feature_9']
+    target_column_teco: 'outcomeType_teco' # Name for the target column used by TabularSequenceDataset
+
+    # Model hyperparameters
+    input_feature_dim: 10 # Should match len(feature_columns_teco) and dummy_data_features
+    d_model: 128 # Reduced from 512 for faster dummy runs
+    num_encoder_layers: 2 # Reduced from 4
+    nhead: 4 # Reduced from 8
+    dim_feedforward: 256 # Reduced from 2048
+    dropout: 0.1
+    num_classes: 2 # Should match dummy_data_classes
+    max_seq_len: 10 # Max sequence length for positional encoding (current actual sequence length is 1)
+
+    # Training hyperparameters for TECO
+    epochs_teco: 5 # Number of epochs for TECO training per fold
+    batch_size_teco: 16 # Batch size for TECO
+    lr_teco: 0.0001      # Learning rate for TECO
+
+    save_path: 'teco_final.pth'
+
+  stm_gnn_params:
+    # Conceptual parameters, assuming STMGNN or ModelWithSTMGNNLayer takes these
+    num_node_features: 10 # Placeholder, should match dummy_data_features if applicable
+    layer_hidden_dim: 256
+    gnn_output_dim: 256
+    num_gnn_layers: 5
+    global_memory_dim: 128
+    num_memory_slots: 10
+    num_heads: 8
+    dropout: 0.1
+    num_classes: 2 # Placeholder, should match dummy_data_classes
+    save_path: 'stm_gnn_final.pth'
+
+  meta_learner_xgb_params:
+    depth: 3
+    num_boost_round: 100 # Reduced
+    early_stopping_rounds: 10 # Reduced
+    # model_specific_params: {eta: 0.05}
+    save_path: 'meta_learner_xgb.joblib'
+
+  soft_vote_weights:
+    stm_gnn: 0.5
+    lgbm: 0.3
+    teco: 0.2
+
+wandb:
+  project: 'ifbme-project-dev' # Example project name
+  entity: null # Your W&B entity (username or team)
+  run_name: 'dummy_ensemble_run_with_teco'
+  run_notes: 'Conceptual ensemble training run including TECO, using dummy data.'
+  tags: ['dummy_data', 'ensemble', 'teco_integration']
