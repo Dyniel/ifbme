@@ -1,3 +1,11 @@
+import sys
+import os
+# Add the project root to sys.path
+# This assumes scripts/train.py is two levels down from the project root (e.g., project_root/scripts/train.py)
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 import argparse
 import yaml # For loading configurations
 import wandb
@@ -12,8 +20,7 @@ from sklearn.model_selection import StratifiedKFold
 from data_utils.balancing import RSMOTEGAN
 from data_utils.losses import ClassBalancedFocalLoss
 # from models.your_model import YourModel # Replace with actual model
-from models.lgbm_model import LightGBMModel
-from models.meta_learner import XGBoostMetaLearner
+from models import LightGBMModel, XGBoostMetaLearner # Adjusted imports
 
 def load_config(config_path):
     """Loads YAML configuration file."""

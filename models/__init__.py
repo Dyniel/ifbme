@@ -6,9 +6,9 @@
 
 # Expose key models or layers for easier import
 from .stm_gnn import STMGNN, STMGNNLayer
-# from .lightgbm_model import LightGBMModel # Example for future
-# from .teco_transformer import TECOTransformerModel # Example for future
-# from .meta_learner import XGBoostMetaLearner # Example for future
+from .lgbm_model import LightGBMModel
+from .teco_transformer import TECOTransformerModel # Assuming it exists and might be used
+from .meta_learner import XGBoostMetaLearner
 
 # Potentially, the model that integrates STMGNNLayer as per plan:
 from .main_model import ModelWithSTMGNNLayer
@@ -17,7 +17,7 @@ __all__ = [
     "STMGNN",
     "STMGNNLayer",
     "ModelWithSTMGNNLayer",
-    # "LightGBMModel",
-    # "TECOTransformerModel",
-    # "XGBoostMetaLearner"
+    "LightGBMModel",
+    "TECOTransformerModel",
+    "XGBoostMetaLearner"
 ]
