@@ -82,11 +82,15 @@ def get_input_dim_from_data(sample_csv_path, lap_pe_k_dim, sign_pe_k_dim):
     Infers the input dimension by preprocessing a small sample of data.
     """
     print("Inferring input dimension from sample data...")
+    # Pass a default empty list for exclude_features for this inference step,
+    # as we want to know the dimension with all potential features.
+    # Actual exclusion will happen during main data loading.
     graph_data_sample, _, preprocessor_sample = load_and_preprocess_data(
         sample_csv_path,
         fit_preprocessor=True,
         target_cols=None,
-        k_neighbors=3
+        k_neighbors=3,
+        exclude_features=[] # Ensure all features are considered for dim inference
     )
     if graph_data_sample is None or preprocessor_sample is None:
         raise RuntimeError("Failed to process sample data for dimension inference.")
@@ -322,7 +326,8 @@ def main(run_config_from_sweep=None):
             "activation_fn": args.activation_fn if hasattr(args, 'activation_fn') else 'relu',
             "clip_grad_norm": args.clip_grad_norm if hasattr(args, 'clip_grad_norm') else 0.0,
             "label_smoothing": args.label_smoothing if hasattr(args, 'label_smoothing') else 0.0,
-            "task": args.task # Add task to config
+            "task": args.task, # Add task to config
+            "exclude_features": args.exclude_features if hasattr(args, 'exclude_features') else [] # Add exclude_features
         }
         run_id = time.strftime('%Y%m%d-%H%M%S')
         run_name_prefix = f"task_{args.task}"
@@ -394,6 +399,7 @@ def main(run_config_from_sweep=None):
     _ACTIVATION_FN = effective_config.get("activation_fn", "relu")
     _CLIP_GRAD_NORM = effective_config.get("clip_grad_norm", 0.0)
     _LABEL_SMOOTHING = effective_config.get("label_smoothing", 0.0)
+    _EXCLUDE_FEATURES = effective_config.get("exclude_features", []) # Get exclude_features from config
 
     print("Starting main training script execution...")
     print(f"Running with effective_config: {effective_config}")
@@ -402,7 +408,11 @@ def main(run_config_from_sweep=None):
 
     print("Loading and preprocessing training data for dimension inference and training...")
     train_graph, _, preprocessor = load_and_preprocess_data(
-        TRAIN_CSV, fit_preprocessor=True, target_cols=['outcomeType', 'lengthofStay'], k_neighbors=10
+        TRAIN_CSV,
+        fit_preprocessor=True,
+        target_cols=['outcomeType', 'lengthofStay'],
+        k_neighbors=10,
+        exclude_features=_EXCLUDE_FEATURES # Pass exclude_features list
     )
     if train_graph is None:
         print("Failed to load training data. Exiting.")
@@ -454,8 +464,12 @@ def main(run_config_from_sweep=None):
 
     print("Loading and preprocessing validation data...")
     val_graph, _ = load_and_preprocess_data(
-        VAL_CSV, preprocessor=preprocessor, fit_preprocessor=False,
-        target_cols=['outcomeType', 'lengthofStay'], k_neighbors=10
+        VAL_CSV,
+        preprocessor=preprocessor,
+        fit_preprocessor=False,
+        target_cols=['outcomeType', 'lengthofStay'],
+        k_neighbors=10,
+        exclude_features=_EXCLUDE_FEATURES # Pass exclude_features list
     )
     if val_graph is None:
         print("Failed to load validation data. Exiting.")
@@ -591,6 +605,7 @@ if __name__ == "__main__":
     parser.add_argument('--label_smoothing', type=float, default=0.0, help='Label smoothing factor for BCE loss (default: 0.0, no smoothing)')
     parser.add_argument('--no-wandb', action='store_true', help='Disable Weights & Biases logging.')
     parser.add_argument('--task', type=str, default='all', choices=['mortality', 'los', 'all'], help='Task to train (mortality, los, or all). Default: all')
+    parser.add_argument('--exclude_features', nargs='*', default=[], help='List of feature names to exclude from processing. E.g., --exclude_features feature1 feature2')
 
     args = parser.parse_args()
 
