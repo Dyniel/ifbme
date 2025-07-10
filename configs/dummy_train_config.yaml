@@ -1,98 +1,111 @@
 random_seed: 42
 use_gpu: true
-dummy_data_train_samples: 500
-dummy_data_val_samples: 100
-dummy_data_features: 10 # This will define the number of features for LGBM and conceptually for TECO/STM-GNN
-dummy_data_classes: 2 # Assuming binary classification for all models
-dummy_data_train_weights: [0.9, 0.1]
-dummy_data_val_weights: [0.8, 0.2]
 
+# --- Data Configuration ---
+# Set to true to use dummy data generation specified below
+use_dummy_data_for_full_run: false # SET TO FALSE TO USE REAL DATA
+data_dir: "data/" # Base directory for trainData.csv, valData.csv
+data_paths:
+  train: "trainData.csv"
+  val: "valData.csv"
+  # test: "testData.csv" # Not used in NCV training script directly
+  target_column: "Mortality" # Name of the target variable column in your CSVs
+
+# Dummy data settings (only used if use_dummy_data_for_full_run is true)
+dummy_data_total_samples: 1000 # Total samples for the combined (train+val) dummy dataset
+dummy_data_features: 50      # Number of features for dummy data
+dummy_data_classes: 2        # Number of classes for dummy data
+dummy_data_weights: [0.85, 0.15] # Class imbalance for dummy data
+
+# --- Preprocessing Configuration ---
+preprocessing:
+  numerical_cols: [] # List of numerical column names. If empty, inferred from dtype.
+                     # Example: ['age', 'lab_value_1']
+  categorical_cols: [] # List of categorical column names. If empty, inferred.
+                       # Example: ['gender', 'ethnicity']
+  imputation_strategy: 'median' # For numerical: 'mean', 'median', 'most_frequent'
+                                # For categorical: 'most_frequent' or a constant like 'missing'
+  scale_numerics: true
+  onehot_handle_unknown: 'ignore' # For OneHotEncoder: 'error', 'ignore', 'infrequent_if_exist'
+
+# --- Balancing Configuration ---
 balancing:
-  use_rsmote_gan_in_cv: true
+  use_rsmote_gan_in_cv: true # Whether to apply RSMOTE-GAN in inner CV folds
   rsmote_gan_params:
     k: 5
-    minority_upsample_factor: 3.0
+    minority_upsample_factor: 3.0 # Target factor for minority class size relative to original
 
-# General loss/optimizer for any primary DL model training (less used by ensemble script directly)
-loss_function:
-  type: ClassBalancedFocalLoss
-  beta: 0.9999
-  gamma: 2.0
-optimizer:
-  name: Adam
-  lr: 0.001
-
-# General training params (less used by ensemble script directly for base models)
-training:
-  num_epochs: 5 # General epoch count, specific models can override
-
+# --- Ensemble Configuration ---
 ensemble:
-  n_folds_for_oof: 5
+  n_outer_folds: 5 # Number of outer folds for NCV
+  n_inner_folds_for_oof: 5 # Number of inner folds for OOF generation
+
   train_lgbm: true
   train_teco: true
-  train_stm_gnn: true # Will still use dummy/conceptual predictions
+  train_stm_gnn: true # STM-GNN is conceptual; will use placeholder predictions
   train_meta_learner: true
 
   lgbm_params:
-    num_leaves: 10000
+    num_leaves: 10000 # As per AUROC spec; consider tuning
     class_weight: 'balanced'
-    num_boost_round: 100 # Reduced for faster dummy run
-    early_stopping_rounds: 20 # Reduced
-    # model_specific_params: {learning_rate: 0.05}
-    save_path: 'lgbm_final.joblib'
+    num_boost_round: 1500 # Increased for full run
+    early_stopping_rounds: 100 # Increased for full run
+    # model_specific_params: { 'learning_rate': 0.01, 'reg_alpha': 0.1, 'reg_lambda': 0.1 } # Example further tuning
+    save_path: 'models_output/lgbm_final_ncv_trained.joblib' # Path for potential final model save (not directly used by NCV script)
 
   teco_params:
-    # Data related for TECO - feature_columns_teco should list actual column names from preprocessed data
-    # For dummy data with dummy_data_features=10, this would be ['feature_0', ..., 'feature_9']
-    # This needs to be set based on the actual preprocessing output.
-    feature_columns_teco: ['feature_0', 'feature_1', 'feature_2', 'feature_3', 'feature_4', 'feature_5', 'feature_6', 'feature_7', 'feature_8', 'feature_9']
-    target_column_teco: 'outcomeType_teco' # Name for the target column used by TabularSequenceDataset
+    # feature_columns_teco: # Not needed here, derived from preprocessor output in train script
+    # target_column_teco: # Not needed here, derived from preprocessor output in train script
 
-    # Model hyperparameters
-    input_feature_dim: 10 # Should match len(feature_columns_teco) and dummy_data_features
-    d_model: 128 # Reduced from 512 for faster dummy runs
-    num_encoder_layers: 2 # Reduced from 4
-    nhead: 4 # Reduced from 8
-    dim_feedforward: 256 # Reduced from 2048
+    # Model hyperparameters (as per AUROC spec, but consider tuning)
+    input_feature_dim: null # Will be determined by preprocessed data in train script
+    d_model: 512
+    num_encoder_layers: 4
+    nhead: 8
+    dim_feedforward: 2048
     dropout: 0.1
-    num_classes: 2 # Should match dummy_data_classes
-    max_seq_len: 10 # Max sequence length for positional encoding (current actual sequence length is 1)
+    num_classes: null # Will be determined by data in train script
+    max_seq_len: 150 # Adjust based on typical sequence length in your data (if applicable, current is 1 for tabular)
 
-    # Training hyperparameters for TECO
-    epochs_teco: 5 # Number of epochs for TECO training per fold
-    batch_size_teco: 16 # Batch size for TECO
-    lr_teco: 0.0001      # Learning rate for TECO
+    # Training hyperparameters for TECO (per inner fold)
+    epochs_teco_inner: 20 # Increased epochs for TECO training in inner folds
+    batch_size_teco: 32
+    lr_teco: 0.0001
+    # class_weights_teco: [1.0, 3.0] # Example if using weighted loss for TECO, must match num_classes
+    save_path: 'models_output/teco_final_ncv_trained.pth'
 
-    save_path: 'teco_final.pth'
-
-  stm_gnn_params:
-    # Conceptual parameters, assuming STMGNN or ModelWithSTMGNNLayer takes these
-    num_node_features: 10 # Placeholder, should match dummy_data_features if applicable
+  stm_gnn_params: # These are highly conceptual as STM-GNN requires graph data
+    num_node_features: null # Placeholder, will depend on graph feature engineering
     layer_hidden_dim: 256
-    gnn_output_dim: 256
+    gnn_output_dim: 256   # Not directly used by classifier if pooling from layer_hidden_dim
     num_gnn_layers: 5
     global_memory_dim: 128
     num_memory_slots: 10
     num_heads: 8
     dropout: 0.1
-    num_classes: 2 # Placeholder, should match dummy_data_classes
-    save_path: 'stm_gnn_final.pth'
+    num_classes: null # Placeholder, will be set from data
+    # Graph-specific params:
+    # num_snapshots_stm: 1 # If processing single graph snapshot from tabular row
+    # epochs_stm_gnn_inner: 15
+    # lr_stm_gnn: 0.0005
+    save_path: 'models_output/stm_gnn_final_ncv_trained.pth'
 
   meta_learner_xgb_params:
-    depth: 3
-    num_boost_round: 100 # Reduced
-    early_stopping_rounds: 10 # Reduced
-    # model_specific_params: {eta: 0.05}
-    save_path: 'meta_learner_xgb.joblib'
+    depth: 3 # As per AUROC spec
+    num_boost_round: 250 # Increased for full run
+    early_stopping_rounds: 30 # Increased for full run
+    # model_specific_params: { 'eta': 0.01, 'gamma': 0.1, 'subsample': 0.8, 'colsample_bytree': 0.8 } # Example
+    save_path: 'models_output/meta_learner_xgb_ncv_trained.joblib'
 
-  soft_vote_weights:
+  soft_vote_weights: # As per AUROC spec
     stm_gnn: 0.5
     lgbm: 0.3
     teco: 0.2
 
+# --- W&B Logging ---
 wandb:
-  project: 'ifbme-project-dev' # Example project name
-  entity: null # Your W&B entity (username or team)
-  run_name: 'dummy_ensemble_run_with_teco'
-  run_notes: 'Conceptual ensemble training run including TECO, using dummy data.'
-  tags: ['dummy_data', 'ensemble', 'teco_integration']
+  project: 'ifbme-project-full-run' # Update project name for full runs
+  entity: null # Replace with your W&B username or team name
+  run_name: 'full_ncv_ensemble_run' # Descriptive run name
+  run_notes: 'Full Nested CV training run with real data (if configured) and updated parameters.'
+  tags: ['full_run', 'ncv', 'ensemble']
