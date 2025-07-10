@@ -22,7 +22,7 @@ This file provides guidance for AI agents working on this codebase.
     *   Model implementations should allow for easy hyperparameter tuning.
     *   Ensure model saving and loading mechanisms are robust.
     *   For PyTorch models, ensure they can be easily moved to GPU/CPU.
-*   **`ssl/`**:
+*   **`self_supervised_learning/`**:
     *   Clearly document the SSL methods and their expected inputs/outputs.
     *   Provide scripts or clear instructions for running pre-training.
 *   **`explainability/`**:

@@ -39,7 +39,7 @@ This project implements a comprehensive pipeline for clinical prediction tasks, 
 │   ├── predict.py            # Prediction script for the ensemble
 │   ├── pretrain_ssl.py       # Self-supervised pre-training (conceptual)
 │   └── train.py              # Main training script (ensemble learning)
-├── ssl/                      # Self-supervised learning components
+├── self_supervised_learning/ # Self-supervised learning components
 │   ├── __init__.py
 │   ├── graphmae.py           # GraphMAE (conceptual)
 │   └── mm_simclr.py          # MM-SimCLR (conceptual)

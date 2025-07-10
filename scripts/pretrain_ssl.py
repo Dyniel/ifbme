@@ -5,8 +5,8 @@ import torch.optim as optim
 import numpy as np
 
 # Project-specific SSL model imports
-from ssl.mm_simclr import MMSimCLR #, DummyStructuredEncoder, DummyTextEncoder (if used directly)
-from ssl.graphmae import GraphMAE
+from self_supervised_learning.mm_simclr import MMSimCLR #, DummyStructuredEncoder, DummyTextEncoder (if used directly)
+from self_supervised_learning.graphmae import GraphMAE
 # Placeholder for data loaders
 # from data_utils.your_ssl_data_loader import MultimodalDataset, GraphDataset
 
