@@ -21,6 +21,11 @@ from data_utils.balancing import RSMOTEGAN
 from data_utils.losses import ClassBalancedFocalLoss
 # from models.your_model import YourModel # Replace with actual model
 from models import LightGBMModel, XGBoostMetaLearner # Adjusted imports
+from models.teco_transformer import TECOTransformerModel
+from data_utils.sequence_loader import TabularSequenceDataset, basic_collate_fn
+import torch.nn as nn # Added for TECO loss
+from torch.utils.data import DataLoader # Added for TECO DataLoader
+import pandas as pd # Added for TECO data handling
 
 def load_config(config_path):
     """Loads YAML configuration file."""
@@ -301,25 +306,123 @@ def main(config_path):
 
         # --- 2. Train TECO-Transformer (Conceptual) ---
         if config.get('ensemble', {}).get('train_teco', True):
-            print(f"\nFold {fold+1}: Training TECO-Transformer (Conceptual)...")
-            # This requires sequence data. Assuming X_fold_train_balanced can be shaped into sequences.
-            # Or, specific sequence data loader is needed. For now, conceptual.
-            # teco_config = config.get('ensemble', {}).get('teco_params', {})
-            # teco_model = TECOTransformerModel(...)
-            # ... training loop for TECO ...
-            # oof_preds['teco'][val_idx] = teco_model.predict_proba(X_fold_val_sequences)
-            # test_preds_sum['teco'] += teco_model.predict_proba(X_test_sequences) / n_folds
-            # For dummy run, fill with random predictions based on class balance
-            num_val_samples_fold = len(y_fold_val)
-            # Simulate probabilities respecting original class balance for more realistic dummy OOF
-            class_probs_sim = np.bincount(y_train_raw) / len(y_train_raw)
-            oof_preds['teco'][val_idx] = np.random.multinomial(1, class_probs_sim, size=num_val_samples_fold) * 0.8 + \
-                                         np.random.rand(num_val_samples_fold, num_classes) * 0.2 # Add noise
-            oof_preds['teco'][val_idx] = oof_preds['teco'][val_idx] / np.sum(oof_preds['teco'][val_idx], axis=1, keepdims=True)
+            print(f"\nFold {fold+1}: Training TECO-Transformer...")
+            teco_config = config.get('ensemble', {}).get('teco_params', {})
 
-            # Log TECO fold metrics (conceptual)
-            y_fold_val_pred_teco = np.argmax(oof_preds['teco'][val_idx], axis=1) # Dummy prediction
-            fold_accuracy_teco = accuracy_score(y_fold_val, y_fold_val_pred_teco)
+            # Data Preparation for TECO
+            # Assuming X_fold_train_balanced, X_fold_val, X_test_for_base_models are numpy arrays of features
+            # We need feature names. For now, assume they are 'feature_0', 'feature_1', ...
+            # This should be configured properly via `teco_feature_columns` in config.
+            num_fold_features = X_fold_train_balanced.shape[1]
+            # Use generic feature names if not specified in config, this is a fallback.
+            teco_feature_columns = teco_config.get('feature_columns_teco', [f'feature_{i}' for i in range(num_fold_features)])
+
+            # Ensure feature_columns used for DataFrame creation match the actual number of features
+            if len(teco_feature_columns) != num_fold_features:
+                print(f"Warning: Mismatch between teco_feature_columns ({len(teco_feature_columns)}) and actual features ({num_fold_features}). Using generic names.")
+                teco_feature_columns = [f'feature_{i}' for i in range(num_fold_features)]
+
+            df_fold_train = pd.DataFrame(X_fold_train_balanced, columns=teco_feature_columns)
+            df_fold_val = pd.DataFrame(X_fold_val, columns=teco_feature_columns)
+            df_test_teco = pd.DataFrame(X_test_for_base_models, columns=teco_feature_columns)
+
+            # For TECO, let's assume the target is binary classification (e.g., 'outcomeType')
+            # The y_fold_train_balanced, y_fold_val are already available.
+            # The TabularSequenceDataset will handle mapping if target is string.
+            # For simplicity, we'll use the 'outcomeType' as the target column name,
+            # and the dataset will map 'Survival'/'Death' if needed.
+            teco_target_column = teco_config.get('target_column_teco', 'outcomeType_teco') # Example, should be in config
+
+            train_teco_dataset = TabularSequenceDataset(
+                csv_file_path=None, df_data=df_fold_train, y_data=y_fold_train_balanced,
+                feature_columns=teco_feature_columns, target_column=teco_target_column
+            )
+            val_teco_dataset = TabularSequenceDataset(
+                csv_file_path=None, df_data=df_fold_val, y_data=y_fold_val,
+                feature_columns=teco_feature_columns, target_column=teco_target_column
+            )
+            test_teco_dataset = TabularSequenceDataset( # y_data can be dummy/None for test set if only predicting
+                csv_file_path=None, df_data=df_test_teco, y_data=np.zeros(len(df_test_teco)), # Dummy y for test
+                feature_columns=teco_feature_columns, target_column=teco_target_column
+            )
+
+            batch_size_teco = teco_config.get('batch_size_teco', 32)
+            train_teco_loader = DataLoader(train_teco_dataset, batch_size=batch_size_teco, shuffle=True, collate_fn=basic_collate_fn)
+            val_teco_loader = DataLoader(val_teco_dataset, batch_size=batch_size_teco, shuffle=False, collate_fn=basic_collate_fn)
+            test_teco_loader = DataLoader(test_teco_dataset, batch_size=batch_size_teco, shuffle=False, collate_fn=basic_collate_fn)
+
+            teco_model = TECOTransformerModel(
+                input_feature_dim=len(teco_feature_columns),
+                d_model=teco_config.get('d_model', 128), # Smaller default for faster dummy runs
+                num_encoder_layers=teco_config.get('num_encoder_layers', 2),
+                nhead=teco_config.get('nhead', 4),
+                dim_feedforward=teco_config.get('dim_feedforward', 512),
+                dropout=teco_config.get('dropout', 0.1),
+                num_classes=num_classes, # num_classes derived from y_train_raw
+                max_seq_len=teco_config.get('max_seq_len', 50) # For positional encoding, though current seq_len is 1
+            ).to(device)
+
+            teco_criterion = nn.CrossEntropyLoss()
+            teco_optimizer = optim.Adam(teco_model.parameters(), lr=teco_config.get('lr_teco', 1e-4))
+
+            epochs_teco = teco_config.get('epochs_teco', 5) # Small number of epochs for example
+
+            for epoch in range(epochs_teco):
+                teco_model.train()
+                train_loss_sum = 0
+                for batch in train_teco_loader:
+                    sequences = batch['sequence'].to(device)
+                    padding_masks = batch['padding_mask'].to(device)
+                    targets = batch['target'].to(device)
+
+                    teco_optimizer.zero_grad()
+                    outputs = teco_model(sequences, src_padding_mask=padding_masks)
+                    loss = teco_criterion(outputs, targets)
+                    loss.backward()
+                    teco_optimizer.step()
+                    train_loss_sum += loss.item()
+                avg_train_loss = train_loss_sum / len(train_teco_loader)
+                print(f"Fold {fold+1}, TECO Epoch {epoch+1}/{epochs_teco}, Train Loss: {avg_train_loss:.4f}")
+
+            # Evaluation and OOF predictions for TECO
+            teco_model.eval()
+            fold_val_preds_teco_list = []
+            with torch.no_grad():
+                for batch in val_teco_loader:
+                    sequences = batch['sequence'].to(device)
+                    padding_masks = batch['padding_mask'].to(device)
+                    outputs = teco_model(sequences, src_padding_mask=padding_masks)
+                    probabilities = torch.softmax(outputs, dim=1)
+                    fold_val_preds_teco_list.append(probabilities.cpu().numpy())
+
+            fold_val_preds_teco = np.concatenate(fold_val_preds_teco_list, axis=0)
+            if fold_val_preds_teco.shape[1] != num_classes: # Basic sanity check
+                 # If num_classes is 2, but model outputs 1 logit for BCE, adjust.
+                 # Current TECO with CrossEntropyLoss for num_classes=2 outputs 2 logits.
+                 print(f"Warning: TECO output prob shape {fold_val_preds_teco.shape} mismatch with num_classes {num_classes}")
+
+            oof_preds['teco'][val_idx] = fold_val_preds_teco[:, :num_classes] # Ensure correct shape
+
+            # Test set predictions for TECO
+            fold_test_preds_teco_list = []
+            with torch.no_grad():
+                for batch in test_teco_loader:
+                    sequences = batch['sequence'].to(device)
+                    padding_masks = batch['padding_mask'].to(device)
+                    outputs = teco_model(sequences, src_padding_mask=padding_masks)
+                    probabilities = torch.softmax(outputs, dim=1)
+                    fold_test_preds_teco_list.append(probabilities.cpu().numpy())
+
+            fold_test_preds_teco = np.concatenate(fold_test_preds_teco_list, axis=0)
+            test_preds_sum['teco'] += fold_test_preds_teco[:, :num_classes] / n_folds
+
+            # Log TECO fold metrics
+            y_fold_val_pred_teco_labels = np.argmax(oof_preds['teco'][val_idx], axis=1)
+            fold_accuracy_teco = accuracy_score(y_fold_val, y_fold_val_pred_teco_labels)
+            fold_f1_teco = f1_score(y_fold_val, y_fold_val_pred_teco_labels, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+            fold_precision_teco = precision_score(y_fold_val, y_fold_val_pred_teco_labels, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+            fold_recall_teco = recall_score(y_fold_val, y_fold_val_pred_teco_labels, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+
             fold_auroc_teco = -1
             try:
                 if num_classes == 2:
@@ -327,20 +430,17 @@ def main(config_path):
                 else:
                     fold_auroc_teco = roc_auc_score(y_fold_val, oof_preds['teco'][val_idx], multi_class='ovr', average='weighted')
             except ValueError as e:
-                print(f"Fold {fold+1} TECO AUROC calculation error (conceptual): {e}")
+                print(f"Fold {fold+1} TECO AUROC calculation error: {e}")
+
             wandb.log({
                 f"fold_{fold+1}/teco_accuracy": fold_accuracy_teco,
                 f"fold_{fold+1}/teco_auroc": fold_auroc_teco,
+                f"fold_{fold+1}/teco_f1": fold_f1_teco,
+                f"fold_{fold+1}/teco_precision": fold_precision_teco,
+                f"fold_{fold+1}/teco_recall": fold_recall_teco,
                 "fold": fold + 1
             })
-            print(f"Fold {fold+1} TECO Val Accuracy (conceptual): {fold_accuracy_teco:.4f}, AUROC (conceptual): {fold_auroc_teco:.4f}")
-
-
-            num_test_samples_fold = len(y_test_for_base_models)
-            test_preds_sum['teco'] += (np.random.multinomial(1, class_probs_sim, size=num_test_samples_fold) * 0.8 + \
-                                      np.random.rand(num_test_samples_fold, num_classes) * 0.2) / n_folds
-            test_preds_sum['teco'] = np.clip(test_preds_sum['teco'], 0, 1) # Ensure valid probs after averaging
-
+            print(f"Fold {fold+1} TECO Val Accuracy: {fold_accuracy_teco:.4f}, AUROC: {fold_auroc_teco:.4f}")
 
         # --- 3. Train STM-GNN (Conceptual) ---
         if config.get('ensemble', {}).get('train_stm_gnn', True):
