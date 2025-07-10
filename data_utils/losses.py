@@ -217,5 +217,3 @@ if __name__ == '__main__':
 
     assert torch.isclose(loss4, loss_ce), "Focal Loss with gamma=0 and no balancing should match CrossEntropyLoss"
     print("Assertion passed: Focal Loss (gamma=0, no balance) matches CrossEntropyLoss.")
-
-```

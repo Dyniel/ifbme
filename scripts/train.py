@@ -487,5 +487,3 @@ if __name__ == '__main__':
         print(f"Created dummy config at {args.config}")
 
     main(args.config)
-
-```

@@ -289,4 +289,3 @@ if __name__ == '__main__':
         pretrain_graphmae(config_loaded)
 
     print("\nSSL Pre-training script finished.")
-```

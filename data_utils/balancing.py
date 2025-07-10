@@ -253,5 +253,3 @@ if __name__ == '__main__':
     print(f"Resampled (one) class distribution: {np.bincount(y_res_one)}")
     expected_one_minority_total = int(round(np.sum(y_one == np.argmin(np.bincount(y_one))) * 3.0))
     self.assertEqual(np.sum(y_res_one == np.argmin(np.bincount(y_one))), expected_one_minority_total, "Single minority count mismatch")
-
-```
