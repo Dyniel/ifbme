@@ -1,6 +1,19 @@
-torch==2.7.0
-torch_geometric==2.6.1
+# Basic requirements - will be expanded as we implement modules
 pandas
 numpy
 scikit-learn
-wandb
+torch
+transformers
+xgboost
+lightgbm
+# For graph operations
+# networkx # Potentially, or torch_geometric/dgl
+# For SSL
+# Consider libraries like lightly or specific implementations for MM-SimCLR/GraphMAE
+# For explainability
+shap
+# For calibration
+# scikit-learn usually covers isotonic regression
+
+# Specific versions can be pinned later based on compatibility needs.
+torch-geometric

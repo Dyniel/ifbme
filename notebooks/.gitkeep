@@ -1,0 +1,5 @@
+# This directory is for Jupyter notebooks used for:
+# - Exploratory Data Analysis (EDA)
+# - Experimentation
+# - Visualizations
+# (.gitkeep to ensure the directory is tracked by git even if empty initially)
