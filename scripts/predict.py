@@ -232,4 +232,4 @@ if __name__ == '__main__':
         # For this script, it's better if the dummy_train_config.yaml (created by train.py) exists.
 
     main(args)
-
+```

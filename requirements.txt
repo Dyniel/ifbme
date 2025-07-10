@@ -1,3 +1,4 @@
+# Basic requirements - will be expanded as we implement modules
 pandas
 numpy
 scikit-learn
@@ -5,7 +6,14 @@ torch
 transformers
 xgboost
 lightgbm
-networkx
+# For graph operations
+# networkx # Potentially, or torch_geometric/dgl
+# For SSL
+# Consider libraries like lightly or specific implementations for MM-SimCLR/GraphMAE
+# For explainability
 shap
-lightly
+# For calibration
+# scikit-learn usually covers isotonic regression
+
+# Specific versions can be pinned later based on compatibility needs.
 torch-geometric
