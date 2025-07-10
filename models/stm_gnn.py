@@ -5,26 +5,26 @@ import torch.nn.functional as F
 # Attempt to import from torch_geometric, but make it optional for conceptual run
 try:
     from torch_geometric.nn import MessagePassing
-    from torch_geometric.utils import add_self_loops, degree
+    from torch_geometric.utils import add_self_loops, degree, softmax
     PYG_AVAILABLE = True
 except ImportError:
     PYG_AVAILABLE = False
-    print("Warning: PyTorch Geometric (torch_geometric) not found. STM-GNN example will be very limited.")
     # Define a placeholder if PyG is not available
-    class MessagePassing(nn.Module):
+    class MessagePassingBase(nn.Module): # Renamed to avoid clash if user installs PyG later
         def __init__(self, aggr='add', flow='source_to_target', node_dim=-2):
-            super(MessagePassing, self).__init__()
-            print("Placeholder MessagePassing layer.")
+            super(MessagePassingBase, self).__init__()
+            print("Placeholder MessagePassingBase layer used. PyTorch Geometric not found.")
         def propagate(self, edge_index, size=None, **kwargs):
-            # This is a very simplified placeholder
-            # In reality, it would call message, aggregate, update methods
-            # For now, let's assume it returns the primary node features passed in kwargs (e.g., x)
             if 'x' in kwargs: return kwargs['x']
-            if 'x_j' in kwargs: return kwargs['x_j'] # if x is split for bipartite
-            return torch.zeros(1) # Should not happen in real use
-        def message(self, x_j): return x_j # Dummy message
-        def aggregate(self, inputs, index): return inputs # Dummy aggregate
-        def update(self, aggr_out): return aggr_out # Dummy update
+            if 'x_j' in kwargs: return kwargs['x_j']
+            return torch.zeros(1)
+        def message(self, x_j): return x_j
+        def aggregate(self, inputs, index, dim_size): return inputs # Placeholder needs dim_size
+        def update(self, aggr_out): return aggr_out
+    MessagePassing = MessagePassingBase # Use placeholder if PyG not available
+    softmax = lambda src, index, num_nodes: F.softmax(src, dim=0) # simplified placeholder for softmax if no PyG
+    degree = lambda index, num_nodes, dtype: torch.zeros(num_nodes, dtype=dtype) # simplified placeholder
+    print("Warning: PyTorch Geometric (torch_geometric) not found. STM-GNN functionality will be severely limited.")
 
 
 class STMAttention(nn.Module):
@@ -112,24 +112,42 @@ class STMGNNLayer(MessagePassing if PYG_AVAILABLE else nn.Module):
         dropout (float): Dropout rate.
     """
     def __init__(self, in_channels, out_channels, time_channels=None, memory_channels=None,
-                 num_heads=8, dropout=0.1, **kwargs):
+                 num_heads=8, dropout=0.1, concat=True, **kwargs):
         if PYG_AVAILABLE:
-            super(STMGNNLayer, self).__init__(aggr='add', **kwargs) # 'add' aggregation for GAT-like behavior
+            super(STMGNNLayer, self).__init__(aggr='add', node_dim=0, **kwargs) # node_dim=0 for PyG compatibility
         else:
-            super(STMGNNLayer, self).__init__()
+            # Pass node_dim if using the placeholder, matching PyG's expectation somewhat
+            super(STMGNNLayer, self).__init__(aggr='add', node_dim=0) # Using placeholder MessagePassingBase
             print("Warning: STMGNNLayer created with placeholder MessagePassing base.")
 
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.num_heads = num_heads
         self.dropout_val = dropout
+        self.concat = concat
+        self.head_dim = out_channels // num_heads if concat else out_channels
 
-        # Spatial Aggregation (e.g., GAT-like multi-head attention)
-        # GATConv typically handles this. Here we sketch a custom spatial attention.
-        # For simplicity, let's assume a linear transformation before spatial attention,
-        # and the attention mechanism itself will project to heads.
-        self.spatial_lin = nn.Linear(in_channels, in_channels) # Or out_channels if direct
-        self.spatial_attention = STMAttention(in_channels, num_heads, dropout)
+        # Linear transformation for node features (applied before attention)
+        # This will project features into the space for multi-head attention
+        self.lin_src = nn.Linear(in_channels, self.num_heads * self.head_dim)
+        # For GAT, target nodes also get transformed for attention score calculation.
+        # We can use a single linear layer if source and target transformations are shared,
+        # or separate ones. GATv1 typically uses one W for all nodes.
+        # self.lin_dst = nn.Linear(in_channels, self.num_heads * self.head_dim) # If different for target
+
+        # Attention mechanism parameters per head
+        # self.att_src = nn.Parameter(torch.Tensor(1, num_heads, self.head_dim))
+        # self.att_dst = nn.Parameter(torch.Tensor(1, num_heads, self.head_dim))
+        # Simpler GAT: a single attention vector 'a' per head, [Wh_i || Wh_j]
+        self.att = nn.Parameter(torch.Tensor(1, num_heads, 2 * self.head_dim))
+
+
+        # Bias term, applied after aggregation if concat is True
+        if concat:
+            self.bias = nn.Parameter(torch.Tensor(num_heads * self.head_dim))
+        else:
+            self.bias = nn.Parameter(torch.Tensor(self.head_dim))
+
 
         # Temporal Component (placeholder - how this is integrated depends on overall model architecture)
         # This might involve LSTMs, GRUs over node features across time, or temporal attention.
@@ -151,108 +169,130 @@ class STMGNNLayer(MessagePassing if PYG_AVAILABLE else nn.Module):
             pass
 
         # Output transformation and LayerNorm
-        # The output of spatial attention will be `in_channels`. We need to map to `out_channels`.
-        self.output_transform = nn.Linear(in_channels, out_channels) # If spatial att output is in_channels
-        self.layernorm = nn.LayerNorm(out_channels)
-        self.dropout = nn.Dropout(dropout)
+        self.layernorm = nn.LayerNorm(self.head_dim if not concat else self.num_heads * self.head_dim)
+        self.dropout_layer = nn.Dropout(dropout) # Use self.dropout_layer to avoid name clash
 
+        # Initialize parameters
+        self._reset_parameters()
 
-    def forward(self, x, edge_index, time_embedding=None, global_memory=None):
+    def _reset_parameters(self):
+        nn.init.xavier_uniform_(self.lin_src.weight)
+        if self.lin_src.bias is not None:
+            nn.init.zeros_(self.lin_src.bias)
+        nn.init.xavier_uniform_(self.att)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+    def forward(self, x, edge_index, time_embedding=None, global_memory=None, size=None):
         """
         Args:
             x (Tensor): Node features, shape (num_nodes, in_channels).
+                        Can be a tuple (x_src, x_dst) for bipartite graphs.
             edge_index (LongTensor): Graph connectivity, shape (2, num_edges).
             time_embedding (Tensor, optional): Temporal embedding for current snapshot.
-                                              Shape (num_nodes, time_channels) or (1, time_channels).
-            global_memory (Tensor, optional): Global memory state. Shape (num_memory_slots, memory_channels).
+            global_memory (Tensor, optional): Global memory state.
+            size (tuple, optional): Shape of the adjacency matrix (N, M).
 
         Returns:
             Tensor: Output node features, shape (num_nodes, out_channels).
         """
-        num_nodes = x.size(0)
+        H, C = self.num_heads, self.head_dim # C is head_dim
 
-        # --- 1. Augment input with time (if applicable) ---
-        h = x
-        if time_embedding is not None and self.time_channels:
-            if time_embedding.size(0) == 1: # Broadcast if single time embedding for all nodes
-                time_embedding = time_embedding.repeat(num_nodes, 1)
-            # This is a simple concatenation; more complex fusion could be used.
-            # h = torch.cat([x, time_embedding], dim=-1) # Requires in_channels to handle this
-            # For now, let's assume time_embedding is handled by a higher-level module
-            # or influences the GNN in other ways (e.g., modulating weights).
-            pass
+        # 1. Linearly transform node features
+        # If x is a tuple for bipartite graphs, transform source and target features.
+        # For now, assume x_src = x_dst = x (standard GAT on homogeneous graph)
+        if isinstance(x, torch.Tensor):
+            x_src = x_dst = self.lin_src(x).view(-1, H, C)
+        else: # Bipartite graph: x = (x_src, x_dst)
+            x_src, x_dst = x
+            x_src = self.lin_src(x_src).view(-1, H, C)
+            if x_dst is not None: # x_dst might be None in some MessagePassing contexts
+                x_dst = self.lin_src(x_dst).view(-1, H, C) # Assuming same transformation for now
 
-        # --- 2. Spatial Aggregation (Conceptual GAT-like) ---
-        # This is a simplified spatial attention. A full GATConv MessagePassing is more complex.
-        # For this sketch, we'll use STMAttention over neighborhood.
-        # This part needs a proper MessagePassing implementation for GNNs.
-        # The STMAttention is more like self-attention or cross-attention.
-        # To use it for spatial graph attention, query=h_i, key/value=h_j (neighbors)
+        x = (x_src, x_dst) # Pass as tuple to propagate
 
-        # Placeholder for actual PyG MessagePassing:
-        if PYG_AVAILABLE:
-            # This is where propagate, message, aggregate, update would be used.
-            # For a GAT-like mechanism:
-            #   message: transform neighbor features, calculate attention scores
-            #   aggregate: weighted sum using attention scores
-            #   update: apply activation, linear layer, etc.
-            # Since STMAttention isn't a MessagePassing class, we can't directly use it in propagate.
-            # A simple GATConv would be:
-            # gat_conv = GATConv(self.in_channels, self.out_channels, heads=self.num_heads, dropout=self.dropout_val)
-            # h_spatial = gat_conv(h, edge_index)
-            # For this conceptual layer, let's assume a simplified "self-attention" over nodes,
-            # modulated by graph structure implicitly or explicitly if mask is built.
-            # This is NOT a standard GNN spatial aggregation.
+        # --- Temporal and Memory Augmentation (Conceptual: Pre-Propagation) ---
+        # These could modify x_src/x_dst before message passing.
+        # For simplicity, we'll assume they are handled outside or integrated later.
+        # Example: x_src = self.apply_temporal_ vaikutus(x_src, time_embedding)
+        # Example: mem_info = self.read_from_memory(x_dst, global_memory)
+        #          x_dst = torch.cat([x_dst, mem_info], dim=-1) -> requires dim adjustments
 
-            # To make it more GNN-like conceptually for this sketch:
-            # We might imagine a GATConv-like behavior.
-            # The STMAttention is more general. If we apply it as self-attention on all nodes:
-            # h_spatial, _ = self.spatial_attention(query=h, key=h, value=h) # This is not graph convolution
+        # 2. Propagate messages (computes spatial GAT aggregation)
+        # The `propagate` method will call `message` and `aggregate`.
+        # We pass alpha as an additional argument to message and aggregate.
+        # This requires custom handling of attention scores.
+        # Standard GAT: alpha is computed in message(), then used to weight x_j.
+        # Let's prepare components for attention score calculation for `message` method.
+        # x_dst (target node features, for alpha_i)
+        # x_src (source node features, for alpha_j)
+        # These will be passed to `message` as x_i and x_j respectively by `propagate`.
 
-            # Let's assume h_spatial is the result of some GNN operation (e.g., custom GAT)
-            # For now, as a placeholder, just a linear transform.
-            # A real STMGNNLayer would use MessagePassing correctly.
-            h_transformed = self.spatial_lin(h) # (N, in_channels)
-            # This is a simplification for the sketch; a proper GNN layer is needed here.
-            # Let's simulate an aggregation step by just using transformed features
-            # (as if it was a GCN layer with identity for A_hat for simplicity of flow)
-            h_spatial = h_transformed # Replace with actual spatial GNN aggregation
+        out = self.propagate(edge_index, x=x, size=size) # x_i, x_j will be derived from x
 
-        else: # No PyG
-            h_spatial = self.spatial_lin(h) # Placeholder if no PyG
+        # --- Temporal and Memory Interaction (Conceptual: Post-Aggregation) ---
+        # These could modify the aggregated output `out`.
+        # Example: out = self.apply_memory_write(out, global_memory)
+        # Example: out = self.temporal_update_rnn(out, prev_hidden_state)
 
-        # --- 3. Temporal Update (Conceptual) ---
-        # If this layer has recurrent state (e.g., GRU cell per node)
-        # h_temporal = self.temporal_gru_cell(h_spatial, prev_node_hidden_states)
-        # For now, assume temporal aspects are handled by stacking these layers across time
-        # or by the way `time_embedding` is used.
-        h_temporal = h_spatial # Pass through if no explicit intra-layer temporal update
+        # 3. Apply bias, activation, dropout, and residual (if any)
+        if self.concat:
+            out = out.view(-1, self.num_heads * self.head_dim)
+        else:
+            out = out.mean(dim=1) # Average over heads if not concatenating
 
-        # --- 4. Memory Interaction (Conceptual) ---
-        h_mem_interaction = h_temporal
-        if global_memory is not None and self.memory_channels:
-            # Example: Nodes attend to memory slots to read relevant info
-            # query_nodes = h_temporal (num_nodes, layer_out_dim)
-            # key_memory = global_memory (num_slots, memory_dim)
-            # value_memory = global_memory
-            # Assume memory_read_attention takes these shapes.
-            # This requires memory_channels == layer_out_dim for simple attention.
-            # Or a projection layer for query_nodes.
-            # read_info, _ = self.memory_read_attention(query_nodes, global_memory, global_memory)
-            # h_mem_interaction = torch.cat([h_temporal, read_info], dim=-1) # Concatenate node state with read memory
-            # Then, potentially update (write to) global_memory based on h_mem_interaction
-            pass # Placeholder for memory read/write logic
+        if self.bias is not None:
+            out = out + self.bias
 
-        # --- 5. Output Processing ---
-        # Map to out_channels (if not already done by spatial/memory interaction)
-        output = self.output_transform(h_mem_interaction) # Assuming h_mem_interaction is `in_channels`
-        output = self.dropout(output)
-        output = self.layernorm(output + x) # Residual connection with input 'x' (or h if pre-processed)
-                                           # Ensure dimensions match for residual. If out_channels!=in_channels, need projection for x.
-                                           # For simplicity, assuming out_channels == in_channels for residual here.
-                                           # Or, no residual if dims change: output = self.layernorm(output)
+        # Apply LayerNorm and Dropout. Residual connection is tricky if dims change.
+        # Original paper GAT doesn't use LayerNorm here, but ELU.
+        # STMGNNLayer sketch had LayerNorm(output + x)
+        # For now: ELU -> Dropout -> LayerNorm (optional, as per STMGNNLayer)
+        out = F.elu(out) # Common activation for GAT
+        out = self.dropout_layer(out) # Apply dropout
 
-        return output
+        # Original residual: output = self.layernorm(output + x_initial_input)
+        # This requires x_initial_input to have same dimension as `out`.
+        # If in_channels != out_channels (after concat), a skip connection needs projection.
+        # For now, let's apply LayerNorm to the output directly.
+        out = self.layernorm(out) # Apply LayerNorm as in original STMGNNLayer sketch
+
+        # TODO: Clarify residual connection if in_channels != out_channels
+        # TODO: Clarify time_embedding and global_memory integration points
+
+        return out
+
+    def message(self, x_j: torch.Tensor, x_i: torch.Tensor, # x_j is source, x_i is target
+                index: torch.Tensor, ptr: torch.Tensor, size_i: int) -> torch.Tensor:
+        # x_j: [E, num_heads, head_dim], features of source nodes for edges
+        # x_i: [E, num_heads, head_dim], features of target nodes for edges (repeated)
+
+        # Construct attention input: [x_i || x_j]
+        # x_i and x_j are already transformed to [num_edges, num_heads, head_dim] by propagate
+        attention_input = torch.cat([x_i, x_j], dim=-1) # [E, H, 2*C]
+
+        # Calculate attention scores e_ij
+        # self.att is [1, H, 2*C]
+        # alpha is [E, H, 1]
+        alpha = (attention_input * self.att).sum(dim=-1, keepdim=True) # Element-wise product then sum
+        alpha = F.leaky_relu(alpha, negative_slope=0.2)
+
+        # Softmax attention scores per target node (over its neighborhood)
+        # `index` here is the target node index for each edge
+        # `size_i` is the number of target nodes (N)
+        alpha = softmax(alpha, index, num_nodes=size_i) # PyG's softmax for MessagePassing
+
+        # Apply dropout to attention scores
+        alpha = F.dropout(alpha, p=self.dropout_val, training=self.training)
+
+        # Weighted sum of source node features (x_j)
+        # Message is alpha_ij * W*h_j
+        return x_j * alpha # [E, H, C]
+
+    # update method is implicitly handled by MessagePassing if not defined (identity)
+    # or can be defined for custom post-aggregation logic before returning from propagate
+    # For GAT, the main logic is in message and aggregation.
+    # The result of aggregation (sum of messages) is what self.propagate returns.
 
 
 class STMGNN(nn.Module):
@@ -298,7 +338,8 @@ class STMGNN(nn.Module):
                 time_channels=time_embedding_dim, # Pass for potential use
                 memory_channels=global_memory_dim if self.global_memory is not None else None,
                 num_heads=num_heads,
-                dropout=dropout
+                dropout=dropout,
+                concat=True # Explicitly set, though it's the default
             ))
 
         # Output layer (e.g., for graph classification or node classification)
@@ -452,4 +493,3 @@ if __name__ == '__main__':
               "or other incompatibilities in the conceptual sketch.")
 
     print("\n--- STM-GNN Example Finished ---")
-```

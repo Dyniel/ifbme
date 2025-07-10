@@ -100,7 +100,8 @@ class ModelWithSTMGNNLayer(nn.Module):
                 time_channels=time_embedding_dim_stm,
                 memory_channels=global_memory_dim_stm,
                 num_heads=heads_stm, # Spec: heads=8
-                dropout=dropout_stm  # Spec: dropout=0.1
+                dropout=dropout_stm, # Spec: dropout=0.1
+                concat=True # Explicitly set, though it's the default
             ))
             # current_dim remains hidden_dim_stm for subsequent STMGNN layers
 
@@ -223,5 +224,3 @@ if __name__ == '__main__':
              print("This might be due to STMGNNLayer's placeholder nature without PyTorch Geometric.")
 
     print("\nComparison complete. Note that STMGNNLayer is a conceptual sketch.")
-
-```
