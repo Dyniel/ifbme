@@ -279,5 +279,3 @@ if __name__ == '__main__':
     #     print(f"\nError during conceptual backward/optimizer step (possibly due to placeholder GNN): {e}")
 
     print("\n--- GraphMAE Example Finished ---")
-
-```
