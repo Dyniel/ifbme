@@ -1,641 +1,324 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score, mean_squared_error, confusion_matrix
+import torch.optim as optim
 import numpy as np
-import pandas as pd
-import os
-import time
-import wandb  # Dodano wandb
-import yaml  # Do wczytywania konfiguracji sweepa
-import argparse  # Do obsługi argumentów linii poleceń dla sweepów
-import io
-from PIL import Image
-import matplotlib.pyplot as plt
-from sklearn.metrics import roc_curve as sk_roc_curve, auc as sk_auc, confusion_matrix as sk_confusion_matrix
 
-from data_utils import load_and_preprocess_data
-from models import MortalityPredictor, LoSPredictor
+# Attempt to import project-specific modules
+try:
+    from models.main_model import ModelWithSTMGNNLayer
+    from models.stm_gnn import STMGNN
+    from models.data_utils import (
+        CustomGraphStaticDataset, create_static_graph_dataloaders,
+        CustomGraphDynamicDataset, create_dynamic_graph_dataloaders,
+        PYG_AVAILABLE_DATAUTILS, Dataset as DatasetPlaceholder, DataLoader as DataLoaderPlaceholder # import placeholders too
+    )
+    PROJECT_MODULES_AVAILABLE = True
+except ImportError as e:
+    print(f"Error importing project modules: {e}")
+    print("Please ensure the script is run from the root of the repository and all model files exist.")
+    PROJECT_MODULES_AVAILABLE = False
+    # Define dummy classes if modules are not found, to allow script to be parsable
+    class ModelWithSTMGNNLayer(torch.nn.Module):
+        def __init__(self, num_features, hidden_dim_stm, num_classes, **kwargs): super().__init__(); self.fc = torch.nn.Linear(hidden_dim_stm,num_classes); self.input_embed = torch.nn.Linear(num_features, hidden_dim_stm)
+        def forward(self, x, edge_index, **kwargs): x_emb = self.input_embed(x); return self.fc(x_emb.mean(dim=0, keepdim=True) if x_emb.dim() > 1 else x_emb) # Adjusted dummy output
 
-# --- Focal Loss Implementation ---
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean', pos_weight=None):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-        self.pos_weight = pos_weight # For compatibility with BCEWithLogitsLoss usage pattern
+    class STMGNN(torch.nn.Module):
+        def __init__(self, num_node_features, layer_hidden_dim, num_classes, **kwargs): super().__init__(); self.fc = torch.nn.Linear(layer_hidden_dim,num_classes); self.input_embed = torch.nn.Linear(num_node_features,layer_hidden_dim)
+        def forward(self, graph_snapshots, **kwargs):
+            # graph_snapshots is list of (x, edge_index, time_idx)
+            # Use first snapshot's x for dummy processing
+            if not graph_snapshots: return torch.randn(1, self.fc.out_features)
+            x_first_snap = graph_snapshots[0][0]
+            x_emb = self.input_embed(x_first_snap)
+            return self.fc(x_emb.mean(dim=0, keepdim=True) if x_emb.dim() > 1 else x_emb) # Adjusted dummy output
 
-    def forward(self, inputs, targets):
-        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none', pos_weight=self.pos_weight)
-        pt = torch.exp(-BCE_loss)  # Prevents nans when BCE_loss is large
-        F_loss = self.alpha * (1 - pt)**self.gamma * BCE_loss
 
-        if self.reduction == 'mean':
-            return torch.mean(F_loss)
-        elif self.reduction == 'sum':
-            return torch.sum(F_loss)
-        else:
-            return F_loss
+    class DatasetPlaceholder: # Simplified for this context
+        def __init__(self, is_dynamic=False, num_samples=10, avg_nodes=10, num_features=10, num_classes=2, avg_snapshots=3, **kwargs):
+            self.is_dynamic = is_dynamic
+            self.num_samples=num_samples
+            self.avg_nodes = avg_nodes
+            self.num_features = num_features
+            self.num_classes = num_classes
+            self.avg_snapshots = avg_snapshots
+        def __len__(self): return self.num_samples
+        def __getitem__(self,idx):
+            if self.is_dynamic:
+                num_snaps = np.random.randint(1, self.avg_snapshots + 2)
+                snaps = []
+                for t_idx in range(num_snaps):
+                    num_n = np.random.randint(1, self.avg_nodes + 5)
+                    snaps.append({'x':torch.randn(num_n, self.num_features),'edge_index':torch.zeros(2,max(0,num_n-1)).long(),'t':torch.tensor(t_idx)})
+                return (snaps, torch.randint(0,self.num_classes,(1,)).item())
+            else: # Static
+                num_n = np.random.randint(1, self.avg_nodes + 5)
+                # Mimic PyG Data object structure for placeholder
+                return {'x':torch.randn(num_n, self.num_features),'edge_index':torch.zeros(2,max(0,num_n-1)).long(),'y':torch.randint(0,self.num_classes,(1,)).squeeze().item(), 'num_nodes':num_n}
 
-# --- Configuration ---
+
+    class DataLoaderPlaceholder: # Simplified
+        def __init__(self, dataset, batch_size, shuffle=True, **kwargs):
+            self.dataset = dataset
+            self.batch_size = batch_size
+            self.shuffle = shuffle
+            self.indices = list(range(len(dataset)))
+        def __iter__(self):
+            self.current_pos = 0
+            if self.shuffle: np.random.shuffle(self.indices)
+            return self
+        def __len__(self):
+            return (len(self.dataset) + self.batch_size -1) // self.batch_size
+        def __next__(self):
+            if self.current_pos >= len(self.indices): raise StopIteration
+
+            batch_indices = self.indices[self.current_pos : self.current_pos + self.batch_size]
+            self.current_pos += self.batch_size
+            items = [self.dataset[i] for i in batch_indices]
+
+            if not items: raise StopIteration
+
+            if not self.dataset.is_dynamic:
+                class BatchMimic: # Mimics PyG Batch for static graphs
+                    def __init__(self, items_list, device):
+                        self.x = torch.cat([i['x'] for i in items_list], dim=0).to(device)
+                        # Simplistic edge_index: take first, or make empty if problem
+                        self.edge_index = items_list[0]['edge_index'].to(device) if items_list[0]['edge_index'].numel() > 0 else torch.empty(2,0,dtype=torch.long).to(device)
+                        self.y = torch.tensor([i['y'] for i in items_list]).to(device)
+                        self.num_graphs = len(items_list)
+                        node_counts = [i['x'].shape[0] for i in items_list]
+                        self.batch = torch.cat([torch.full((nc,), j, dtype=torch.long) for j, nc in enumerate(node_counts)]).to(device)
+                    def to(self, device_ignored): # Already on device
+                        return self
+                return BatchMimic(items, DEVICE) # Pass DEVICE to BatchMimic
+            return items # List of (snapshots, label) for dynamic
+
+    PYG_AVAILABLE_DATAUTILS = False
+
+# Configuration
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {DEVICE}")
+MODEL_TYPE = "model_with_stmgnnlayer" # "stm_gnn" or "model_with_stmgnnlayer"
+# MODEL_TYPE = "stm_gnn" # Uncomment to test STMGNN
+LEARNING_RATE = 0.001
+BATCH_SIZE = 8
+EPOCHS = 3
 
-# Data paths
-TRAIN_CSV = 'data/trainData.csv'
-VAL_CSV = 'data/valData.csv'
+# Static graph dataset parameters
+NUM_SAMPLES_STATIC = 50
+AVG_NODES_STATIC = 10
+FEATURES_STATIC = 16
+CLASSES_STATIC = 3
 
-# Model Hyperparameters (can be tuned)
-DIM_HIDDEN = 128  # Hidden dimension for GraphGPS
-NUM_GPS_LAYERS = 3
-NUM_ATTN_HEADS = 4
-LAP_PE_K_DIM = 8  # Dimension for Laplacian PE (k eigenvectors)
-SIGN_PE_K_DIM = 0  # Dimension for SignNet features (set to 0 if not using/available)
-DROPOUT_RATE = 0.2
-
-# Training Hyperparameters
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 1e-5
-EPOCHS = 100  # Max epochs, early stopping will likely intervene
-PATIENCE_EARLY_STOPPING = 15
-COSINE_T_0 = 10
-COSINE_T_MULT = 2
-WARMUP_EPOCHS = 5
-
-# File names for saved models - These will be dynamically set in main()
-MORTALITY_MODEL_FILENAME = 'model_dt.pt'
-LOS_MODEL_FILENAME = 'model_los.pt'
-SAVED_MODELS_DIR_BASE = 'saved_models' # Base directory for all saved models
-
-# Wandb configuration
-WANDB_PROJECT = "ifbme-projekt"
-WANDB_ENTITY = None  # Uzupełnij, jeśli używasz teamu w wandb
-USE_WANDB = True # Default to using wandb, can be overridden by CLI
+# Dynamic graph dataset parameters
+NUM_SEQUENCES_DYNAMIC = 20
+AVG_SNAPSHOTS_DYNAMIC = 3
+AVG_NODES_DYNAMIC = 8
+FEATURES_DYNAMIC = 16
+CLASSES_DYNAMIC = 2
 
 
-# --- Helper Functions ---
-def get_input_dim_from_data(sample_csv_path, lap_pe_k_dim, sign_pe_k_dim):
-    """
-    Infers the input dimension by preprocessing a small sample of data.
-    """
-    print("Inferring input dimension from sample data...")
-    # Pass a default empty list for exclude_features for this inference step,
-    # as we want to know the dimension with all potential features.
-    # Actual exclusion will happen during main data loading.
-    graph_data_sample, _, preprocessor_sample = load_and_preprocess_data(
-        sample_csv_path,
-        fit_preprocessor=True,
-        target_cols=None,
-        k_neighbors=3,
-        exclude_features=[] # Ensure all features are considered for dim inference
-    )
-    if graph_data_sample is None or preprocessor_sample is None:
-        raise RuntimeError("Failed to process sample data for dimension inference.")
+def train_epoch_static(model, loader, optimizer, criterion):
+    model.train()
+    total_loss = 0; correct_predictions = 0; total_samples = 0
+    for batch in loader:
+        # batch is already on DEVICE if using BatchMimic, or PyG Batch
+        # For PyG Batch, batch.to(DEVICE) is needed if not done by loader.
+        # Our BatchMimic puts data on DEVICE in its __init__.
+        # PyG's default loader does not move to device.
+        if PYG_AVAILABLE_DATAUTILS: batch = batch.to(DEVICE)
 
-    num_numerical_features = 0
-    if 'num' in preprocessor_sample.named_transformers_ and preprocessor_sample.named_transformers_['num'] != 'drop':
-        num_numerical_features = len(preprocessor_sample.transformers_[0][2])
-
-    num_onehot_features = 0
-    if 'cat' in preprocessor_sample.named_transformers_ and preprocessor_sample.named_transformers_['cat'] != 'drop':
-        cat_transformer = preprocessor_sample.named_transformers_['cat']
-        onehot_encoder = cat_transformer.named_steps['onehot']
-        if hasattr(onehot_encoder, 'get_feature_names_out'):
-            try:
-                num_onehot_features = len(onehot_encoder.get_feature_names_out(preprocessor_sample.transformers_[1][2]))
-            except Exception:  # Fallback if categorical features were not present in sample
-                num_onehot_features = 0
-        elif hasattr(onehot_encoder, 'categories_'):
-            for cats in onehot_encoder.categories_:
-                num_onehot_features += len(cats)
-
-    dim_processed_features = num_numerical_features + num_onehot_features
-    print(f"Dimension from preprocessor (numerical + one-hot categorical): {dim_processed_features}")
-    return dim_processed_features
-
-
-def train_model(model, train_data, val_data, criterion, optimizer, scheduler,
-                task_name, epochs, patience, model_path,
-                # Added config parameters needed within the training loop
-                label_smoothing_factor, clip_grad_norm_value, warmup_epochs_value):
-    best_val_metric = -np.inf if task_name == "Mortality" else np.inf
-    epochs_no_improve = 0
-
-    print(f"\n--- Starting Training: {task_name} ---")
-    print(f"Model: {model.__class__.__name__}")
-    print(f"Optimizer: {optimizer}")
-    print(f"Scheduler: {scheduler.__class__.__name__ if scheduler else 'None'}")
-    print(f"Criterion: {criterion}")
-
-    for epoch in range(1, epochs + 1):
-        start_time = time.time()
-        model.train()
         optimizer.zero_grad()
+        out = model(batch.x, batch.edge_index)
+        loss = criterion(out, batch.y)
+        loss.backward(); optimizer.step()
+        total_loss += loss.item() * batch.num_graphs
+        pred = out.argmax(dim=1)
+        correct_predictions += pred.eq(batch.y).sum().item()
+        total_samples += batch.num_graphs
+    return (total_loss / total_samples if total_samples > 0 else 0), \
+           (correct_predictions / total_samples if total_samples > 0 else 0)
 
-        out = model(train_data.to(DEVICE))
-
-        if task_name == "Mortality":
-            target = train_data.y_mortality.to(DEVICE)
-            if label_smoothing_factor > 0.0 and isinstance(criterion, nn.BCEWithLogitsLoss):
-                target = target.float() # ensure float
-                target = (1.0 - target) * (label_smoothing_factor / 2.0) + target * (1.0 - label_smoothing_factor / 2.0)
-
-            loss = criterion(out, target)
-        elif task_name == "LoS":
-            target = torch.log1p(train_data.y_los.to(DEVICE))
-            loss = criterion(out, target)
-        else:
-            raise ValueError("Unknown task name")
-
-        loss.backward()
-        if clip_grad_norm_value > 0: # Apply gradient clipping if configured
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm_value)
-
-        optimizer.step()
-
-        if scheduler and epoch > warmup_epochs_value: # Use passed warmup_epochs_value
-            if isinstance(scheduler, CosineAnnealingWarmRestarts):
-                scheduler.step(epoch - warmup_epochs_value) # Use passed warmup_epochs_value
-            else:
-                # For other schedulers like ReduceLROnPlateau, they might not need warmup_epochs_value explicitly here
-                # or their step() is called with metric/loss later.
-                # This part of logic remains as is for CosineAnnealingWarmRestarts.
-                pass
-
-        model.eval()
-        with torch.no_grad():
-            val_out = model(val_data.to(DEVICE))
-
-            # Initialize a dictionary to hold all data for this epoch's wandb.log call
-            log_data_for_epoch = {}
-
-            if task_name == "Mortality":
-                val_target = val_data.y_mortality.to(DEVICE)
-                val_loss = criterion(val_out, val_target)
-                val_probs_np = torch.sigmoid(val_out).cpu().numpy().flatten()  # Spłaszczenie
-                val_target_cpu_np = val_target.cpu().numpy().flatten()  # Spłaszczenie
-                val_metric = roc_auc_score(val_target_cpu_np, val_probs_np)
-                metric_name = "AUROC"
-
-                if USE_WANDB and wandb.run is not None:
-                    try:
-                        # --- Ręczne generowanie krzywej ROC ---
-                        fpr, tpr, _ = sk_roc_curve(val_target_cpu_np, val_probs_np)
-                        roc_auc_value = sk_auc(fpr, tpr)
-                        plt.figure()
-                        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc_value:.2f})')
-                        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-                        plt.xlim([0.0, 1.0])
-                        plt.ylim([0.0, 1.05])
-                        plt.xlabel('False Positive Rate')
-                        plt.ylabel('True Positive Rate')
-                        plt.title(f'Receiver Operating Characteristic - {task_name}')
-                        plt.legend(loc="lower right")
-                        buf_roc = io.BytesIO()
-                        plt.savefig(buf_roc, format='png')
-                        buf_roc.seek(0)
-                        roc_image = Image.open(buf_roc)
-                        log_data_for_epoch[f"{task_name}/roc_curve_image"] = wandb.Image(roc_image)
-                        plt.close()
-                        buf_roc.close()
-
-                        # --- Ręczne generowanie macierzy konfuzji ---
-                        val_preds_classes_np = (val_probs_np > 0.5).astype(int)
-                        cm = sk_confusion_matrix(val_target_cpu_np, val_preds_classes_np)
-                        fig_cm, ax_cm = plt.subplots()
-                        cax = ax_cm.matshow(cm, cmap=plt.cm.Blues)
-                        fig_cm.colorbar(cax)
-                        class_names = ['Survival', 'Death']
-                        ax_cm.set_xticks(np.arange(len(class_names)))
-                        ax_cm.set_yticks(np.arange(len(class_names)))
-                        ax_cm.set_xticklabels(class_names)
-                        ax_cm.set_yticklabels(class_names)
-                        plt.xlabel('Predicted')
-                        plt.ylabel('True')
-                        plt.title(f'Confusion Matrix - {task_name}')
-                        for i in range(cm.shape[0]):
-                            for j in range(cm.shape[1]):
-                                ax_cm.text(j, i, str(cm[i, j]), va='center', ha='center',
-                                           color='black' if cm[i, j] < cm.max() / 2 else 'white')
-                        buf_cm = io.BytesIO()
-                        plt.savefig(buf_cm, format='png')
-                        buf_cm.seek(0)
-                        cm_image = Image.open(buf_cm)
-                        log_data_for_epoch[f"{task_name}/confusion_matrix_image"] = wandb.Image(cm_image)
-                        plt.close(fig_cm)
-                        buf_cm.close()
-                    except Exception as e:
-                        print(f"Error preparing wandb plots for Mortality: {e}")
-
-            elif task_name == "LoS":
-                val_target_log = torch.log1p(val_data.y_los.to(DEVICE))
-                val_loss = criterion(val_out, val_target_log)
-                val_preds_original_scale_np = torch.expm1(val_out).cpu().numpy().clip(min=0).flatten()
-                val_target_original_scale_np = val_data.y_los.cpu().numpy().flatten()
-                val_metric = np.sqrt(mean_squared_error(val_target_original_scale_np, val_preds_original_scale_np))
-                metric_name = "RMSE"
-
-                if USE_WANDB and wandb.run is not None:
-                    try:
-                        data_scatter_list = [[float(true_val), float(pred_val)] for true_val, pred_val in
-                                             zip(val_target_original_scale_np, val_preds_original_scale_np)]
-                        table_scatter = wandb.Table(data=data_scatter_list, columns=["Actual LoS", "Predicted LoS"])
-                        log_data_for_epoch[f"{task_name}/predictions_scatter"] = wandb.plot.scatter(
-                            table_scatter, "Actual LoS", "Predicted LoS", title="Actual vs. Predicted LoS"
-                        )
-                    except Exception as e:
-                        print(f"Error preparing wandb plots for LoS: {e}")
-
-        epoch_duration = time.time() - start_time
-        print(
-            f"Epoch {epoch}/{epochs} | Train Loss: {loss.item():.4f} | Val Loss: {val_loss.item():.4f} | Val {metric_name}: {val_metric:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f} | Time: {epoch_duration:.2f}s")
-
-        if USE_WANDB and wandb.run is not None:
-            # Add scalar metrics to the dictionary
-            log_data_for_epoch.update({
-                f"{task_name}/train_loss": loss.item(),
-                f"{task_name}/val_loss": val_loss.item(),
-                f"{task_name}/val_{metric_name.lower()}": val_metric,
-                f"{task_name}/learning_rate": optimizer.param_groups[0]['lr'],
-                f"{task_name}/epoch_duration_sec": epoch_duration,
-            })
-            # Single log call for the epoch
-            if log_data_for_epoch:  # Ensure there's something to log
-                wandb.log(log_data_for_epoch, step=epoch)
-
-        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step(val_metric if task_name == "Mortality" else val_loss)
-
-        if task_name == "Mortality":
-            if val_metric > best_val_metric:
-                best_val_metric = val_metric
-                torch.save(model.state_dict(), model_path)
-                print(f"Improved {metric_name}. Model saved to {model_path}")
-                epochs_no_improve = 0
-            else:
-                epochs_no_improve += 1
-        else:
-            if val_metric < best_val_metric:
-                best_val_metric = val_metric
-                torch.save(model.state_dict(), model_path)
-                print(f"Improved {metric_name}. Model saved to {model_path}")
-                epochs_no_improve = 0
-            else:
-                epochs_no_improve += 1
-
-        if epochs_no_improve >= patience:
-            print(f"Early stopping triggered after {patience} epochs with no improvement.")
-            break
-
-    print(f"Finished training for {task_name}. Best Val {metric_name}: {best_val_metric:.4f}")
-    model.load_state_dict(torch.load(model_path))
-
-    if USE_WANDB and wandb.run is not None:
-        wandb.save(model_path)
-        wandb.summary[f"best_val_{metric_name.lower()}_{task_name.lower()}"] = best_val_metric
-    return model, best_val_metric  # Zwracamy również najlepszą metrykę
+def evaluate_epoch_static(model, loader, criterion):
+    model.eval()
+    total_loss = 0; correct_predictions = 0; total_samples = 0
+    with torch.no_grad():
+        for batch in loader:
+            if PYG_AVAILABLE_DATAUTILS: batch = batch.to(DEVICE)
+            out = model(batch.x, batch.edge_index)
+            loss = criterion(out, batch.y)
+            total_loss += loss.item() * batch.num_graphs
+            pred = out.argmax(dim=1)
+            correct_predictions += pred.eq(batch.y).sum().item()
+            total_samples += batch.num_graphs
+    return (total_loss / total_samples if total_samples > 0 else 0), \
+           (correct_predictions / total_samples if total_samples > 0 else 0)
 
 
-# --- Main Training Execution ---
-def main(run_config_from_sweep=None):
-    """
-    Główna funkcja trenująca modele.
-    Args:
-        run_config_from_sweep (dict, optional): Słownik konfiguracji z wandb sweep.
-    """
-    if run_config_from_sweep is None:
-        # Use command-line args for manual tuning if provided, otherwise script defaults
-        # This block is for non-sweep runs
-        current_run_config = {
-            "learning_rate": args.lr if hasattr(args, 'lr') else LEARNING_RATE,
-            "dim_hidden": DIM_HIDDEN,
-            "num_gps_layers": NUM_GPS_LAYERS,
-            "num_attn_heads": NUM_ATTN_HEADS,
-            "dropout_rate": args.dropout if hasattr(args, 'dropout') else DROPOUT_RATE,
-            "lap_pe_k_dim": LAP_PE_K_DIM,
-            "sign_pe_k_dim": SIGN_PE_K_DIM,
-            "weight_decay": args.wd if hasattr(args, 'wd') else WEIGHT_DECAY,
-            "epochs": EPOCHS,
-            "patience_early_stopping": PATIENCE_EARLY_STOPPING,
-            "cosine_t_0": COSINE_T_0,
-            "cosine_t_mult": COSINE_T_MULT,
-            "warmup_epochs": WARMUP_EPOCHS,
-            "activation_fn": args.activation_fn if hasattr(args, 'activation_fn') else 'relu',
-            "clip_grad_norm": args.clip_grad_norm if hasattr(args, 'clip_grad_norm') else 0.0,
-            "label_smoothing": args.label_smoothing if hasattr(args, 'label_smoothing') else 0.0,
-            "task": args.task, # Add task to config
-            "exclude_features": args.exclude_features if hasattr(args, 'exclude_features') else [] # Add exclude_features
-        }
-        run_id = time.strftime('%Y%m%d-%H%M%S')
-        run_name_prefix = f"task_{args.task}"
-        run_name = f"{run_name_prefix}_{run_id}"
-        wandb_mode = "disabled" if not USE_WANDB else "online"
+def train_epoch_dynamic(model, loader, optimizer, criterion):
+    model.train()
+    total_loss = 0; correct_predictions = 0; total_sequences = 0
+    for batch_of_sequences in loader: # This is a list of (sequence_data, label)
+        if not batch_of_sequences: continue
 
-    else: # This is a sweep run
-        current_run_config = run_config_from_sweep
-        # Ensure task from args is part of the config if not already set by sweep
-        if 'task' not in current_run_config:
-             current_run_config['task'] = args.task # Sweeps might not override task, so use CLI
-        # Sweep agent names the run, but we can log the task
-        run_id = wandb.run.id if wandb.run else time.strftime('%Y%m%d-%H%M%S')
-        run_name_prefix = f"task_{current_run_config.get('task', args.task)}_sweep" # Use task from config or args
-        run_name = f"{run_name_prefix}_{run_id}" # wandb.run should exist for agent, it names the run. This is more for our logging.
-        wandb_mode = "online"  # Sweep agent always uses wandb online
+        optimizer.zero_grad()
+        batch_accumulated_loss = torch.tensor(0.0, device=DEVICE)
+        num_sequences_in_batch = 0
+
+        for sequence_data_item in batch_of_sequences:
+            snapshots_list_of_dicts = sequence_data_item[0] # list of dicts or Data
+            label_scalar = sequence_data_item[1]
+            label_tensor = torch.tensor([label_scalar], device=DEVICE)
+
+            processed_snapshots_for_model = []
+            for snap_dict_or_data in snapshots_list_of_dicts:
+                x = snap_dict_or_data['x'].to(DEVICE) if isinstance(snap_dict_or_data, dict) else snap_dict_or_data.x.to(DEVICE)
+                ei = snap_dict_or_data['edge_index'].to(DEVICE) if isinstance(snap_dict_or_data, dict) else snap_dict_or_data.edge_index.to(DEVICE)
+                tval = snap_dict_or_data['t'].item() if isinstance(snap_dict_or_data, dict) else snap_dict_or_data.t.item()
+                processed_snapshots_for_model.append((x, ei, tval))
+
+            if not processed_snapshots_for_model: continue
+
+            out = model(processed_snapshots_for_model) # Expected: [num_classes]
+            loss = criterion(out.unsqueeze(0), label_tensor) # out: [C], label: [1]
+            batch_accumulated_loss += loss # Accumulate loss for the batch
+
+            if out.argmax(dim=0) == label_tensor.item(): correct_predictions += 1
+            num_sequences_in_batch +=1
+
+        if num_sequences_in_batch > 0:
+            avg_batch_loss = batch_accumulated_loss / num_sequences_in_batch
+            avg_batch_loss.backward()
+            optimizer.step()
+            total_loss += avg_batch_loss.item() * num_sequences_in_batch # Store sum of losses
+            total_sequences += num_sequences_in_batch
+
+    return (total_loss / total_sequences if total_sequences > 0 else 0), \
+           (correct_predictions / total_sequences if total_sequences > 0 else 0)
 
 
-    effective_config = current_run_config
+def evaluate_epoch_dynamic(model, loader, criterion):
+    model.eval()
+    total_loss = 0; correct_predictions = 0; total_sequences = 0
+    with torch.no_grad():
+        for batch_of_sequences in loader:
+            if not batch_of_sequences: continue
+            for sequence_data_item in batch_of_sequences:
+                snapshots_list_of_dicts = sequence_data_item[0]
+                label_scalar = sequence_data_item[1]
+                label_tensor = torch.tensor([label_scalar], device=DEVICE)
 
-    if USE_WANDB:
-        if wandb.run is None: # Only init if not already initialized by agent
-            wandb.init(
-                project=WANDB_PROJECT,
-                entity=WANDB_ENTITY,
-                config=current_run_config,
-                name=run_name, # Use the generated run_name
-                mode=wandb_mode
-            )
-        # If wandb.init was called, wandb.config will be populated.
-        # For sweep runs, wandb.config is the source of truth.
-        # For single runs, wandb.config is a copy of current_run_config.
-        if wandb.run:
-            effective_config = wandb.config # Use wandb's config as the primary source
-            run_id = wandb.run.id # Update run_id with the actual wandb run ID
-            # Update run_name in wandb if it was a default name from wandb.init() and we have a more specific one
-            # This is generally not needed if `name` is passed to `wandb.init()`
-            # wandb.run.name = run_name # Optional: force update wandb run name if needed
-    else:
-        print("Weights & Biases is disabled. Using local configuration.")
-        # effective_config is already current_run_config
-        # run_id is already set from time.strftime
+                processed_snapshots_for_model = []
+                for snap_dict_or_data in snapshots_list_of_dicts:
+                    x = snap_dict_or_data['x'].to(DEVICE) if isinstance(snap_dict_or_data, dict) else snap_dict_or_data.x.to(DEVICE)
+                    ei = snap_dict_or_data['edge_index'].to(DEVICE) if isinstance(snap_dict_or_data, dict) else snap_dict_or_data.edge_index.to(DEVICE)
+                    tval = snap_dict_or_data['t'].item() if isinstance(snap_dict_or_data, dict) else snap_dict_or_data.t.item()
+                    processed_snapshots_for_model.append((x, ei, tval))
 
-    # Create unique directory for saving models for this run
-    current_run_models_dir = os.path.join(SAVED_MODELS_DIR_BASE, run_id)
-    os.makedirs(current_run_models_dir, exist_ok=True)
-    print(f"Models for this run will be saved in: {current_run_models_dir}")
-
-    # Define full paths for model files for this run
-    mortality_model_path_dynamic = os.path.join(current_run_models_dir, MORTALITY_MODEL_FILENAME)
-    los_model_path_dynamic = os.path.join(current_run_models_dir, LOS_MODEL_FILENAME)
+                if not processed_snapshots_for_model: continue
+                out = model(processed_snapshots_for_model)
+                loss = criterion(out.unsqueeze(0), label_tensor)
+                total_loss += loss.item()
+                if out.argmax(dim=0) == label_tensor.item(): correct_predictions += 1
+                total_sequences += 1
+    return (total_loss / total_sequences if total_sequences > 0 else 0), \
+           (correct_predictions / total_sequences if total_sequences > 0 else 0)
 
 
-    # Pobierz wartości z effective_config, using .get() for safety, especially for optional params
-    _LEARNING_RATE = effective_config.get("learning_rate", LEARNING_RATE)
-    _DIM_HIDDEN = effective_config.get("dim_hidden", DIM_HIDDEN)
-    _NUM_GPS_LAYERS = effective_config.get("num_gps_layers", NUM_GPS_LAYERS)
-    _NUM_ATTN_HEADS = effective_config.get("num_attn_heads", NUM_ATTN_HEADS)
-    _DROPOUT_RATE = effective_config.get("dropout_rate", DROPOUT_RATE)
-    _LAP_PE_K_DIM = effective_config.get("lap_pe_k_dim", LAP_PE_K_DIM)
-    _SIGN_PE_K_DIM = effective_config.get("sign_pe_k_dim", SIGN_PE_K_DIM)
-    _WEIGHT_DECAY = effective_config.get("weight_decay", WEIGHT_DECAY)
-    _EPOCHS = effective_config.get("epochs", EPOCHS)
-    _PATIENCE_EARLY_STOPPING = effective_config.get("patience_early_stopping", PATIENCE_EARLY_STOPPING)
-    _COSINE_T_0 = effective_config.get("cosine_t_0", COSINE_T_0)
-    _COSINE_T_MULT = effective_config.get("cosine_t_mult", COSINE_T_MULT)
-    _WARMUP_EPOCHS = effective_config.get("warmup_epochs", WARMUP_EPOCHS)
-    _BATCH_SIZE_PARAM = effective_config.get("batch_size", 64)
-    _ACTIVATION_FN = effective_config.get("activation_fn", "relu")
-    _CLIP_GRAD_NORM = effective_config.get("clip_grad_norm", 0.0)
-    _LABEL_SMOOTHING = effective_config.get("label_smoothing", 0.0)
-    _EXCLUDE_FEATURES = effective_config.get("exclude_features", []) # Get exclude_features from config
+def main():
+    global PYG_AVAILABLE_DATAUTILS # Allow main to modify this based on actual imports
+    try:
+        from models.data_utils import PYG_AVAILABLE_DATAUTILS as PYG_STATUS_FROM_UTILS
+        PYG_AVAILABLE_DATAUTILS = PYG_STATUS_FROM_UTILS
+    except ImportError: # If models.data_utils itself is missing
+        PYG_AVAILABLE_DATAUTILS = False
 
-    print("Starting main training script execution...")
-    print(f"Running with effective_config: {effective_config}")
-    # Note: _BATCH_SIZE_PARAM is available here but not directly used in the current GNN full-graph processing.
-    # It's made available for future modifications if subgraph batching is implemented.
 
-    print("Loading and preprocessing training data for dimension inference and training...")
-    train_graph, _, preprocessor = load_and_preprocess_data(
-        TRAIN_CSV,
-        fit_preprocessor=True,
-        target_cols=['outcomeType', 'lengthofStay'],
-        k_neighbors=10,
-        exclude_features=_EXCLUDE_FEATURES # Pass exclude_features list
-    )
-    if train_graph is None:
-        print("Failed to load training data. Exiting.")
-        if USE_WANDB and wandb.run: wandb.finish(exit_code=1)
-        exit()
+    if not PROJECT_MODULES_AVAILABLE: # If models themselves are missing
+        print("Exiting: Essential project model modules could not be imported.")
+        # Setup dummy versions if proceeding for a dry run of train.py structure
+        global ModelWithSTMGNNLayer, STMGNN, CustomGraphStaticDataset, create_static_graph_dataloaders
+        global CustomGraphDynamicDataset, create_dynamic_graph_dataloaders
 
-    num_numerical_features_fitted = 0
-    if 'num' in preprocessor.named_transformers_ and preprocessor.named_transformers_['num'] != 'drop':
-        num_numerical_features_fitted = len(preprocessor.transformers_[0][2])
+        # Ensure dummy classes defined at top are used
+        print("Continuing with top-level placeholder model and data classes for train.py basic execution.")
 
-    num_onehot_features_fitted = 0
-    if 'cat' in preprocessor.named_transformers_ and preprocessor.named_transformers_['cat'] != 'drop':
-        cat_transformer_fitted = preprocessor.named_transformers_['cat']
-        onehot_encoder_fitted = cat_transformer_fitted.named_steps['onehot']
-        if hasattr(onehot_encoder_fitted, 'get_feature_names_out'):
-            try:  # Handle cases where categorical_features might be empty
-                num_onehot_features_fitted = len(
-                    onehot_encoder_fitted.get_feature_names_out(preprocessor.transformers_[1][2]))
-            except Exception:
-                num_onehot_features_fitted = 0  # If no cat features were passed to onehot
-        elif hasattr(onehot_encoder_fitted, 'categories_'):
-            for cats in onehot_encoder_fitted.categories_:
-                num_onehot_features_fitted += len(cats)
+    # Override data utilities with placeholders if PyG is not available
+    if not PYG_AVAILABLE_DATAUTILS:
+        print("PyTorch Geometric not available in data_utils. Using placeholder data utilities for train.py.")
+        global CustomGraphStaticDataset, create_static_graph_dataloaders
+        global CustomGraphDynamicDataset, create_dynamic_graph_dataloaders
+        CustomGraphStaticDataset = lambda **kwargs: DatasetPlaceholder(**kwargs, is_dynamic=False)
+        CustomGraphDynamicDataset = lambda **kwargs: DatasetPlaceholder(**kwargs, is_dynamic=True)
+        # DataLoaderPlaceholder already assigned if initial import failed
+        create_static_graph_dataloaders = lambda dataset, batch_size, **kwargs: (DataLoaderPlaceholder(dataset, batch_size), DataLoaderPlaceholder(dataset, batch_size), DataLoaderPlaceholder(dataset, batch_size))
+        create_dynamic_graph_dataloaders = lambda dataset, batch_size, **kwargs: (DataLoaderPlaceholder(dataset, batch_size), DataLoaderPlaceholder(dataset, batch_size), DataLoaderPlaceholder(dataset, batch_size))
 
-    DIM_IN_FEATURES_FROM_DATA = num_numerical_features_fitted + num_onehot_features_fitted
-    print(f"Actual input dimension from preprocessed data (excluding explicit PEs): {DIM_IN_FEATURES_FROM_DATA}")
 
-    actual_lap_pe_dim = 0
-    if hasattr(train_graph, 'lap_pe') and train_graph.lap_pe is not None:
-        actual_lap_pe_dim = train_graph.lap_pe.shape[1]
-        print(f"LapPE found in data with dimension: {actual_lap_pe_dim}")
-        if actual_lap_pe_dim != _LAP_PE_K_DIM:
-            print(
-                f"WARNING: Configured LAP_PE_K_DIM ({_LAP_PE_K_DIM}) differs from actual LapPE dim in data ({actual_lap_pe_dim}). Using actual: {actual_lap_pe_dim} for model init.")
-            # Model should use actual_lap_pe_dim; wandb.config logs the intended _LAP_PE_K_DIM
-    else:
-        print("No LapPE found in data. LapPE dim for model will be 0.")
+    print(f"Using device: {DEVICE}")
+    print(f"Selected model type: {MODEL_TYPE}")
+    print(f"PYG_AVAILABLE_DATAUTILS (after check): {PYG_AVAILABLE_DATAUTILS}")
 
-    actual_sign_pe_dim = 0
-    if hasattr(train_graph, 'sign_pe') and train_graph.sign_pe is not None:
-        actual_sign_pe_dim = train_graph.sign_pe.shape[1]
-        print(f"SignPE found in data with dimension: {actual_sign_pe_dim}")
-        if actual_sign_pe_dim != _SIGN_PE_K_DIM:
-            print(
-                f"WARNING: Configured SIGN_PE_K_DIM ({_SIGN_PE_K_DIM}) differs from actual SignPE dim in data ({actual_sign_pe_dim}). Using actual: {actual_sign_pe_dim} for model init.")
-    elif _SIGN_PE_K_DIM > 0:
-        print(
-            f"WARNING: SIGN_PE_K_DIM is {_SIGN_PE_K_DIM} but no SignPE found in data. SignPE dim for model will be 0.")
+    model = None; train_loader, val_loader, test_loader = None, None, None
 
-    print("Loading and preprocessing validation data...")
-    val_graph, _ = load_and_preprocess_data(
-        VAL_CSV,
-        preprocessor=preprocessor,
-        fit_preprocessor=False,
-        target_cols=['outcomeType', 'lengthofStay'],
-        k_neighbors=10,
-        exclude_features=_EXCLUDE_FEATURES # Pass exclude_features list
-    )
-    if val_graph is None:
-        print("Failed to load validation data. Exiting.")
-        if USE_WANDB and wandb.run: wandb.finish(exit_code=1)
-        exit()
+    if MODEL_TYPE == "model_with_stmgnnlayer":
+        if not PYG_AVAILABLE_DATAUTILS and PROJECT_MODULES_AVAILABLE:
+            print("Warning: 'model_with_stmgnnlayer' training needs PyTorch Geometric for data. Placeholders may not reflect true performance.")
+            # Allow to proceed with placeholders if PROJECT_MODULES_AVAILABLE is true but PyG is false.
+            # If models are also placeholders, this is fine for a dry run.
 
-    # Initialize metrics to None, they will be set if the corresponding task is run
-    best_auroc_mortality = None
-    best_rmse_los = None
-
-    # --- Train Mortality Model (Conditional) ---
-    if args.task == 'mortality' or args.task == 'all':
-        print("\nInitializing Mortality Predictor...")
-        mortality_model = MortalityPredictor(
-            dim_in=DIM_IN_FEATURES_FROM_DATA, dim_h=_DIM_HIDDEN, num_layers=_NUM_GPS_LAYERS,
-            num_heads=_NUM_ATTN_HEADS, lap_pe_dim=actual_lap_pe_dim,
-            sign_pe_dim=actual_sign_pe_dim, dropout=_DROPOUT_RATE,
-            activation_fn_str=_ACTIVATION_FN
-        ).to(DEVICE)
-
-        if USE_WANDB and wandb.run:
-            wandb.config.update({
-                "mortality_model_architecture": str(mortality_model),
-                "input_features_dim_from_data": DIM_IN_FEATURES_FROM_DATA,
-                "actual_lap_pe_dim_from_data_for_model": actual_lap_pe_dim,
-                "actual_sign_pe_dim_from_data_for_model": actual_sign_pe_dim
-            }, allow_val_change=True)
-
-        if train_graph.y_mortality is not None:
-            num_positive = torch.sum(train_graph.y_mortality == 1)
-            num_negative = torch.sum(train_graph.y_mortality == 0)
-            pos_weight_value = num_negative / (num_positive + 1e-6)
-            print(f"Mortality: Negatives={num_negative}, Positives={num_positive}, Pos_weight={pos_weight_value:.2f}")
-
-            loss_fn_choice = args.loss_fn if hasattr(args, 'loss_fn') else 'bce'
-            if loss_fn_choice == 'focal':
-                print("Using FocalLoss for mortality task.")
-                criterion_mortality = FocalLoss(alpha=0.25, gamma=2.0, pos_weight=torch.tensor([pos_weight_value], device=DEVICE))
-            else:
-                print(f"Using BCEWithLogitsLoss for mortality task with label smoothing: {_LABEL_SMOOTHING}")
-                criterion_mortality = nn.BCEWithLogitsLoss(
-                    pos_weight=torch.tensor([pos_weight_value], device=DEVICE),
-                )
-        else:
-            print("Warning: y_mortality not found in train_graph. Using unweighted loss.")
-            loss_fn_choice = args.loss_fn if hasattr(args, 'loss_fn') else 'bce'
-            if loss_fn_choice == 'focal':
-                criterion_mortality = FocalLoss(alpha=0.25, gamma=2.0)
-            else:
-                print(f"Using BCEWithLogitsLoss (unweighted) with label smoothing: {_LABEL_SMOOTHING if _LABEL_SMOOTHING > 0 else 'N/A'}")
-                criterion_mortality = nn.BCEWithLogitsLoss()
-
-        optimizer_mortality = optim.AdamW(mortality_model.parameters(), lr=_LEARNING_RATE, weight_decay=_WEIGHT_DECAY)
-        scheduler_mortality = CosineAnnealingWarmRestarts(optimizer_mortality, T_0=_COSINE_T_0, T_mult=_COSINE_T_MULT)
-
-        _, best_auroc_mortality = train_model( # Store the returned model if needed later, for now only metric
-            model=mortality_model, train_data=train_graph, val_data=val_graph, criterion=criterion_mortality,
-            optimizer=optimizer_mortality, scheduler=scheduler_mortality, task_name="Mortality",
-            epochs=_EPOCHS, patience=_PATIENCE_EARLY_STOPPING, model_path=mortality_model_path_dynamic,
-            label_smoothing_factor=_LABEL_SMOOTHING, clip_grad_norm_value=_CLIP_GRAD_NORM, warmup_epochs_value=_WARMUP_EPOCHS
+        dataset = CustomGraphStaticDataset(
+            num_samples=NUM_SAMPLES_STATIC, avg_nodes=AVG_NODES_STATIC, num_features=FEATURES_STATIC,
+            num_classes=CLASSES_STATIC, random_seed=42
         )
-        if USE_WANDB and wandb.run:
-            wandb.summary["final_best_auroc_mortality"] = best_auroc_mortality
-        print(f"Mortality Model trained. Best AUROC: {best_auroc_mortality}")
-
-    # --- Train LoS Model (Conditional) ---
-    if args.task == 'los' or args.task == 'all':
-        print("\nInitializing LoS Predictor...")
-        los_model = LoSPredictor(
-            dim_in=DIM_IN_FEATURES_FROM_DATA, dim_h=_DIM_HIDDEN, num_layers=_NUM_GPS_LAYERS,
-            num_heads=_NUM_ATTN_HEADS, lap_pe_dim=actual_lap_pe_dim,
-            sign_pe_dim=actual_sign_pe_dim, dropout=_DROPOUT_RATE,
-            activation_fn_str=_ACTIVATION_FN
-        ).to(DEVICE)
-
-        if USE_WANDB and wandb.run:
-            wandb.config.update({"los_model_architecture": str(los_model)}, allow_val_change=True)
-
-        criterion_los = nn.MSELoss()
-        optimizer_los = optim.AdamW(los_model.parameters(), lr=_LEARNING_RATE, weight_decay=_WEIGHT_DECAY)
-        scheduler_los = CosineAnnealingWarmRestarts(optimizer_los, T_0=_COSINE_T_0, T_mult=_COSINE_T_MULT)
-
-        _, best_rmse_los = train_model( # Store the returned model if needed later
-            model=los_model, train_data=train_graph, val_data=val_graph, criterion=criterion_los,
-            optimizer=optimizer_los, scheduler=scheduler_los, task_name="LoS",
-            epochs=_EPOCHS, patience=_PATIENCE_EARLY_STOPPING, model_path=los_model_path_dynamic,
-            label_smoothing_factor=0.0,
-            clip_grad_norm_value=_CLIP_GRAD_NORM, warmup_epochs_value=_WARMUP_EPOCHS
+        train_loader, val_loader, test_loader = create_static_graph_dataloaders(
+            dataset, BATCH_SIZE, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42
         )
-        if USE_WANDB and wandb.run:
-            wandb.summary["final_best_rmse_los"] = best_rmse_los
-        print(f"LoS Model trained. Best RMSE: {best_rmse_los}")
 
-    print("\nTraining finished.")
-    if (args.task == 'mortality' or args.task == 'all') and best_auroc_mortality is not None:
-        print(f"Mortality Model saved to: {mortality_model_path_dynamic}")
-    if (args.task == 'los' or args.task == 'all') and best_rmse_los is not None:
-        print(f"LoS Model saved to: {los_model_path_dynamic}")
-
-    # Obliczanie i logowanie GLscore (tylko jeśli oba modele były trenowane i metryki są dostępne)
-    if (args.task == 'all') and (best_auroc_mortality is not None) and (best_rmse_los is not None):
-        if USE_WANDB and wandb.run is not None:
-            los_score_component = 1 / (1 + best_rmse_los)
-            gl_score = best_auroc_mortality + los_score_component
-            wandb.summary["los_score_component"] = los_score_component
-            wandb.summary["GLscore"] = gl_score
-            print(
-                f"GLscore calculated: {gl_score:.4f} (AUROC: {best_auroc_mortality:.4f}, LoS_component: {los_score_component:.4f} from RMSE: {best_rmse_los:.4f})")
-    elif args.task == 'all':
-        print("Could not calculate GLscore because one or both primary metrics are missing (likely due to individual task runs or training issues).")
-
-
-    if USE_WANDB and wandb.run:
-        wandb.finish()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--sweep_id', type=str, default=None, help='Wandb sweep ID to run an agent for.')
-    parser.add_argument('--sweep_config', type=str, default='sweep.yaml', help='Path to the sweep configuration file.')
-    parser.add_argument('--project', type=str, default=WANDB_PROJECT, help='Wandb project name.')
-    parser.add_argument('--entity', type=str, default=WANDB_ENTITY, help='Wandb entity (user or team).')
-    parser.add_argument('--count', type=int, default=None, help='Number of runs for the sweep agent.')
-
-    # Arguments for manual hyperparameter tuning
-    parser.add_argument('--lr', type=float, default=LEARNING_RATE, help=f'Learning rate (default: {LEARNING_RATE})')
-    parser.add_argument('--wd', type=float, default=WEIGHT_DECAY, help=f'Weight decay (default: {WEIGHT_DECAY})')
-    parser.add_argument('--dropout', type=float, default=DROPOUT_RATE, help=f'Dropout rate (default: {DROPOUT_RATE})')
-
-    parser.add_argument('--loss_fn', type=str, default='bce', choices=['bce', 'focal'], help='Loss function for mortality task (bce or focal, default: bce)')
-    parser.add_argument('--activation_fn', type=str, default='relu', choices=['relu', 'gelu', 'leaky_relu'], help='Activation function for GNN layers (default: relu)')
-    parser.add_argument('--clip_grad_norm', type=float, default=0.0, help='Max norm for gradient clipping (0.0 to disable, default: 0.0)')
-    parser.add_argument('--label_smoothing', type=float, default=0.0, help='Label smoothing factor for BCE loss (default: 0.0, no smoothing)')
-    parser.add_argument('--no-wandb', action='store_true', help='Disable Weights & Biases logging.')
-    parser.add_argument('--task', type=str, default='all', choices=['mortality', 'los', 'all'], help='Task to train (mortality, los, or all). Default: all')
-    parser.add_argument('--exclude_features', nargs='*', default=[], help='List of feature names to exclude from processing. E.g., --exclude_features feature1 feature2')
-
-    args = parser.parse_args()
-
-    # This is the correct place for `global` if we intend to modify the module-level USE_WANDB
-    # However, the script structure is such that main() reads the global USE_WANDB.
-    # We only need to ensure USE_WANDB is set correctly before main() is called.
-
-
-    # Modify the module-level USE_WANDB based on args.no_wandb
-    if args.no_wandb:
-        USE_WANDB = False # This modifies the global USE_WANDB
-        print("Weights & Biases logging explicitly disabled via --no-wandb flag.")
-
-    if args.sweep_id:
-        # If a sweep is requested, W&B is necessary.
-        if not USE_WANDB: # This checks the potentially modified global USE_WANDB
-            print("WARNING: --no-wandb was set, but sweep functionality relies on W&B. W&B will be re-enabled for the sweep agent.")
-            USE_WANDB = True # Modify the global USE_WANDB again
-
-        print(f"Starting wandb agent for sweep_id: {args.sweep_id}")
-
-        def main_for_sweep(config_from_agent=None):
-            main(run_config_from_sweep=config_from_agent)
-
-        wandb.agent(sweep_id=args.sweep_id, function=main_for_sweep, count=args.count, project=args.project, entity=args.entity)
+        model = ModelWithSTMGNNLayer( # Dummy or real based on PROJECT_MODULES_AVAILABLE
+            num_features=FEATURES_STATIC, hidden_dim_stm=64, num_classes=CLASSES_STATIC,
+            num_stm_layers=2, heads_stm=2, dropout_stm=0.1,
+            global_memory_dim_stm=32, num_memory_slots_stm=3
+        ).to(DEVICE)
+    elif MODEL_TYPE == "stm_gnn":
+        dataset = CustomGraphDynamicDataset(
+            num_sequences=NUM_SEQUENCES_DYNAMIC, avg_snapshots=AVG_SNAPSHOTS_DYNAMIC,
+            avg_nodes_per_snapshot=AVG_NODES_DYNAMIC, num_features=FEATURES_DYNAMIC,
+            num_classes=CLASSES_DYNAMIC, random_seed=123
+        )
+        train_loader, val_loader, test_loader = create_dynamic_graph_dataloaders(
+            dataset, BATCH_SIZE, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=123
+        )
+        model = STMGNN( # Dummy or real
+            num_node_features=FEATURES_DYNAMIC, layer_hidden_dim=64, gnn_output_dim=64,
+            num_gnn_layers=2, global_memory_dim=32, num_memory_slots=3,
+            num_heads=2, dropout=0.1, num_classes=CLASSES_DYNAMIC
+        ).to(DEVICE)
     else:
-        # For a single run, USE_WANDB would have been set by --no-wandb if provided.
-        # If not provided, it remains its default True value from module level.
-        if not USE_WANDB:
-            print("Starting a single training run with W&B disabled.")
-        else:
-            print("Starting a single training run (W&B will be used unless it was disabled by --no-wandb).")
-        main()
+        print(f"Unknown model type: {MODEL_TYPE}"); return
+
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    criterion = F.cross_entropy
+
+    print(f"\nStarting training for {MODEL_TYPE}...")
+    train_fn = train_epoch_static if MODEL_TYPE == "model_with_stmgnnlayer" else train_epoch_dynamic
+    eval_fn = evaluate_epoch_static if MODEL_TYPE == "model_with_stmgnnlayer" else evaluate_epoch_dynamic
+
+    for epoch in range(1, EPOCHS + 1):
+        train_loss, train_acc = train_fn(model, train_loader, optimizer, criterion)
+        val_loss, val_acc = eval_fn(model, val_loader, criterion)
+        print(f"Epoch {epoch:02d}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+
+    # Check if test_loader.dataset has items or if it's a placeholder with 0 length effectively
+    has_test_data = False
+    try:
+        if len(test_loader.dataset) > 0: has_test_data = True
+    except: # Placeholder might not have dataset attribute in the same way
+        if len(test_loader) > 0 : has_test_data = True # Check if loader itself has batches
+
+    if has_test_data:
+        test_loss, test_acc = eval_fn(model, test_loader, criterion)
+        print(f"Test Results: Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f}")
+    else:
+        print("Test loader is empty or invalid, skipping test evaluation.")
+
+if __name__ == '__main__':
+    main()
