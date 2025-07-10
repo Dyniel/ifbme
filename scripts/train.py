@@ -1,14 +1,19 @@
 import argparse
 import yaml # For loading configurations
+import wandb
 import torch
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, precision_score, recall_score
 import torch.optim as optim
 import numpy as np
+from sklearn.model_selection import StratifiedKFold
 
 # Project-specific imports (will be refined)
 # from data_utils.loader import YourDataLoader # Replace with actual data loader
 from data_utils.balancing import RSMOTEGAN
 from data_utils.losses import ClassBalancedFocalLoss
 # from models.your_model import YourModel # Replace with actual model
+from models.lgbm_model import LightGBMModel
+from models.meta_learner import XGBoostMetaLearner
 
 def load_config(config_path):
     """Loads YAML configuration file."""
@@ -32,6 +37,20 @@ def get_samples_per_class(y_train):
 def main(config_path):
     """Main training loop."""
     config = load_config(config_path)
+
+    # --- Initialize W&B ---
+    # Potentially load wandb specific configs from main config file
+    wandb_config = config.get('wandb', {})
+    wandb.init(
+        project=wandb_config.get('project', 'ifbme-project'), # Replace with your project name
+        entity=wandb_config.get('entity', None), # Replace with your entity (user or team)
+        config=config, # Log the entire configuration
+        name=wandb_config.get('run_name', None), # Optional: set a run name
+        notes=wandb_config.get('run_notes', None), # Optional: add notes
+        tags=wandb_config.get('tags', None) # Optional: add tags
+    )
+    # Update wandb config with the loaded config (in case init did not take it all)
+    # wandb.config.update(config) # Already done by passing config to wandb.init
 
     # --- Setup ---
     device = torch.device("cuda" if torch.cuda.is_available() and config.get('use_gpu', True) else "cpu")
@@ -178,11 +197,18 @@ def main(config_path):
     # Dimensions: (num_train_samples, num_classes_base_model_output)
     # For LGBM/XGBoost, this is num_classes. For DL models, also num_classes (after softmax).
 
-    # Need to know num_classes for sizing OOF arrays
-    # num_classes determined by y_train_raw
+    # Determine num_classes from the data (used for OOF arrays and metric calculations)
+    # Ensure this is done BEFORE it's first used by oof_preds or logging.
+    # Using y_train_raw as it represents the original class structure for OOF.
+    unique_classes_train_raw = np.unique(y_train_raw)
+    num_classes = len(unique_classes_train_raw)
+    print(f"Determined number of classes: {num_classes} from y_train_raw unique values: {unique_classes_train_raw}")
+    if num_classes < 2:
+        raise ValueError(f"Number of classes must be at least 2. Found {num_classes} in y_train_raw.")
+
 
     oof_preds = {
-        'lgbm': np.zeros((len(y_train_raw), num_classes)), # Assuming num_classes is known
+        'lgbm': np.zeros((len(y_train_raw), num_classes)),
         'teco': np.zeros((len(y_train_raw), num_classes)),
         'stm_gnn': np.zeros((len(y_train_raw), num_classes))
     }
@@ -237,6 +263,35 @@ def main(config_path):
             test_preds_sum['lgbm'] += lgbm_fold_model.predict_proba(X_test_for_base_models) / n_folds
             # lgbm_fold_model.save_model(f"lgbm_fold_{fold+1}.joblib") # Optional: save fold model
 
+            # Log LGBM fold metrics
+            y_fold_val_pred_lgbm = lgbm_fold_model.predict(X_fold_val)
+            y_fold_val_proba_lgbm = oof_preds['lgbm'][val_idx]
+
+            fold_accuracy_lgbm = accuracy_score(y_fold_val, y_fold_val_pred_lgbm)
+            fold_f1_lgbm = f1_score(y_fold_val, y_fold_val_pred_lgbm, average='weighted' if num_classes > 2 else 'binary')
+            fold_precision_lgbm = precision_score(y_fold_val, y_fold_val_pred_lgbm, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+            fold_recall_lgbm = recall_score(y_fold_val, y_fold_val_pred_lgbm, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+
+            fold_auroc_lgbm = -1 # Placeholder if not calculable
+            try:
+                if num_classes == 2:
+                    fold_auroc_lgbm = roc_auc_score(y_fold_val, y_fold_val_proba_lgbm[:, 1])
+                else:
+                    fold_auroc_lgbm = roc_auc_score(y_fold_val, y_fold_val_proba_lgbm, multi_class='ovr', average='weighted')
+            except ValueError as e:
+                print(f"Fold {fold+1} LGBM AUROC calculation error: {e}")
+
+            wandb.log({
+                f"fold_{fold+1}/lgbm_accuracy": fold_accuracy_lgbm,
+                f"fold_{fold+1}/lgbm_auroc": fold_auroc_lgbm,
+                f"fold_{fold+1}/lgbm_f1": fold_f1_lgbm,
+                f"fold_{fold+1}/lgbm_precision": fold_precision_lgbm,
+                f"fold_{fold+1}/lgbm_recall": fold_recall_lgbm,
+                "fold": fold + 1
+            })
+            print(f"Fold {fold+1} LGBM Val Accuracy: {fold_accuracy_lgbm:.4f}, AUROC: {fold_auroc_lgbm:.4f}")
+
+
         # --- 2. Train TECO-Transformer (Conceptual) ---
         if config.get('ensemble', {}).get('train_teco', True):
             print(f"\nFold {fold+1}: Training TECO-Transformer (Conceptual)...")
@@ -254,6 +309,24 @@ def main(config_path):
             oof_preds['teco'][val_idx] = np.random.multinomial(1, class_probs_sim, size=num_val_samples_fold) * 0.8 + \
                                          np.random.rand(num_val_samples_fold, num_classes) * 0.2 # Add noise
             oof_preds['teco'][val_idx] = oof_preds['teco'][val_idx] / np.sum(oof_preds['teco'][val_idx], axis=1, keepdims=True)
+
+            # Log TECO fold metrics (conceptual)
+            y_fold_val_pred_teco = np.argmax(oof_preds['teco'][val_idx], axis=1) # Dummy prediction
+            fold_accuracy_teco = accuracy_score(y_fold_val, y_fold_val_pred_teco)
+            fold_auroc_teco = -1
+            try:
+                if num_classes == 2:
+                    fold_auroc_teco = roc_auc_score(y_fold_val, oof_preds['teco'][val_idx][:, 1])
+                else:
+                    fold_auroc_teco = roc_auc_score(y_fold_val, oof_preds['teco'][val_idx], multi_class='ovr', average='weighted')
+            except ValueError as e:
+                print(f"Fold {fold+1} TECO AUROC calculation error (conceptual): {e}")
+            wandb.log({
+                f"fold_{fold+1}/teco_accuracy": fold_accuracy_teco,
+                f"fold_{fold+1}/teco_auroc": fold_auroc_teco,
+                "fold": fold + 1
+            })
+            print(f"Fold {fold+1} TECO Val Accuracy (conceptual): {fold_accuracy_teco:.4f}, AUROC (conceptual): {fold_auroc_teco:.4f}")
 
 
             num_test_samples_fold = len(y_test_for_base_models)
@@ -283,6 +356,25 @@ def main(config_path):
             test_preds_sum['stm_gnn'] += (np.random.multinomial(1, class_probs_sim, size=num_test_samples_fold) * 0.85 + \
                                          np.random.rand(num_test_samples_fold, num_classes) * 0.15) / n_folds
             test_preds_sum['stm_gnn'] = np.clip(test_preds_sum['stm_gnn'], 0, 1)
+
+            # Log STM-GNN fold metrics (conceptual)
+            y_fold_val_pred_stm_gnn = np.argmax(oof_preds['stm_gnn'][val_idx], axis=1) # Dummy prediction
+            fold_accuracy_stm_gnn = accuracy_score(y_fold_val, y_fold_val_pred_stm_gnn)
+            fold_auroc_stm_gnn = -1
+            try:
+                if num_classes == 2:
+                    fold_auroc_stm_gnn = roc_auc_score(y_fold_val, oof_preds['stm_gnn'][val_idx][:, 1])
+                else:
+                    fold_auroc_stm_gnn = roc_auc_score(y_fold_val, oof_preds['stm_gnn'][val_idx], multi_class='ovr', average='weighted')
+            except ValueError as e:
+                print(f"Fold {fold+1} STM-GNN AUROC calculation error (conceptual): {e}")
+
+            wandb.log({
+                f"fold_{fold+1}/stm_gnn_accuracy": fold_accuracy_stm_gnn,
+                f"fold_{fold+1}/stm_gnn_auroc": fold_auroc_stm_gnn,
+                "fold": fold + 1
+            })
+            print(f"Fold {fold+1} STM-GNN Val Accuracy (conceptual): {fold_accuracy_stm_gnn:.4f}, AUROC (conceptual): {fold_auroc_stm_gnn:.4f}")
 
 
     print("\n--- Finished generating OOF predictions for base models ---")
@@ -342,8 +434,28 @@ def main(config_path):
         print(f"Meta-learner predictions on test set (proxy) - Proba shape: {final_predictions_meta_proba.shape}")
 
         # Evaluate meta-learner (example)
-        # accuracy_meta = accuracy_score(y_test_for_base_models, final_predictions_meta_labels)
-        # print(f"Meta-Learner Test Accuracy (proxy): {accuracy_meta:.4f}")
+        accuracy_meta = accuracy_score(y_test_for_base_models, final_predictions_meta_labels)
+        f1_meta = f1_score(y_test_for_base_models, final_predictions_meta_labels, average='weighted' if num_classes > 2 else 'binary')
+        precision_meta = precision_score(y_test_for_base_models, final_predictions_meta_labels, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+        recall_meta = recall_score(y_test_for_base_models, final_predictions_meta_labels, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+
+        auroc_meta = -1
+        try:
+            if num_classes == 2:
+                auroc_meta = roc_auc_score(y_test_for_base_models, final_predictions_meta_proba[:, 1])
+            else:
+                auroc_meta = roc_auc_score(y_test_for_base_models, final_predictions_meta_proba, multi_class='ovr', average='weighted')
+        except ValueError as e:
+            print(f"Meta-learner AUROC calculation error: {e}")
+
+        wandb.log({
+            "meta_learner/test_accuracy": accuracy_meta,
+            "meta_learner/test_auroc": auroc_meta,
+            "meta_learner/test_f1": f1_meta,
+            "meta_learner/test_precision": precision_meta,
+            "meta_learner/test_recall": recall_meta,
+        })
+        print(f"Meta-Learner Test Accuracy (proxy): {accuracy_meta:.4f}, AUROC: {auroc_meta:.4f}")
 
     # --- Soft Voting (Alternative/Complementary) ---
     # Weights: STM-GNN 0.5, LightGBM 0.3, TECO-Transformer 0.2
@@ -368,12 +480,33 @@ def main(config_path):
             # final_predictions_soft_vote_proba /= total_weight
             final_predictions_soft_vote_labels = np.argmax(final_predictions_soft_vote_proba, axis=1)
             print(f"Soft-vote predictions on test set (proxy) - Proba shape: {final_predictions_soft_vote_proba.shape}")
-            # accuracy_soft_vote = accuracy_score(y_test_for_base_models, final_predictions_soft_vote_labels)
-            # print(f"Soft-Vote Test Accuracy (proxy): {accuracy_soft_vote:.4f}")
+
+            accuracy_soft_vote = accuracy_score(y_test_for_base_models, final_predictions_soft_vote_labels)
+            f1_soft_vote = f1_score(y_test_for_base_models, final_predictions_soft_vote_labels, average='weighted' if num_classes > 2 else 'binary')
+            precision_soft_vote = precision_score(y_test_for_base_models, final_predictions_soft_vote_labels, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+            recall_soft_vote = recall_score(y_test_for_base_models, final_predictions_soft_vote_labels, average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+
+            auroc_soft_vote = -1
+            try:
+                if num_classes == 2:
+                    auroc_soft_vote = roc_auc_score(y_test_for_base_models, final_predictions_soft_vote_proba[:, 1])
+                else:
+                    auroc_soft_vote = roc_auc_score(y_test_for_base_models, final_predictions_soft_vote_proba, multi_class='ovr', average='weighted')
+            except ValueError as e:
+                print(f"Soft-vote AUROC calculation error: {e}")
+
+            wandb.log({
+                "soft_vote/test_accuracy": accuracy_soft_vote,
+                "soft_vote/test_auroc": auroc_soft_vote,
+                "soft_vote/test_f1": f1_soft_vote,
+                "soft_vote/test_precision": precision_soft_vote,
+                "soft_vote/test_recall": recall_soft_vote,
+            })
+            print(f"Soft-Vote Test Accuracy (proxy): {accuracy_soft_vote:.4f}, AUROC: {auroc_soft_vote:.4f}")
         else:
             print("No valid models/weights for soft voting.")
 
-
+    wandb.finish() # Ensure wandb run is closed
     print("\nEnsemble training conceptual run finished.")
 
 
