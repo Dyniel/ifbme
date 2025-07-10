@@ -130,16 +130,29 @@ class TECOTransformerModel(nn.Module):
         if self.num_classes is not None:
             # Simple mean pooling over sequence dimension, ignoring padding
             if src_padding_mask is not None:
-                # Invert mask for summing: True for valid tokens, False for padding
-                valid_tokens_mask = ~src_padding_mask # (batch_size, seq_len)
-                valid_tokens_mask = valid_tokens_mask.unsqueeze(-1).expand_as(encoded_sequence) # (B, S, D)
+                # src_padding_mask is (batch_size, seq_len), True for padded positions.
+                # We want to sum embeddings for non-padded positions and divide by count of non-padded.
 
-                sum_embeddings = (encoded_sequence * valid_tokens_mask).sum(dim=1) # (B, D)
-                num_valid_tokens = valid_tokens_mask.sum(dim=1) # (B, D), sum over S
-                num_valid_tokens = torch.clamp(num_valid_tokens[:,0], min=1) # (B,), take one feature dim count
+                # Create a mask for valid tokens (True for valid, False for padded)
+                # This mask should be (batch_size, seq_len)
+                inverted_padding_mask = ~src_padding_mask
 
-                pooled_output = sum_embeddings / num_valid_tokens.unsqueeze(-1) # (B,D) / (B,1)
+                # Expand this mask to multiply with encoded_sequence (B, S, D)
+                # valid_tokens_mask_expanded will be (B, S, 1) and then broadcasted or expanded to (B, S, D)
+                valid_tokens_mask_expanded = inverted_padding_mask.unsqueeze(-1).float() # Ensure float for multiplication
+
+                # Sum embeddings where mask is True (valid tokens)
+                masked_encoded_sequence = encoded_sequence * valid_tokens_mask_expanded # Zeros out padded steps
+                sum_embeddings = masked_encoded_sequence.sum(dim=1)  # Sum over seq_len dim -> (B, D)
+
+                # Count number of valid tokens per sequence
+                num_valid_tokens_per_sequence = inverted_padding_mask.sum(dim=1).float()  # (B,)
+                # Clamp to avoid division by zero if a sequence has no valid tokens (should not happen with seq_len=1)
+                num_valid_tokens_per_sequence = torch.clamp(num_valid_tokens_per_sequence, min=1)
+
+                pooled_output = sum_embeddings / num_valid_tokens_per_sequence.unsqueeze(-1)  # (B, D) / (B, 1) -> (B, D)
             else:
+                # No padding mask, so all tokens are valid
                 pooled_output = encoded_sequence.mean(dim=1) # (batch_size, d_model)
 
             logits = self.output_classifier(pooled_output) # (batch_size, num_classes)
