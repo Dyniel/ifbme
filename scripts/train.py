@@ -1106,6 +1106,7 @@ def main(config_path):
                                         early_stopping_rounds=lgbm_los_config.get('early_stopping_rounds_final', 20))
 
                     predicted_los_outer_test = los_model.predict(X_outer_test_processed)
+
                     # Ensure predictions are non-negative
                     predicted_los_outer_test = np.maximum(0, predicted_los_outer_test)
 
