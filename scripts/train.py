@@ -1024,9 +1024,87 @@ def main(config_path):
                         'n_jobs': -1,
                         'verbose': -1,
                     }
-                    los_model = LightGBMModel(params=los_regressor_params)
-                    # No separate validation set for LoS model in this simplified setup, trains on full outer_train part
-                    los_model.train(X_los_train_fold_processed, y_los_outer_train_cleaned)
+                    los_model = LightGBMModel(params=los_regressor_params) # Initialize with base params
+
+                    optuna_los_config = config.get('optuna', {}).get('lgbm_los', {})
+                    use_optuna_for_los = optuna_los_config.get('use_optuna_for_los', False) # Control flag
+                    n_trials_los = optuna_los_config.get('n_trials', 15)
+                    timeout_los = optuna_los_config.get('timeout_seconds_per_fold', 300)
+
+                    if use_optuna_for_los and X_los_train_fold_processed.shape[0] > 20: # Ensure enough data for split
+                        # Create a train/validation split from X_los_train_fold_processed for Optuna
+                        # Using a simple split here, can be improved (e.g., KFold for robustness within Optuna)
+                        # For simplicity, let's use a fixed 80/20 split of the already cleaned LoS training data
+                        # Ensure y_los_outer_train_cleaned is not all the same value before trying StratifiedShuffleSplit
+                        # For regression, a simple train_test_split is fine.
+                        from sklearn.model_selection import train_test_split as los_optuna_split
+
+                        X_optuna_los_train, X_optuna_los_val, \
+                        y_optuna_los_train, y_optuna_los_val = los_optuna_split(
+                            X_los_train_fold_processed, y_los_outer_train_cleaned,
+                            test_size=0.25, # e.g. 25% for Optuna validation
+                            random_state=seed + outer_fold_idx + 100 # Different seed offset
+                        )
+
+                        def los_objective(trial):
+                            # Define hyperparameter search space for LoS Optuna
+                            trial_los_params = {
+                                'objective': 'regression_l1', # Fixed for MAE
+                                'metric': 'mae',             # Fixed for MAE
+                                'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+                                'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.2, log=True),
+                                'num_leaves': trial.suggest_int('num_leaves', 10, 100, log=True),
+                                'max_depth': trial.suggest_int('max_depth', 3, 10),
+                                'min_child_samples': trial.suggest_int('min_child_samples', 5, 50),
+                                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                                'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 1.0, log=True),
+                                'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 1.0, log=True),
+                                'random_state': seed + outer_fold_idx + trial.number,
+                                'n_jobs': -1,
+                                'verbose': -1,
+                            }
+
+                            temp_los_model = LightGBMModel(params=trial_los_params)
+                            temp_los_model.train(
+                                X_optuna_los_train, y_optuna_los_train,
+                                X_optuna_los_val, y_optuna_los_val, # Pass validation set to Optuna trial
+                                early_stopping_rounds=optuna_los_config.get('early_stopping_rounds_trial', 10) # Short ES for trials
+                            )
+                            preds_val_los = temp_los_model.predict(X_optuna_los_val)
+                            mae = mean_absolute_error(y_optuna_los_val, preds_val_los)
+                            return mae # Optuna minimizes this
+
+                        study_los = optuna.create_study(direction='minimize',
+                                                        sampler=optuna.samplers.TPESampler(seed=seed + outer_fold_idx + 200))
+                        study_los.optimize(los_objective, n_trials=n_trials_los, timeout=timeout_los)
+
+                        best_los_params_optuna = study_los.best_params
+                        best_los_score_optuna = study_los.best_value
+                        logger.info(f"Outer Fold {outer_fold_idx + 1}: Best LoS Regressor params from Optuna: {best_los_params_optuna}, Best MAE: {best_los_score_optuna:.4f}")
+                        wandb.log({
+                            f"outer_fold_{outer_fold_idx+1}/los_optuna_best_params": best_los_params_optuna,
+                            f"outer_fold_{outer_fold_idx+1}/los_optuna_best_mae": best_los_score_optuna
+                        })
+
+                        # Update los_regressor_params with the best ones from Optuna for the final model
+                        # Ensure objective and metric are correctly set for regression, Optuna might only tune structural ones
+                        final_los_params = los_regressor_params.copy() # Start with base
+                        final_los_params.update(best_los_params_optuna) # Override with Optuna's best
+                        final_los_params['objective'] = 'regression_l1' # Ensure it's set
+                        final_los_params['metric'] = 'mae'              # Ensure it's set
+
+                        los_model = LightGBMModel(params=final_los_params)
+                        # Train final LoS model for this outer fold on all available LoS training data for this fold
+                        los_model.train(X_los_train_fold_processed, y_los_outer_train_cleaned,
+                                        early_stopping_rounds=lgbm_los_config.get('early_stopping_rounds_final', 20)) # Potentially different ES for final model
+                    else:
+                        if use_optuna_for_los: # Log why Optuna was skipped if it was enabled
+                             logger.warning(f"Outer Fold {outer_fold_idx + 1}: Skipping Optuna for LoS due to insufficient data ({X_los_train_fold_processed.shape[0]} samples). Using base lgbm_los_params.")
+                        # No Optuna, or not enough data for Optuna split: train with predefined/base params
+                        los_model.train(X_los_train_fold_processed, y_los_outer_train_cleaned,
+                                        early_stopping_rounds=lgbm_los_config.get('early_stopping_rounds_final', 20))
+
                     predicted_los_outer_test = los_model.predict(X_outer_test_processed)
 
                     # Ensure predictions are non-negative
