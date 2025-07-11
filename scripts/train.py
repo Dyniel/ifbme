@@ -1304,7 +1304,7 @@ def main(config_path):
                            f"outer_fold_{outer_fold_idx + 1}/meta_gl_score": gl_score_meta_outer,
                            "outer_fold": outer_fold_idx + 1})
                 logger.info(
-                    f"Outer Fold {outer_fold_idx + 1} Meta-Learner: AUROC={auroc_meta_outer:.4f}, Acc={acc_meta_outer:.4f}, DTscore={dt_score_meta_outer:.4f}, GLscore={gl_score_meta_outer:.4f}")
+                    f"Outer Fold {outer_fold_idx + 1} Meta-Learner: AUROC={auroc_meta_outer:.4f}, Acc={acc_meta_outer:.4f}, DTscore={dt_score_meta_outer:.4f}, GLscore={gl_score_meta_outer:.4f} (DTscore={dt_score_meta_outer:.4f} + LSscore={current_ls_score:.4f})")
 
                 # --- Accumulate predictions for CSV logging ---
                 all_test_indices_list.append(outer_test_idx)
@@ -1445,7 +1445,7 @@ def main(config_path):
                          f"outer_fold_{outer_fold_idx + 1}/sv_gl_score": gl_score_sv_outer,
                          "outer_fold": outer_fold_idx + 1})
                     logger.info(
-                        f"Outer Fold {outer_fold_idx + 1} Soft Vote: AUROC={auroc_sv_outer:.4f}, Acc={acc_sv_outer:.4f}, DTscore={dt_score_sv_outer:.4f}, GLscore={gl_score_sv_outer:.4f}")
+                        f"Outer Fold {outer_fold_idx + 1} Soft Vote: AUROC={auroc_sv_outer:.4f}, Acc={acc_sv_outer:.4f}, DTscore={dt_score_sv_outer:.4f}, GLscore={gl_score_sv_outer:.4f} (DTscore={dt_score_sv_outer:.4f} + LSscore={current_ls_score:.4f})")
                 else:
                     logger.warning(
                         f"Outer Fold {outer_fold_idx + 1}: Soft Voting not performed (no active models with positive weights or zero total weight).")
@@ -1480,6 +1480,20 @@ def main(config_path):
                 avg_val = np.nanmean(values)
                 wandb.summary[f"ncv_meta_avg_{metric_name_meta}"] = avg_val
                 logger.info(f"Meta-Learner Average {metric_name_meta.replace('_', ' ').capitalize()}: {avg_val:.4f}")
+        # Detailed GL Score printout for Meta-Learner
+        avg_meta_gl_score = np.nanmean(outer_fold_metrics_meta['gl_score'])
+        avg_meta_dt_score = np.nanmean(outer_fold_metrics_meta['dt_score'])
+        # avg_ls_score needs to be defined before this point, or use np.nanmean(outer_fold_los_metrics['ls_score'])
+        # Assuming avg_ls_score will be available from the LoS summary section that comes later,
+        # or computed just before this summary block. For now, let's compute it here if not available.
+        if 'avg_ls_score' not in locals() and 'avg_ls_score' not in globals(): # Check if avg_ls_score is already computed
+            current_avg_ls_score = np.nanmean(outer_fold_los_metrics['ls_score']) if outer_fold_los_metrics['ls_score'] else np.nan
+        else:
+            current_avg_ls_score = avg_ls_score # Use existing if available
+
+        if not np.isnan(avg_meta_gl_score): # Only print if GL score is valid
+            logger.info(f"Meta-Learner Average GLscore: {avg_meta_gl_score:.4f} (Avg DTscore={avg_meta_dt_score:.4f} + Avg LSscore={current_avg_ls_score:.4f})")
+
     else:
         logger.info("Meta-Learner metrics not computed or all NaN.")
         # Log NaN for all expected summary metrics if meta-learner didn't run or all were NaN
@@ -1500,6 +1514,17 @@ def main(config_path):
                 avg_val = np.nanmean(values)
                 wandb.summary[f"ncv_sv_avg_{metric_name_sv}"] = avg_val
                 logger.info(f"Soft Voting Average {metric_name_sv.replace('_', ' ').capitalize()}: {avg_val:.4f}")
+        # Detailed GL Score printout for Soft Voting
+        avg_sv_gl_score = np.nanmean(outer_fold_metrics_soft_vote['gl_score'])
+        avg_sv_dt_score = np.nanmean(outer_fold_metrics_soft_vote['dt_score'])
+        # Assuming avg_ls_score is available from LoS summary or computed earlier
+        if 'avg_ls_score' not in locals() and 'avg_ls_score' not in globals():
+            current_avg_ls_score_sv = np.nanmean(outer_fold_los_metrics['ls_score']) if outer_fold_los_metrics['ls_score'] else np.nan
+        else:
+            current_avg_ls_score_sv = avg_ls_score
+
+        if not np.isnan(avg_sv_gl_score): # Only print if GL score is valid
+            logger.info(f"Soft Voting Average GLscore: {avg_sv_gl_score:.4f} (Avg DTscore={avg_sv_dt_score:.4f} + Avg LSscore={current_avg_ls_score_sv:.4f})")
     else:
         logger.info("Soft Voting metrics not computed or all NaN.")
         # Log NaN for all expected summary metrics if soft voting didn't run or all were NaN

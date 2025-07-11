@@ -150,18 +150,30 @@ class LightGBMModel:
 
     def predict(self, X_test):
         """
-        Predicts class labels.
+        Predicts class labels or regression values.
 
         Args:
             X_test (pd.DataFrame or np.ndarray): Test features.
 
         Returns:
-            np.ndarray: Predicted class labels.
+            np.ndarray: Predicted class labels or regression values.
         """
-        proba = self.predict_proba(X_test)
-        if self.params.get('objective') == 'binary':
-            return (proba > 0.5).astype(int) # Threshold for binary
-        else: # multiclass
+        proba = self.predict_proba(X_test) # For regression, proba actually holds the predicted values
+
+        # Determine if the task is regression based on the objective
+        # This check should ideally mirror the logic in the train() method or rely on a stored task type
+        objective = self.params.get('objective', '').lower()
+        is_regression = any(reg_obj in objective for reg_obj in
+                              ['regression', 'regression_l1', 'regression_l2', 'mae', 'mse', 'huber', 'quantile', 'poisson', 'gamma', 'tweedie'])
+
+        if is_regression:
+            return proba # For regression, return the direct output
+        elif objective == 'binary':
+            return (proba > 0.5).astype(int) # Threshold for binary classification
+        else: # multiclass classification
+            # Ensure proba is 2D for argmax, predict_proba should already handle this for classification
+            if proba.ndim == 1 and objective != 'binary': # Should not happen if predict_proba is correct for multiclass
+                 raise ValueError(f"Expected 2D probabilities for multiclass objective '{objective}', but got 1D.")
             return np.argmax(proba, axis=1)
 
     def save_model(self, filepath):
