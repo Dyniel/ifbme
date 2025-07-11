@@ -149,14 +149,16 @@ def main(config_path):
     outer_fold_metrics_soft_vote = {'accuracy': [], 'auroc': [], 'f1': [], 'precision': [], 'recall': []}
 
     # Convert to NumPy for SKFold if not already (assuming X_full_raw_df and y_full_raw_series are pandas)
-    X_full_for_split = X_full_raw_df # Keep as DataFrame for now, will be converted after preproc if needed or by models
+    X_full_for_split = X_full_raw_df  # Keep as DataFrame for now, will be converted after preproc if needed or by models
 
     # --- Target Variable Encoding ---
     from sklearn.preprocessing import LabelEncoder
     le = LabelEncoder()
-    y_full_raw_series_encoded = pd.Series(le.fit_transform(y_full_raw_series), name=y_full_raw_series.name, index=y_full_raw_series.index)
+    y_full_raw_series_encoded = pd.Series(le.fit_transform(y_full_raw_series), name=y_full_raw_series.name,
+                                          index=y_full_raw_series.index)
     class_mapping = dict(zip(le.classes_, le.transform(le.classes_)))
-    logger.info(f"Target variable '{y_full_raw_series.name}' encoded. Mapping: {class_mapping}. Unique values after encoding: {y_full_raw_series_encoded.unique()}")
+    logger.info(
+        f"Target variable '{y_full_raw_series.name}' encoded. Mapping: {class_mapping}. Unique values after encoding: {y_full_raw_series_encoded.unique()}")
     # Use the encoded series for splitting
     y_full_for_split = y_full_raw_series_encoded
     # --- End Target Variable Encoding ---
@@ -171,22 +173,25 @@ def main(config_path):
     # y_full_for_split_np = y_full_for_split.to_numpy() if isinstance(y_full_for_split, pd.Series) else y_full_for_split
 
     for outer_fold_idx, (outer_train_idx, outer_test_idx) in enumerate(
-            outer_skf.split(X_full_raw_df, y_full_for_split)): # Use X_full_raw_df for splitting indices
+            outer_skf.split(X_full_raw_df, y_full_for_split)):  # Use X_full_raw_df for splitting indices
         logger.info(f"===== Starting Outer Fold {outer_fold_idx + 1}/{n_outer_folds} =====")
 
         # Get DataFrame/Series slices for this outer fold
         X_outer_train_raw_fold_df = X_full_raw_df.iloc[outer_train_idx]
-        y_outer_train_fold_series = y_full_for_split.iloc[outer_train_idx] # Use encoded y
+        y_outer_train_fold_series = y_full_for_split.iloc[outer_train_idx]  # Use encoded y
         X_outer_test_raw_fold_df = X_full_raw_df.iloc[outer_test_idx]
-        y_outer_test_fold_series = y_full_for_split.iloc[outer_test_idx]   # Use encoded y
-            outer_skf.split(X_full_for_split, y_full_for_split)):
-        logger.info(f"===== Starting Outer Fold {outer_fold_idx + 1}/{n_outer_folds} =====")
-
-        # Get DataFrame/Series slices for this outer fold
-        X_outer_train_raw_fold_df = X_full_raw_df.iloc[outer_train_idx]
-        y_outer_train_fold_series = y_full_raw_series.iloc[outer_train_idx]
-        X_outer_test_raw_fold_df = X_full_raw_df.iloc[outer_test_idx]
-        y_outer_test_fold_series = y_full_raw_series.iloc[outer_test_idx]
+        y_outer_test_fold_series = y_full_for_split.iloc[outer_test_idx]  # Use encoded y
+        # The following block was a duplicated and incorrectly indented section, causing the IndentationError
+        # and using non-encoded y_outer_train_fold_series / y_outer_test_fold_series.
+        # It has been removed.
+        # outer_skf.split(X_full_for_split, y_full_for_split)):
+        # logger.info(f"===== Starting Outer Fold {outer_fold_idx + 1}/{n_outer_folds} =====")
+        #
+        # # Get DataFrame/Series slices for this outer fold
+        # X_outer_train_raw_fold_df = X_full_raw_df.iloc[outer_train_idx]
+        # y_outer_train_fold_series = y_full_raw_series.iloc[outer_train_idx]
+        # X_outer_test_raw_fold_df = X_full_raw_df.iloc[outer_test_idx]
+        # y_outer_test_fold_series = y_full_raw_series.iloc[outer_test_idx]
 
         logger.debug(
             f"Outer Fold {outer_fold_idx + 1}: X_outer_train_raw_fold_df shape {X_outer_train_raw_fold_df.shape}, X_outer_test_raw_fold_df shape {X_outer_test_raw_fold_df.shape}")
