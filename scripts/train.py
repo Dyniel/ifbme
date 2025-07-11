@@ -18,6 +18,7 @@ import logging
 import pandas as pd
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import optuna # Import Optuna
 
 # Project-specific imports
 from data_utils.balancing import RSMOTEGAN
@@ -330,6 +331,15 @@ def main(config_path):
     outer_fold_metrics_meta = {'accuracy': [], 'auroc': [], 'f1': [], 'precision': [], 'recall': []}
     outer_fold_metrics_soft_vote = {'accuracy': [], 'auroc': [], 'f1': [], 'precision': [], 'recall': []}
 
+    # For accumulating predictions and actuals for final CSV logging
+    all_test_indices_list = []
+    all_y_test_list = []
+    all_preds_meta_list = [] # For DTestimation.csv (predicted outcomeType)
+    all_actual_los_list = [] # For LSestimation.csv (actual lengthOfStay)
+    # If patient IDs are consistently available and aligned with X_full_raw_df.index:
+    all_patient_ids_list = []
+
+
     X_full_for_split = X_full_raw_df
 
     from sklearn.preprocessing import LabelEncoder
@@ -496,19 +506,107 @@ def main(config_path):
                 X_inner_fold_train_balanced, y_inner_fold_train_balanced = X_inner_fold_train, y_inner_fold_train
 
             if config.get('ensemble', {}).get('train_lgbm', True):
-                logger.info(f"Inner Fold {inner_fold_idx + 1}: Training LightGBM...")
+                logger.info(f"Inner Fold {inner_fold_idx + 1}: Training LightGBM with Optuna...")
                 try:
                     lgbm_config = config.get('ensemble', {}).get('lgbm_params', {})
-                    lgbm_inner_fold_model = LightGBMModel(
-                        params=lgbm_config.get('model_specific_params'),
-                        num_leaves=lgbm_config.get('num_leaves', 10000),
-                        class_weight=lgbm_config.get('class_weight', 'balanced')
-                    )
+                    optuna_lgbm_config = config.get('optuna', {}).get('lgbm', {})
+                    n_trials_lgbm = optuna_lgbm_config.get('n_trials', 20)
+
+                    def lgbm_objective(trial):
+                        # Define hyperparameter search space for Optuna
+                        lgbm_params = {
+                            'objective': 'binary' if num_classes == 2 else 'multiclass',
+                            'metric': 'binary_logloss' if num_classes == 2 else 'multi_logloss',
+                            'n_estimators': trial.suggest_int('n_estimators', lgbm_config.get('num_boost_round', 1000) // 5, lgbm_config.get('num_boost_round', 1000) * 2),
+                            'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.3, log=True),
+                            'num_leaves': trial.suggest_int('num_leaves', 20, lgbm_config.get('num_leaves', 31) * 5, log=True), # Max value was 10000, reducing for Optuna
+                            'max_depth': trial.suggest_int('max_depth', -1, 15), # -1 means no limit
+                            'min_child_samples': trial.suggest_int('min_child_samples', 5, 100),
+                            'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+                            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+                            'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
+                            'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
+                            'class_weight': lgbm_config.get('class_weight', 'balanced'),
+                            'random_state': seed + outer_fold_idx + inner_fold_idx,
+                            'n_jobs': -1, # Use all available cores
+                            'verbose': -1, # Suppress LightGBM's own verbosity during Optuna trials
+                        }
+                        if num_classes > 2:
+                            lgbm_params['num_class'] = num_classes
+
+                        model = LightGBMModel(params=lgbm_params) # Use the class wrapper
+                        # Train with early stopping on validation set
+                        # The train method of LightGBMModel needs to return the score for Optuna
+                        # For now, we assume it trains and we get score from predict_proba
+                        # This might need adjustment in LightGBMModel or here to directly get best score
+
+                        # We need a temporary model instance for each trial
+                        temp_lgbm_model = LightGBMModel(params=lgbm_params)
+                        temp_lgbm_model.train(
+                            X_inner_fold_train_balanced, y_inner_fold_train_balanced,
+                            X_inner_fold_val, y_inner_fold_val,
+                            # num_boost_round passed via n_estimators in lgbm_params
+                            early_stopping_rounds=lgbm_config.get('early_stopping_rounds', 20) # Shorter for Optuna trials
+                        )
+
+                        preds_proba = temp_lgbm_model.predict_proba(X_inner_fold_val)
+
+                        if num_classes == 2:
+                            # Use AUROC for binary classification as it's often preferred for imbalanced data
+                            # And it's a common metric for Optuna to optimize
+                            try:
+                                score = roc_auc_score(y_inner_fold_val, preds_proba if preds_proba.ndim == 1 else preds_proba[:, 1])
+                                return score # Optuna maximizes this
+                            except ValueError: # Handle cases where only one class is present in y_inner_fold_val
+                                return 0.0 # Return a poor score
+                        else:
+                            # For multiclass, logloss is fine, Optuna minimizes this
+                            # This part needs careful handling of predict_proba output for multi_logloss
+                            # For now, let's stick to a placeholder if we need to minimize logloss.
+                            # The current LightGBMModel.train uses binary_logloss or multi_logloss for early stopping.
+                            # We'll use the best score from the model's internal evaluation if possible, or roc_auc for now.
+                            # Placeholder: if multiclass, this needs to be log_loss and Optuna direction set to 'minimize'
+                            try:
+                                score = roc_auc_score(y_inner_fold_val, preds_proba, multi_class='ovr', average='weighted')
+                                return score # Optuna maximizes this
+                            except ValueError:
+                                return 0.0
+
+
+                    study_direction = 'maximize' if num_classes == 2 else 'maximize' # Assuming AUROC for both for now
+                    study_lgbm = optuna.create_study(direction=study_direction,
+                                                     sampler=optuna.samplers.TPESampler(seed=seed + outer_fold_idx + inner_fold_idx))
+                    study_lgbm.optimize(lgbm_objective, n_trials=n_trials_lgbm,
+                                        timeout=optuna_lgbm_config.get('timeout_seconds_per_fold', 600)) # Add a timeout
+
+                    best_params_lgbm = study_lgbm.best_params
+                    best_score_lgbm = study_lgbm.best_value
+                    logger.info(f"Inner Fold {inner_fold_idx + 1}: Best LGBM params from Optuna: {best_params_lgbm}, Best Score (AUROC/LogLoss): {best_score_lgbm}")
+                    wandb.log({
+                        f"outer_fold_{outer_fold_idx+1}/inner_fold_{inner_fold_idx+1}/lgbm_best_params": best_params_lgbm,
+                        f"outer_fold_{outer_fold_idx+1}/inner_fold_{inner_fold_idx+1}/lgbm_best_score": best_score_lgbm
+                    })
+
+                    # Train final LGBM model for this inner fold using best params
+                    final_lgbm_params = {
+                        'objective': 'binary' if num_classes == 2 else 'multiclass',
+                        'metric': 'binary_logloss' if num_classes == 2 else 'multi_logloss',
+                        'class_weight': lgbm_config.get('class_weight', 'balanced'),
+                        'random_state': seed + outer_fold_idx + inner_fold_idx,
+                        'n_jobs': -1,
+                        'verbose': -1, # Keep it less verbose for final model training too
+                    }
+                    if num_classes > 2:
+                        final_lgbm_params['num_class'] = num_classes
+
+                    final_lgbm_params.update(best_params_lgbm) # Add Optuna's best params
+
+                    lgbm_inner_fold_model = LightGBMModel(params=final_lgbm_params)
                     lgbm_inner_fold_model.train(
                         X_inner_fold_train_balanced, y_inner_fold_train_balanced,
                         X_inner_fold_val, y_inner_fold_val,
-                        num_boost_round=lgbm_config.get('num_boost_round', 1000),
-                        early_stopping_rounds=lgbm_config.get('early_stopping_rounds', 50)
+                        # num_boost_round is now part of best_params_lgbm as n_estimators
+                        early_stopping_rounds=lgbm_config.get('early_stopping_rounds', 50) # Use original early stopping for final model
                     )
 
                     # Get probabilities
@@ -919,14 +1017,67 @@ def main(config_path):
             logger.info(f"Outer Fold {outer_fold_idx + 1}: Training XGBoost Meta-Learner...")
             try:
                 meta_config = config.get('ensemble', {}).get('meta_learner_xgb_params', {})
+                optuna_meta_config = config.get('optuna', {}).get('xgboost_meta', {})
+
                 xgb_meta_model_outer = XGBoostMetaLearner(
-                    params=meta_config.get('model_specific_params'),
-                    depth=meta_config.get('depth', 3)
+                    params=meta_config.get('model_specific_params'), # Initial base params
+                    depth=meta_config.get('depth', 3) # Default depth, Optuna can override if 'max_depth' is tuned
                 )
+
+                # Pass X_outer_test_processed and y_outer_test for validation if Optuna needs it
+                # However, XGBoostMetaLearner's train method expects X_val, y_val to be from the *training set* for Optuna,
+                # which is X_meta_train_outer and y_meta_train_outer itself if we want to use a validation split from that.
+                # For meta-learner, typically we train on all OOF preds. If Optuna needs a val set,
+                # it should split X_meta_train_outer. The current XGBoostMetaLearner setup implies
+                # X_val, y_val passed to its train are for *that specific training run*.
+                # Let's assume for now that if Optuna is used, it needs a validation set derived from X_meta_train_outer.
+                # The XGBoostMetaLearner current Optuna objective uses the evals_list, which can include a validation set.
+                # We will pass a portion of X_meta_train_outer as validation for Optuna if enabled.
+
+                X_meta_val_optuna, y_meta_val_optuna = None, None
+                if optuna_meta_config.get('use_optuna_for_meta', False) and X_meta_train_outer.shape[0] > 10: # Basic check
+                    # Simple split for Optuna validation - can be improved (e.g. stratified)
+                    # This split is ONLY for Optuna's internal validation during hyperparameter search.
+                    # The final model will be trained on the full X_meta_train_outer.
+                    # Note: The XGBoostMetaLearner.train() method itself doesn't do this split.
+                    # It expects X_val, y_val. We need to decide if we pass a split here, or if Optuna
+                    # runs CV internally (which it can). The current setup of XGBoostPruningCallback
+                    # uses an 'eval' set.
+                    # For simplicity, we'll rely on XGBoost's early stopping with X_val if provided.
+                    # Optuna will use this X_val for its objective.
+                    # The meta-learner is trained on OOF predictions, so a further split might reduce data too much.
+                    # The `train` method of `XGBoostMetaLearner` already accepts X_val, y_val.
+                    # We should pass X_meta_train_outer and y_meta_train_outer as X_train, y_train
+                    # and potentially NOT pass X_val, y_val to Optuna, letting it use its default (e.g. CV)
+                    # or the early stopping within the trial based on the 'eval' set if only train is in evals_list.
+                    # The current XGBoostMetaLearner's Optuna objective uses `evals_list` which can have `dval`.
+                    # We will train the meta-learner on the full X_meta_train_outer and y_meta_train_outer.
+                    # For Optuna, if X_val/y_val are required by its objective, they should be passed.
+                    # The current XGBoostMetaLearner.train() uses X_val, y_val for early stopping in trials.
+                    # We will *not* split X_meta_train_outer here. XGBoostMetaLearner's train will use
+                    # its internal logic for validation if X_val, y_val are passed to it.
+                    # The current meta-learner trains on all OOF data without a val split.
+                    # So, for Optuna, we also won't provide a separate val split to its train method.
+                    # It will use early stopping on the training data itself if no X_val is passed,
+                    # or if X_val is passed, it will use that.
+                    # The warning in XGBoostMetaLearner about X_val/y_val not provided for early stopping applies.
+                    pass # No explicit split here for X_meta_val_optuna
+
                 xgb_meta_model_outer.train(
                     X_meta_train_outer, y_meta_train_outer,
+                    # X_val and y_val for meta-learner are typically None, as it trains on all OOF.
+                    # If Optuna needs a validation set, it should be handled by its configuration
+                    # or by passing a split of X_meta_train_outer here.
+                    # For now, we pass None, and Optuna in XGBoostMetaLearner will use training metrics
+                    # if no validation set is part of evals_list.
+                    X_val=None, # Or a split of X_meta_train_outer if desired for Optuna
+                    y_val=None, # Or a split of y_meta_train_outer
                     num_boost_round=meta_config.get('num_boost_round', 200),
-                    early_stopping_rounds=meta_config.get('early_stopping_rounds', 20)
+                    early_stopping_rounds=meta_config.get('early_stopping_rounds', 20), # For final model
+                    use_optuna=optuna_meta_config.get('use_optuna_for_meta', False),
+                    optuna_n_trials=optuna_meta_config.get('n_trials', 15),
+                    optuna_timeout=optuna_meta_config.get('timeout_seconds_fold', 300),
+                    wandb_run=wandb.run # Pass the W&B run object
                 )
                 logger.info(f"Outer Fold {outer_fold_idx + 1}: XGBoost Meta-Learner trained.")
 
@@ -980,10 +1131,51 @@ def main(config_path):
                            "outer_fold": outer_fold_idx + 1})
                 logger.info(
                     f"Outer Fold {outer_fold_idx + 1} Meta-Learner: AUROC={auroc_meta_outer:.4f}, Acc={acc_meta_outer:.4f}")
+
+                # --- Accumulate predictions for CSV logging ---
+                all_test_indices_list.append(outer_test_idx)
+                all_y_test_list.append(y_outer_test) # Actual outcomeType
+                all_preds_meta_list.append(final_preds_meta_labels_outer) # Predicted outcomeType by meta-learner
+
+                # Get actual lengthOfStay for these test indices from the original X_full_raw_df
+                # Ensure 'lengthofStay' is a valid column name. From logs, it seems to be.
+                los_column_name = 'lengthofStay' # As seen in logs
+                if los_column_name in X_full_raw_df.columns:
+                    actual_los_fold = X_full_raw_df.iloc[outer_test_idx][los_column_name].values
+                    all_actual_los_list.append(actual_los_fold)
+                else:
+                    logger.warning(f"Column '{los_column_name}' not found in X_full_raw_df. Cannot log actual Length of Stay.")
+                    all_actual_los_list.append(np.full(len(outer_test_idx), np.nan)) # Append NaNs if not found
+
+                # Capture patient IDs if patient_id_col_name_for_gnn is set and valid
+                if patient_id_col_name_for_gnn and patient_id_col_name_for_gnn in X_full_raw_df.columns:
+                    patient_ids_fold = X_full_raw_df.iloc[outer_test_idx][patient_id_col_name_for_gnn].values
+                    all_patient_ids_list.append(patient_ids_fold)
+                elif X_full_raw_df.index.name == patient_id_col_name_for_gnn : # If it was the index
+                     patient_ids_fold = X_full_raw_df.iloc[outer_test_idx].index.values
+                     all_patient_ids_list.append(patient_ids_fold)
+                else: # Fallback to original index if no specific patient ID column
+                    patient_ids_fold = X_full_raw_df.iloc[outer_test_idx].index.values
+                    all_patient_ids_list.append(patient_ids_fold)
+                # --- End Accumulate predictions ---
+
             except Exception as e:
                 logger.error(f"Outer Fold {outer_fold_idx + 1}: Error during Meta-Learner: {e}")
                 for key in outer_fold_metrics_meta.keys(): outer_fold_metrics_meta[key].append(np.nan)
                 wandb.log({f"outer_fold_{outer_fold_idx + 1}/meta_auroc": np.nan, "outer_fold": outer_fold_idx + 1})
+                # Also append NaNs or empty arrays to tracking lists if meta-learner fails for a fold
+                all_test_indices_list.append(outer_test_idx) # Still log indices
+                all_y_test_list.append(y_outer_test)
+                all_preds_meta_list.append(np.full(len(y_outer_test), np.nan)) # NaN for predictions
+                if 'lengthofStay' in X_full_raw_df.columns:
+                     all_actual_los_list.append(X_full_raw_df.iloc[outer_test_idx]['lengthofStay'].values)
+                else:
+                     all_actual_los_list.append(np.full(len(y_outer_test), np.nan))
+                if patient_id_col_name_for_gnn and patient_id_col_name_for_gnn in X_full_raw_df.columns:
+                    all_patient_ids_list.append(X_full_raw_df.iloc[outer_test_idx][patient_id_col_name_for_gnn].values)
+                else:
+                    all_patient_ids_list.append(X_full_raw_df.iloc[outer_test_idx].index.values)
+
 
         soft_vote_weights = config.get('ensemble', {}).get('soft_vote_weights', {})
 
@@ -1110,6 +1302,70 @@ def main(config_path):
     else:
         logger.info("Soft Voting metrics not computed or all NaN.")
         wandb.summary["ncv_sv_avg_auroc"] = np.nan
+
+    # --- Process and Log Accumulated Predictions ---
+    if all_test_indices_list:
+        try:
+            logger.info("Processing accumulated predictions for CSV logging...")
+            # Concatenate results from all folds
+            all_indices_flat = np.concatenate(all_test_indices_list)
+            all_y_test_flat = np.concatenate(all_y_test_list)
+            all_preds_meta_flat = np.concatenate(all_preds_meta_list)
+            all_actual_los_flat = np.concatenate(all_actual_los_list)
+            all_patient_ids_flat = np.concatenate(all_patient_ids_list)
+
+            # Create a DataFrame for DTestimation.csv
+            # Sort by original index to ensure consistent order if needed, though not strictly necessary for a simple vector.
+            # df_dtest = pd.DataFrame({
+            # 'original_index': all_indices_flat,
+            # 'patient_id': all_patient_ids_flat, # patient_id or original_index
+            # 'predicted_outcomeType': all_preds_meta_flat, # This is DTestimation
+            # 'actual_outcomeType': all_y_test_flat
+            # }).sort_values(by='original_index').reset_index(drop=True)
+
+            # Simpler: just the prediction vector as requested.
+            # We need to ensure the order is meaningful, e.g. sorted by patient_id or original index.
+            # For now, let's create them based on concatenation order, assuming NCV folds are processed sequentially.
+            # To ensure the vectors correspond to the original dataset order for the test samples:
+
+            # Create a mapping from original index to prediction/actuals
+            results_df = pd.DataFrame({
+                'original_index': all_indices_flat,
+                'patient_id': all_patient_ids_flat,
+                'predicted_outcomeType': all_preds_meta_flat,
+                'actual_lengthOfStay': all_actual_los_flat,
+                'actual_outcomeType': all_y_test_flat
+            })
+            # Sort by the original index to restore order of samples as they appeared in X_full_raw_df
+            results_df_sorted = results_df.sort_values(by='original_index').reset_index(drop=True)
+
+            output_dir = config.get('output_dir', 'outputs')
+            os.makedirs(output_dir, exist_ok=True) # Ensure the output directory exists
+
+            # DTestimation.csv: vector of predicted discharge type (outcomeType)
+            dt_estimation_df = pd.DataFrame({'predicted_outcome': results_df_sorted['predicted_outcomeType']})
+            dt_estimation_path = os.path.join(output_dir, "DTestimation.csv")
+            dt_estimation_df.to_csv(dt_estimation_path, index=False, header=True) # header=True for clarity
+            logger.info(f"Saved DTestimation.csv to {dt_estimation_path}")
+            wandb.log_artifact(dt_estimation_path, name="DTestimation", type="predictions")
+
+            # LSestimation.csv: vector of (actual) length of stay
+            ls_estimation_df = pd.DataFrame({'actual_lengthOfStay': results_df_sorted['actual_lengthOfStay']})
+            ls_estimation_path = os.path.join(output_dir, "LSestimation.csv")
+            ls_estimation_df.to_csv(ls_estimation_path, index=False, header=True) # header=True for clarity
+            logger.info(f"Saved LSestimation.csv to {ls_estimation_path}")
+            wandb.log_artifact(ls_estimation_path, name="LSestimation", type="ground_truth_context")
+
+            # Optionally, log a combined file for easier review
+            combined_output_path = os.path.join(output_dir, "predictions_and_los_summary.csv")
+            results_df_sorted.to_csv(combined_output_path, index=False)
+            wandb.log_artifact(combined_output_path, name="full_test_set_predictions_summary", type="predictions_summary")
+
+        except Exception as e:
+            logger.error(f"Error processing or logging accumulated prediction CSVs: {e}")
+    else:
+        logger.warning("No test predictions accumulated. Skipping CSV logging for DTestimation and LSestimation.")
+    # --- End Process and Log ---
 
     wandb.finish()
     logger.info("Full Nested Cross-Validation ensemble training run finished successfully.")
