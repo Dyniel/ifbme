@@ -422,12 +422,44 @@ def main(config_path):
                 logger.info(f"Inner Fold {inner_fold_idx + 1}: Training TECO-Transformer...")
                 try:
                     teco_config = config.get('ensemble', {}).get('teco_params', {})
+
+                    # --- TECO Debug Logging Start ---
+                    logger.debug(
+                        f"TECO: X_inner_fold_train_balanced type: {type(X_inner_fold_train_balanced)}, shape: {X_inner_fold_train_balanced.shape if isinstance(X_inner_fold_train_balanced, np.ndarray) else 'N/A'}")
+                    logger.debug(
+                        f"TECO: y_inner_fold_train_balanced type: {type(y_inner_fold_train_balanced)}, shape: {y_inner_fold_train_balanced.shape if isinstance(y_inner_fold_train_balanced, np.ndarray) else 'N/A'}")
+                    if isinstance(X_inner_fold_train_balanced, np.ndarray) and X_inner_fold_train_balanced.size > 0:
+                        logger.debug(
+                            f"TECO: X_inner_fold_train_balanced sample (first 5): \n{X_inner_fold_train_balanced[:5, :min(5, X_inner_fold_train_balanced.shape[1])]} \ndtypes: {X_inner_fold_train_balanced.dtype}")
+                    if isinstance(y_inner_fold_train_balanced, np.ndarray) and y_inner_fold_train_balanced.size > 0:
+                        logger.debug(
+                            f"TECO: y_inner_fold_train_balanced sample (first 5): {y_inner_fold_train_balanced[:5]}, dtype: {y_inner_fold_train_balanced.dtype}")
+
+                    logger.debug(
+                        f"TECO: X_inner_fold_val type: {type(X_inner_fold_val)}, shape: {X_inner_fold_val.shape if isinstance(X_inner_fold_val, np.ndarray) else 'N/A'}")
+                    logger.debug(
+                        f"TECO: y_inner_fold_val type: {type(y_inner_fold_val)}, shape: {y_inner_fold_val.shape if isinstance(y_inner_fold_val, np.ndarray) else 'N/A'}")
+
+                    logger.debug(
+                        f"TECO: processed_feature_names type: {type(processed_feature_names)}, len: {len(processed_feature_names) if isinstance(processed_feature_names, list) else 'N/A'}")
+                    if isinstance(processed_feature_names, list) and len(processed_feature_names) > 0:
+                        logger.debug(f"TECO: processed_feature_names sample (first 5): {processed_feature_names[:5]}")
+                    # --- End TECO Debug Logging ---
+
                     df_inner_fold_train_teco = pd.DataFrame(X_inner_fold_train_balanced,
                                                             columns=processed_feature_names)
                     df_inner_fold_val_teco = pd.DataFrame(X_inner_fold_val, columns=processed_feature_names)
                     df_outer_test_teco = pd.DataFrame(X_outer_test_processed, columns=processed_feature_names)
 
                     teco_target_column_name = 'target_for_teco'
+
+                    # --- TECO Debug Logging for DataFrames ---
+                    logger.debug(
+                        f"TECO: df_inner_fold_train_teco shape: {df_inner_fold_train_teco.shape}, dtypes head: \n{df_inner_fold_train_teco.dtypes.head()}")
+                    if not df_inner_fold_train_teco.empty:
+                        logger.debug(
+                            f"TECO: df_inner_fold_train_teco sample head: \n{df_inner_fold_train_teco.head(2)}")
+                    # --- End TECO Debug Logging ---
 
                     train_teco_dataset_inner = TabularSequenceDataset(
                         data_frame=df_inner_fold_train_teco,
