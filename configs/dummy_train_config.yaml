@@ -19,9 +19,32 @@ dummy_data_weights: [0.85, 0.15] # Class imbalance for dummy data
 
 # --- Preprocessing Configuration ---
 preprocessing:
-  numerical_cols: [] # List of numerical column names. If empty, inferred from dtype.
+  numerical_cols: [
+    "requestDate",
+    "admissionDate",
+    "patientAge",
+    "glasgowScale",
+    "hematocrit",
+    "hemoglobin",
+    "leucocitos",
+    "lymphocytes",
+    "urea",
+    "creatinine",
+    "platelets",
+    "diuresis",
+    "lengthofStay"
+  ] # List of numerical column names. If empty, inferred from dtype.
                      # Example: ['age', 'lab_value_1']
-  categorical_cols: [] # List of categorical column names. If empty, inferred.
+  categorical_cols: [
+    "requestType",
+    "requestBedType",
+    "admissionBedType",
+    "admissionHealthUnit",
+    "patientGender",
+    "patientFfederalUnit",
+    "icdCode",
+    "blodPressure" # Assuming blodPressure might contain non-numeric strings or is better treated as categorical
+  ] # List of categorical column names. If empty, inferred.
                        # Example: ['gender', 'ethnicity']
   imputation_strategy: 'median' # For numerical: 'mean', 'median', 'most_frequent'
                                 # For categorical: 'most_frequent' or a constant like 'missing'
