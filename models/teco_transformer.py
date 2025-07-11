@@ -58,7 +58,8 @@ class TECOTransformerModel(nn.Module):
     # nhead=8, dim_feedforward=2048 are common for d_model=512
     def __init__(self, input_feature_dim, d_model=512, num_encoder_layers=4,
                  nhead=8, dim_feedforward=2048, dropout=0.1, num_classes=None,
-                 max_seq_len=500):  # max_seq_len for PositionalEncoding
+                 max_seq_len=500): # max_seq_len for PositionalEncoding
+
         """
         Args:
             input_feature_dim (int): Dimensionality of input features at each time step.
@@ -73,7 +74,8 @@ class TECOTransformerModel(nn.Module):
         """
         super(TECOTransformerModel, self).__init__()
         self.d_model = d_model
-        self.max_seq_len_config = max_seq_len  # Store for clarity if needed for debug
+        self.max_seq_len_config = max_seq_len # Store for clarity if needed for debug
+
 
         # 1. Input Embedding/Projection
         # Project input features to d_model if they are not already that dimension.
@@ -98,7 +100,8 @@ class TECOTransformerModel(nn.Module):
         # 4. Output Layer (for classification)
         self.num_classes = num_classes
         if self.num_classes is not None:
-            self.output_classifier = nn.Linear(self.d_model, self.num_classes)  # Use self.d_model and self.num_classes
+            self.output_classifier = nn.Linear(self.d_model, self.num_classes) # Use self.d_model and self.num_classes
+
 
         self._init_weights()
 
@@ -139,38 +142,33 @@ class TECOTransformerModel(nn.Module):
             # The PositionalEncoding.forward will raise a more specific error if this happens.
 
         # 1. Project input features to d_model
-        x = self.input_projection(src_sequences) * math.sqrt(self.d_model)  # Scale embeddings
+        x = self.input_projection(src_sequences) * math.sqrt(self.d_model) # Scale embeddings
 
         # 2. Add positional encoding
-        x = self.pos_encoder(x)  # x shape: (batch_size, current_seq_len, d_model)
+        x = self.pos_encoder(x) # x shape: (batch_size, current_seq_len, d_model)
 
         # --- Start Debugging/Assertion Block for TransformerEncoder input ---
-        assert isinstance(x,
-                          torch.Tensor), f"Input 'x' to TransformerEncoder (after pos_encoder) must be a Tensor. Got {type(x)}"
+        assert isinstance(x, torch.Tensor), f"Input 'x' to TransformerEncoder (after pos_encoder) must be a Tensor. Got {type(x)}"
+
         assert x.dim() == 3, f"Input 'x' to TransformerEncoder must be 3D (batch, seq, d_model). Got {x.dim()}D, shape {x.shape}"
 
         # Batch size check (can be done once, e.g. on src_sequences.shape[0])
         batch_size = x.shape[0]
         if not (batch_size > 0):
-            logger.warning(
-                f"Input 'x' batch size is {batch_size}. Expected > 0. This might be an empty batch if drop_last=False and dataset size is small.")
+             logger.warning(f"Input 'x' batch size is {batch_size}. Expected > 0. This might be an empty batch if drop_last=False and dataset size is small.")
         # Allowing empty batch to proceed to transformer_encoder if PyTorch handles it, error will be caught by try-except.
         # assert batch_size > 0, "Input 'x' batch size must be > 0."
 
-        assert current_seq_len > 0, f"Input 'x' sequence length must be > 0. Got {current_seq_len}"  # current_seq_len from src_sequences
-        assert x.shape[
-                   1] == current_seq_len, f"Sequence length of x ({x.shape[1]}) after pos_encoder should match current_seq_len ({current_seq_len})."
-        assert x.shape[
-                   2] == self.d_model, f"Input 'x' feature dim after projection must be d_model ({self.d_model}). Got {x.shape[2]}"
+        assert current_seq_len > 0, f"Input 'x' sequence length must be > 0. Got {current_seq_len}" # current_seq_len from src_sequences
+        assert x.shape[1] == current_seq_len, f"Sequence length of x ({x.shape[1]}) after pos_encoder should match current_seq_len ({current_seq_len})."
+        assert x.shape[2] == self.d_model, f"Input 'x' feature dim after projection must be d_model ({self.d_model}). Got {x.shape[2]}"
 
         if src_padding_mask is not None:
-            assert isinstance(src_padding_mask,
-                              torch.Tensor), f"src_padding_mask must be a Tensor. Got {type(src_padding_mask)}"
+            assert isinstance(src_padding_mask, torch.Tensor), f"src_padding_mask must be a Tensor. Got {type(src_padding_mask)}"
             assert src_padding_mask.dim() == 2, f"src_padding_mask must be 2D (batch, seq). Got {src_padding_mask.dim()}D, shape {src_padding_mask.shape}"
-            assert src_padding_mask.shape[
-                       0] == batch_size, f"src_padding_mask batch size ({src_padding_mask.shape[0]}) must match input 'x' batch size ({batch_size})."
-            assert src_padding_mask.shape[
-                       1] == current_seq_len, f"src_padding_mask sequence length ({src_padding_mask.shape[1]}) must match input 'x' sequence length ({current_seq_len})."
+            assert src_padding_mask.shape[0] == batch_size, f"src_padding_mask batch size ({src_padding_mask.shape[0]}) must match input 'x' batch size ({batch_size})."
+            assert src_padding_mask.shape[1] == current_seq_len, f"src_padding_mask sequence length ({src_padding_mask.shape[1]}) must match input 'x' sequence length ({current_seq_len})."
+
             assert src_padding_mask.dtype == torch.bool, f"src_padding_mask dtype must be torch.bool. Got {src_padding_mask.dtype}"
         # --- End Debugging/Assertion Block ---
 
@@ -182,10 +180,9 @@ class TECOTransformerModel(nn.Module):
             logger.error(f"Error during self.transformer_encoder(x, src_key_padding_mask=src_padding_mask) call.")
             logger.error(f"  x properties: shape={x.shape}, dtype={x.dtype}, device={x.device}")
             if src_padding_mask is not None:
-                logger.error(
-                    f"  src_padding_mask properties: shape={src_padding_mask.shape}, dtype={src_padding_mask.dtype}, device={src_padding_mask.device}")
-                if src_padding_mask.numel() > 0 and src_padding_mask.shape[
-                    0] > 0:  # Check if mask has elements and at least one batch item
+                logger.error(f"  src_padding_mask properties: shape={src_padding_mask.shape}, dtype={src_padding_mask.dtype}, device={src_padding_mask.device}")
+                if src_padding_mask.numel() > 0 and src_padding_mask.shape[0] > 0: # Check if mask has elements and at least one batch item
+
                     sample_mask_slice = src_padding_mask[0, :min(5, src_padding_mask.shape[1])]
                     logger.error(f"  src_padding_mask sample (first batch item, up to 5 elements): {sample_mask_slice}")
                 else:
@@ -200,15 +197,14 @@ class TECOTransformerModel(nn.Module):
         if self.num_classes is not None:
             # Simple mean pooling over sequence dimension, ignoring padding
             if src_padding_mask is not None:
-                inverted_padding_mask = ~src_padding_mask  # True for valid tokens
+                inverted_padding_mask = ~src_padding_mask # True for valid tokens
                 valid_tokens_mask_expanded = inverted_padding_mask.unsqueeze(-1).float()
 
                 masked_encoded_sequence = encoded_sequence * valid_tokens_mask_expanded
                 sum_embeddings = masked_encoded_sequence.sum(dim=1)
 
                 num_valid_tokens_per_sequence = inverted_padding_mask.sum(dim=1).float()
-                num_valid_tokens_per_sequence = torch.clamp(num_valid_tokens_per_sequence,
-                                                            min=1)  # Avoid division by zero
+                num_valid_tokens_per_sequence = torch.clamp(num_valid_tokens_per_sequence, min=1) # Avoid division by zero
 
                 pooled_output = sum_embeddings / num_valid_tokens_per_sequence.unsqueeze(-1)
             else:
