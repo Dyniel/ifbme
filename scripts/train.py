@@ -67,9 +67,12 @@ def main(config_path):
         config=config,
         name=wandb_config.get('run_name', "full_pipeline_run"),
         notes=wandb_config.get('run_notes', "Full training pipeline run with NCV."),
-        tags=wandb_config.get('tags', ['full_run', 'ncv'])
+        tags=wandb_config.get('tags', ['full_run', 'ncv']),
+        mode="offline"  # Ensure W&B runs in offline mode to avoid API key prompts
     )
-    logger.info(f"W&B initialized for project '{wandb_config.get('project', 'ifbme-project')}'")
+    logger.info(f"W&B initialized for project '{wandb_config.get('project', 'ifbme-project')}' in offline mode.")
+    print("WANDB init completed.")  # For debugging
+    sys.stdout.flush()  # Ensure it prints immediately
 
     device = torch.device("cuda" if torch.cuda.is_available() and config.get('use_gpu', True) else "cpu")
     logger.info(f"Using device: {device}")
@@ -100,8 +103,6 @@ def main(config_path):
     else:
         try:
             logger.info("Loading real data...")
-            # load_raw_data now expects config and base_data_path
-            # It should return X_full_df, y_full_series (or X_full_np, y_full_np)
             X_full_raw_df, y_full_raw_series = load_raw_data(config, base_data_path=config.get('data_dir', 'data/'))
             logger.info(f"Real data loaded: X_df shape {X_full_raw_df.shape}, y_series shape {y_full_raw_series.shape}")
         except Exception as e:
@@ -116,25 +117,132 @@ def main(config_path):
         raise ValueError(f"Number of classes must be at least 2. Found {num_classes}.")
 
     # --- Preprocessing Setup ---
-    # Define numerical and categorical columns from config - these must match columns in loaded data
     preproc_cfg = config.get('preprocessing', {})
-    numerical_cols = preproc_cfg.get('numerical_cols',
-                                     X_full_raw_df.select_dtypes(include=np.number).columns.tolist() if isinstance(
-                                         X_full_raw_df, pd.DataFrame) else [])
-    categorical_cols = preproc_cfg.get('categorical_cols',
-                                       X_full_raw_df.select_dtypes(include='object').columns.tolist() if isinstance(
-                                           X_full_raw_df, pd.DataFrame) else [])
+    numerical_cols_from_config = preproc_cfg.get('numerical_cols', [])
+    categorical_cols_from_config = preproc_cfg.get('categorical_cols', [])
 
-    # Ensure numerical_cols and categorical_cols are disjoint and present in the DataFrame
     if isinstance(X_full_raw_df, pd.DataFrame):
-        all_cols = X_full_raw_df.columns.tolist()
-        numerical_cols = [col for col in numerical_cols if col in all_cols]
-        categorical_cols = [col for col in categorical_cols if col in all_cols]
-        # Handle potential overlap by removing from numerical if also in categorical (or vice-versa, based on policy)
-        numerical_cols = [col for col in numerical_cols if col not in categorical_cols]
+        all_df_columns_set = set(X_full_raw_df.columns.tolist())
 
-    logger.info(f"Using numerical columns for preprocessing: {numerical_cols}")
-    logger.info(f"Using categorical columns for preprocessing: {categorical_cols}")
+        # Initialize from config or auto-detect if config lists are empty/not provided
+        if numerical_cols_from_config or categorical_cols_from_config:
+            numerical_cols = [col for col in numerical_cols_from_config if col in all_df_columns_set]
+            categorical_cols = [col for col in categorical_cols_from_config if col in all_df_columns_set]
+
+            if not numerical_cols_from_config and categorical_cols_from_config:  # Only categorical provided
+                numerical_cols = [col for col in all_df_columns_set if col not in categorical_cols]
+            elif not categorical_cols_from_config and numerical_cols_from_config:  # Only numerical provided
+                categorical_cols = [col for col in all_df_columns_set if col not in numerical_cols]
+            # If both are provided (or both empty meaning use all other columns), they are already set.
+            # If both config lists are empty, it implies user wants auto-detection for unspecified columns,
+            # but if they provided empty lists, it might mean "no columns of this type".
+            # This part of logic might need refinement if config can specify empty list to mean "no such columns".
+            # Current assumption: empty list in config = auto-detect for that type if other list is also empty/not given.
+
+        else:  # Neither numerical_cols nor categorical_cols provided in config, so auto-detect all.
+            logger.info("No numerical/categorical column lists in config. Auto-detecting all based on dtype.")
+            numerical_cols = X_full_raw_df.select_dtypes(include=np.number).columns.tolist()
+            # Include 'category' dtype as categorical by default as well
+            categorical_cols = X_full_raw_df.select_dtypes(include=['object', 'category']).columns.tolist()
+
+        # Ensure initial disjointness: if a column is in both (e.g. from config error or complex auto-detection), prefer categorical.
+        common_cols = list(set(numerical_cols) & set(categorical_cols))
+        if common_cols:
+            logger.warning(
+                f"Columns {common_cols} initially identified in both numerical and categorical. Defaulting them to categorical for safety.")
+            numerical_cols = [col for col in numerical_cols if col not in common_cols]
+
+    else:  # Not a DataFrame, rely purely on config lists
+        numerical_cols = list(numerical_cols_from_config)
+        categorical_cols = list(categorical_cols_from_config)
+        common_cols_non_df = list(set(numerical_cols) & set(categorical_cols))
+        if common_cols_non_df:
+            logger.warning(
+                f"Columns {common_cols_non_df} found in both numerical and categorical lists (non-DataFrame input). Defaulting to categorical.")
+            numerical_cols = [col for col in numerical_cols if col not in common_cols_non_df]
+
+    logger.info(f"Initial numerical_cols (config/auto-detected): {numerical_cols}")
+    logger.info(f"Initial categorical_cols (config/auto-detected): {categorical_cols}")
+
+    # Robust handling of column types and cleaning for DataFrames
+    if isinstance(X_full_raw_df, pd.DataFrame):
+        logger.info("Cleaning numerical columns and re-assigning types if necessary...")
+
+        known_placeholders = ['Not applicable', 'NA', 'N/A', '', ' ', 'NaN', 'nan',
+                              '<NA>']  # Common string representations of NaN
+
+        cols_to_move_to_categorical = []
+        final_cleaned_numerical_cols = []
+
+        for col_name in list(numerical_cols):  # Iterate over a copy of the current numerical_cols list
+            if col_name not in X_full_raw_df.columns:
+                logger.warning(f"Numerical column '{col_name}' not found in DataFrame. Skipping.")
+                continue
+
+            col_series = X_full_raw_df[col_name].copy()  # Work on a copy of the series
+
+            # If the column is of object type, it might contain string placeholders for NaNs or actual string values.
+            if col_series.dtype == 'object' or pd.api.types.is_categorical_dtype(col_series.dtype):
+                for placeholder in known_placeholders:
+                    col_series.replace(placeholder, np.nan, inplace=True)
+
+            # Attempt to convert to a numeric type. errors='coerce' turns unparseable values into NaN.
+            converted_series = pd.to_numeric(col_series, errors='coerce')
+
+            # Check the result of the conversion
+            if pd.api.types.is_numeric_dtype(converted_series):
+                # If original was object/category AND all values became NaN, it implies the column was full of non-numeric strings.
+                # Such columns are better treated as categorical.
+                if (X_full_raw_df[col_name].dtype == 'object' or pd.api.types.is_categorical_dtype(
+                        X_full_raw_df[col_name])) and converted_series.isnull().all():
+                    logger.warning(
+                        f"Column '{col_name}' (original type: {X_full_raw_df[col_name].dtype}) was designated numerical but became all NaNs after cleaning. Moving to categorical.")
+                    cols_to_move_to_categorical.append(col_name)
+                    X_full_raw_df[col_name] = converted_series  # Keep the NaNs for categorical imputer
+                else:
+                    # Successfully converted (or was already numeric), update the DataFrame.
+                    X_full_raw_df[col_name] = converted_series
+                    final_cleaned_numerical_cols.append(col_name)
+            else:
+                # Failed to convert to a numeric type even with errors='coerce' (should be rare, implies complex objects).
+                # Or, pd.to_numeric might return object type if it contains mixed non-numeric data not handled by coerce (e.g. datetimes, timedeltas if not handled earlier)
+                logger.warning(
+                    f"Column '{col_name}' (original type: {X_full_raw_df[col_name].dtype}) could not be converted to a pure numeric type (resulting dtype: {converted_series.dtype}). Moving to categorical.")
+                cols_to_move_to_categorical.append(col_name)
+                # Ensure the column in the DataFrame reflects NaNs for unparseable parts if it was object
+                if X_full_raw_df[col_name].dtype == 'object':
+                    X_full_raw_df[col_name] = converted_series  # converted_series here would have NaNs for unparseable
+
+        numerical_cols = final_cleaned_numerical_cols
+
+        # Add columns that were moved to the categorical list
+        for col_to_move in cols_to_move_to_categorical:
+            if col_to_move not in categorical_cols:
+                categorical_cols.append(col_to_move)
+
+        # Clean placeholders in all columns now considered categorical
+        for col_name_cat in list(categorical_cols):
+            if col_name_cat in X_full_raw_df.columns:
+                if X_full_raw_df[col_name_cat].dtype == 'object' or pd.api.types.is_categorical_dtype(
+                        X_full_raw_df[col_name_cat]):
+                    col_cat_series = X_full_raw_df[col_name_cat].copy()
+                    for placeholder in known_placeholders:
+                        col_cat_series.replace(placeholder, np.nan, inplace=True)
+                    X_full_raw_df[col_name_cat] = col_cat_series
+
+        # Final pass to ensure lists are unique and disjoint, and columns exist
+        all_df_columns_set = set(X_full_raw_df.columns.tolist())
+        numerical_cols = sorted(list(set(col for col in numerical_cols if col in all_df_columns_set)))
+        categorical_cols = sorted(list(set(col for col in categorical_cols if col in all_df_columns_set)))
+
+        final_common_cols = list(set(numerical_cols) & set(categorical_cols))
+        if final_common_cols:
+            logger.warning(
+                f"Columns {final_common_cols} ended up in both lists after cleaning. Prioritizing as categorical.")
+            numerical_cols = [col for col in numerical_cols if col not in final_common_cols]
+
+        logger.info(f"Final numerical columns after cleaning: {numerical_cols}")
+        logger.info(f"Final categorical columns after cleaning (includes reassigned): {categorical_cols}")
 
     # Global preprocessor - will be fit on outer train folds
     # Note: For NCV, the preprocessor should be fit *inside each outer fold* on its training split.
@@ -148,10 +256,8 @@ def main(config_path):
     outer_fold_metrics_meta = {'accuracy': [], 'auroc': [], 'f1': [], 'precision': [], 'recall': []}
     outer_fold_metrics_soft_vote = {'accuracy': [], 'auroc': [], 'f1': [], 'precision': [], 'recall': []}
 
-    # Convert to NumPy for SKFold if not already (assuming X_full_raw_df and y_full_raw_series are pandas)
-    X_full_for_split = X_full_raw_df  # Keep as DataFrame for now, will be converted after preproc if needed or by models
+    X_full_for_split = X_full_raw_df
 
-    # --- Target Variable Encoding ---
     from sklearn.preprocessing import LabelEncoder
     le = LabelEncoder()
     y_full_raw_series_encoded = pd.Series(le.fit_transform(y_full_raw_series), name=y_full_raw_series.name,
@@ -159,93 +265,65 @@ def main(config_path):
     class_mapping = dict(zip(le.classes_, le.transform(le.classes_)))
     logger.info(
         f"Target variable '{y_full_raw_series.name}' encoded. Mapping: {class_mapping}. Unique values after encoding: {y_full_raw_series_encoded.unique()}")
-    # Use the encoded series for splitting
     y_full_for_split = y_full_raw_series_encoded
-    # --- End Target Variable Encoding ---
-
-    # Ensure X_full_for_split is numpy if required by StratifiedKFold and X_full_raw_df was not DataFrame
-    # However, StratifiedKFold can often handle pandas DataFrames/Series directly for splitting indices.
-    # Let's assume X_full_raw_df is a DataFrame as per data_loader.py
-
-    # If X_full_raw_df is used directly by skf.split, it's fine.
-    # If it needs to be numpy:
-    # X_full_for_split_np = X_full_raw_df.to_numpy() if isinstance(X_full_raw_df, pd.DataFrame) else X_full_raw_df
-    # y_full_for_split_np = y_full_for_split.to_numpy() if isinstance(y_full_for_split, pd.Series) else y_full_for_split
 
     for outer_fold_idx, (outer_train_idx, outer_test_idx) in enumerate(
-            outer_skf.split(X_full_raw_df, y_full_for_split)):  # Use X_full_raw_df for splitting indices
+            outer_skf.split(X_full_raw_df, y_full_for_split)):
         logger.info(f"===== Starting Outer Fold {outer_fold_idx + 1}/{n_outer_folds} =====")
 
-        # Get DataFrame/Series slices for this outer fold
         X_outer_train_raw_fold_df = X_full_raw_df.iloc[outer_train_idx]
-        y_outer_train_fold_series = y_full_for_split.iloc[outer_train_idx]  # Use encoded y
+        y_outer_train_fold_series = y_full_for_split.iloc[outer_train_idx]
         X_outer_test_raw_fold_df = X_full_raw_df.iloc[outer_test_idx]
-        y_outer_test_fold_series = y_full_for_split.iloc[outer_test_idx]  # Use encoded y
-        # The following block was a duplicated and incorrectly indented section, causing the IndentationError
-        # and using non-encoded y_outer_train_fold_series / y_outer_test_fold_series.
-        # It has been removed.
-        # outer_skf.split(X_full_for_split, y_full_for_split)):
-        # logger.info(f"===== Starting Outer Fold {outer_fold_idx + 1}/{n_outer_folds} =====")
-        #
-        # # Get DataFrame/Series slices for this outer fold
-        # X_outer_train_raw_fold_df = X_full_raw_df.iloc[outer_train_idx]
-        # y_outer_train_fold_series = y_full_raw_series.iloc[outer_train_idx]
-        # X_outer_test_raw_fold_df = X_full_raw_df.iloc[outer_test_idx]
-        # y_outer_test_fold_series = y_full_raw_series.iloc[outer_test_idx]
+        y_outer_test_fold_series = y_full_for_split.iloc[outer_test_idx]
 
         logger.debug(
             f"Outer Fold {outer_fold_idx + 1}: X_outer_train_raw_fold_df shape {X_outer_train_raw_fold_df.shape}, X_outer_test_raw_fold_df shape {X_outer_test_raw_fold_df.shape}")
 
-        # --- Preprocessing for the current outer fold ---
-        # Fit preprocessor on this outer fold's training data
         fold_preprocessor = get_preprocessor(
-            numerical_cols=numerical_cols,  # Use list of names
-            categorical_cols=categorical_cols,  # Use list of names
+            numerical_cols=numerical_cols,
+            categorical_cols=categorical_cols,
             imputation_strategy=preproc_cfg.get('imputation_strategy', 'median'),
             scale_numerics=preproc_cfg.get('scale_numerics', True),
             handle_unknown_categorical=preproc_cfg.get('onehot_handle_unknown', 'ignore')
         )
         try:
             logger.info(f"Outer Fold {outer_fold_idx + 1}: Fitting preprocessor on X_outer_train_raw_fold_df...")
-            # fit_transform expects DataFrame
             X_outer_train_processed = fold_preprocessor.fit_transform(X_outer_train_raw_fold_df)
             X_outer_test_processed = fold_preprocessor.transform(X_outer_test_raw_fold_df)
 
-            # Get feature names after transformation for TECO if needed
             try:
                 processed_feature_names = fold_preprocessor.get_feature_names_out()
-            except Exception:  # Older sklearn might not have get_feature_names_out or it might fail
-                # Fallback: generate generic names if needed, or ensure models can handle raw numpy
+            except Exception:
                 num_processed_features = X_outer_train_processed.shape[1]
                 processed_feature_names = [f'proc_feat_{i}' for i in range(num_processed_features)]
                 logger.warning(
                     f"Could not get feature names from preprocessor. Using generic names: {processed_feature_names[:5]}...")
 
-            y_outer_train = y_outer_train_fold_series.to_numpy()  # Labels to numpy
+            y_outer_train = y_outer_train_fold_series.to_numpy()
             y_outer_test = y_outer_test_fold_series.to_numpy()
             logger.info(
                 f"Outer Fold {outer_fold_idx + 1}: Preprocessing complete. X_outer_train_processed shape {X_outer_train_processed.shape}, X_outer_test_processed shape {X_outer_test_processed.shape}")
         except Exception as e:
             logger.error(
                 f"Outer Fold {outer_fold_idx + 1}: Error during general preprocessing: {e}. Using raw data for this outer fold (if numpy).")
-            # Fallback to numpy versions if DataFrames were used
-            X_outer_train_processed = X_outer_train_raw_fold_df.to_numpy()
-            X_outer_test_processed = X_outer_test_raw_fold_df.to_numpy()
+            X_outer_train_processed = X_outer_train_raw_fold_df.to_numpy() if isinstance(X_outer_train_raw_fold_df,
+                                                                                         pd.DataFrame) else X_outer_train_raw_fold_df
+            X_outer_test_processed = X_outer_test_raw_fold_df.to_numpy() if isinstance(X_outer_test_raw_fold_df,
+                                                                                       pd.DataFrame) else X_outer_test_raw_fold_df
             y_outer_train = y_outer_train_fold_series.to_numpy()
             y_outer_test = y_outer_test_fold_series.to_numpy()
-            processed_feature_names = X_outer_train_raw_fold_df.columns.tolist()
+            processed_feature_names = X_outer_train_raw_fold_df.columns.tolist() if isinstance(
+                X_outer_train_raw_fold_df, pd.DataFrame) else [f'raw_feat_{i}' for i in
+                                                               range(X_outer_train_processed.shape[1])]
 
-        # --- Inner Cross-Validation for OOF generation ---
         inner_skf = StratifiedKFold(n_splits=n_inner_folds, shuffle=True, random_state=seed + outer_fold_idx)
         oof_preds_inner = {
             'lgbm': np.zeros((len(y_outer_train), num_classes)),
             'teco': np.zeros((len(y_outer_train), num_classes))
-            # 'stm_gnn': np.zeros((len(y_outer_train), num_classes)) # STM-GNN Removed
         }
         base_model_preds_on_outer_test_sum = {
             'lgbm': np.zeros((len(y_outer_test), num_classes)),
             'teco': np.zeros((len(y_outer_test), num_classes))
-            # 'stm_gnn': np.zeros((len(y_outer_test), num_classes)) # STM-GNN Removed
         }
 
         for inner_fold_idx, (inner_train_idx, inner_val_idx) in enumerate(
@@ -276,7 +354,6 @@ def main(config_path):
             else:
                 X_inner_fold_train_balanced, y_inner_fold_train_balanced = X_inner_fold_train, y_inner_fold_train
 
-            # --- 1. Train LightGBM (Inner Fold) ---
             if config.get('ensemble', {}).get('train_lgbm', True):
                 logger.info(f"Inner Fold {inner_fold_idx + 1}: Training LightGBM...")
                 try:
@@ -289,46 +366,80 @@ def main(config_path):
                     lgbm_inner_fold_model.train(
                         X_inner_fold_train_balanced, y_inner_fold_train_balanced,
                         X_inner_fold_val, y_inner_fold_val,
-                        num_boost_round=lgbm_config.get('num_boost_round', 1000),  # Full run params
-                        early_stopping_rounds=lgbm_config.get('early_stopping_rounds', 50)  # Full run params
+                        num_boost_round=lgbm_config.get('num_boost_round', 1000),
+                        early_stopping_rounds=lgbm_config.get('early_stopping_rounds', 50)
                     )
-                    oof_preds_inner['lgbm'][inner_val_idx] = lgbm_inner_fold_model.predict_proba(X_inner_fold_val)
-                    base_model_preds_on_outer_test_sum['lgbm'] += lgbm_inner_fold_model.predict_proba(
-                        X_outer_test_processed) / n_inner_folds
+
+                    # Get probabilities
+                    lgbm_oof_probas_raw = lgbm_inner_fold_model.predict_proba(X_inner_fold_val)
+                    lgbm_test_probas_raw = lgbm_inner_fold_model.predict_proba(X_outer_test_processed)
+
+                    # Ensure 2D shape for binary classification [prob_class_0, prob_class_1]
+                    if num_classes == 2:
+                        if lgbm_oof_probas_raw.ndim == 1:
+                            lgbm_oof_probas_2d = np.vstack([1 - lgbm_oof_probas_raw, lgbm_oof_probas_raw]).T
+                        elif lgbm_oof_probas_raw.shape[1] == 1:  # Handles cases where it might return (N,1)
+                            lgbm_oof_probas_2d = np.hstack([1 - lgbm_oof_probas_raw, lgbm_oof_probas_raw])
+                        else:
+                            lgbm_oof_probas_2d = lgbm_oof_probas_raw
+
+                        if lgbm_test_probas_raw.ndim == 1:
+                            lgbm_test_probas_2d = np.vstack([1 - lgbm_test_probas_raw, lgbm_test_probas_raw]).T
+                        elif lgbm_test_probas_raw.shape[1] == 1:
+                            lgbm_test_probas_2d = np.hstack([1 - lgbm_test_probas_raw, lgbm_test_probas_raw])
+                        else:
+                            lgbm_test_probas_2d = lgbm_test_probas_raw
+                    else:  # Multiclass, should already be (N, num_classes)
+                        lgbm_oof_probas_2d = lgbm_oof_probas_raw
+                        lgbm_test_probas_2d = lgbm_test_probas_raw
+
+                    # Assign to OOF predictions array
+                    if oof_preds_inner['lgbm'][inner_val_idx].shape == lgbm_oof_probas_2d.shape:
+                        oof_preds_inner['lgbm'][inner_val_idx] = lgbm_oof_probas_2d
+                    else:
+                        logger.error(
+                            f"LGBM OOF shape mismatch: Target shape {oof_preds_inner['lgbm'][inner_val_idx].shape}, Value shape {lgbm_oof_probas_2d.shape}. Filling with default.")
+                        oof_preds_inner['lgbm'][inner_val_idx] = np.full((len(inner_val_idx), num_classes),
+                                                                         1 / num_classes)
+
+                    # Add to base model predictions for outer test set
+                    if base_model_preds_on_outer_test_sum['lgbm'].shape == lgbm_test_probas_2d.shape:
+                        base_model_preds_on_outer_test_sum['lgbm'] += lgbm_test_probas_2d / n_inner_folds
+                    else:
+                        logger.error(
+                            f"LGBM Test Sum shape mismatch: Target shape {base_model_preds_on_outer_test_sum['lgbm'].shape}, Value shape {lgbm_test_probas_2d.shape}. Adding default.")
+                        base_model_preds_on_outer_test_sum['lgbm'] += np.full((len(y_outer_test), num_classes),
+                                                                              1 / num_classes) / n_inner_folds
+
                     logger.info(f"Inner Fold {inner_fold_idx + 1}: LightGBM training and prediction complete.")
                 except Exception as e:
                     logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during LightGBM: {e}")
-                    # Fill with default (e.g. uniform) if error, to avoid breaking concatenation
                     oof_preds_inner['lgbm'][inner_val_idx] = np.full((len(inner_val_idx), num_classes), 1 / num_classes)
                     base_model_preds_on_outer_test_sum['lgbm'] += np.full((len(y_outer_test), num_classes),
                                                                           1 / num_classes) / n_inner_folds
 
-            # --- 2. Train TECO-Transformer (Inner Fold) ---
             if config.get('ensemble', {}).get('train_teco', True):
                 logger.info(f"Inner Fold {inner_fold_idx + 1}: Training TECO-Transformer...")
                 try:
                     teco_config = config.get('ensemble', {}).get('teco_params', {})
-
-                    # Use processed_feature_names from the outer fold's preprocessor
-                    # These names correspond to the columns in X_inner_fold_train_balanced etc.
-                    # Ensure the feature names are consistent with what TabularSequenceDataset expects
                     df_inner_fold_train_teco = pd.DataFrame(X_inner_fold_train_balanced,
                                                             columns=processed_feature_names)
                     df_inner_fold_val_teco = pd.DataFrame(X_inner_fold_val, columns=processed_feature_names)
                     df_outer_test_teco = pd.DataFrame(X_outer_test_processed, columns=processed_feature_names)
 
-                    teco_target_column_name = 'target_for_teco'  # Internal name for TabularSequenceDataset
+                    teco_target_column_name = 'target_for_teco'
 
                     train_teco_dataset_inner = TabularSequenceDataset(
                         data_frame=df_inner_fold_train_teco,
                         targets=y_inner_fold_train_balanced,
-                        feature_columns=processed_feature_names,  # Pass all processed feature names
+                        feature_columns=processed_feature_names,
                         target_column_name=teco_target_column_name
                     )
                     val_teco_dataset_inner = TabularSequenceDataset(df_inner_fold_val_teco, y_inner_fold_val,
                                                                     processed_feature_names, teco_target_column_name)
                     outer_test_teco_dataset = TabularSequenceDataset(df_outer_test_teco,
                                                                      np.zeros(len(df_outer_test_teco)),
+                                                                     # Dummy targets for test
                                                                      processed_feature_names, teco_target_column_name)
 
                     batch_size_teco = teco_config.get('batch_size_teco', 32)
@@ -340,27 +451,26 @@ def main(config_path):
                                                         shuffle=False, collate_fn=basic_collate_fn)
 
                     teco_model_inner = TECOTransformerModel(
-                        input_feature_dim=len(processed_feature_names),  # From preprocessed data
+                        input_feature_dim=len(processed_feature_names),
                         d_model=teco_config.get('d_model', 512),
                         num_encoder_layers=teco_config.get('num_encoder_layers', 4),
                         nhead=teco_config.get('nhead', 8),
                         dim_feedforward=teco_config.get('dim_feedforward', 2048),
                         dropout=teco_config.get('dropout', 0.1),
                         num_classes=num_classes,
-                        max_seq_len=teco_config.get('max_seq_len', 100)  # Adjust if sequences are longer
+                        max_seq_len=teco_config.get('max_seq_len', 100)
                     ).to(device)
 
-                    teco_criterion_inner = nn.CrossEntropyLoss()  # Add class weights if needed from config
+                    teco_criterion_inner = nn.CrossEntropyLoss()
                     teco_optimizer_inner = optim.Adam(teco_model_inner.parameters(),
                                                       lr=teco_config.get('lr_teco', 1e-4))
-                    epochs_teco_inner = teco_config.get('epochs_teco_inner', 10)  # Full run epochs
+                    epochs_teco_inner = teco_config.get('epochs_teco_inner', 10)
 
                     for epoch in range(epochs_teco_inner):
                         teco_model_inner.train()
                         epoch_loss_sum = 0.0
                         for batch in train_teco_loader_inner:
                             teco_optimizer_inner.zero_grad()
-                            # Ensure batch items are on the correct device
                             sequences = batch['sequence'].to(device)
                             padding_masks = batch['padding_mask'].to(device)
                             targets = batch['target'].to(device)
@@ -380,10 +490,10 @@ def main(config_path):
                             outputs = teco_model_inner(batch['sequence'].to(device), batch['padding_mask'].to(device))
                             inner_val_preds_teco_list.append(torch.softmax(outputs, dim=1).cpu().numpy())
 
-                    if inner_val_preds_teco_list:  # Check if list is not empty
+                    if inner_val_preds_teco_list:
                         oof_preds_inner['teco'][inner_val_idx] = np.concatenate(inner_val_preds_teco_list, axis=0)[:,
                                                                  :num_classes]
-                    else:  # Handle case with no validation samples or error
+                    else:
                         oof_preds_inner['teco'][inner_val_idx] = np.full((len(inner_val_idx), num_classes),
                                                                          1 / num_classes)
 
@@ -397,7 +507,7 @@ def main(config_path):
                         base_model_preds_on_outer_test_sum['teco'] += np.concatenate(outer_test_preds_teco_list,
                                                                                      axis=0)[:,
                                                                       :num_classes] / n_inner_folds
-                    else:  # Handle empty list
+                    else:
                         base_model_preds_on_outer_test_sum['teco'] += np.full((len(y_outer_test), num_classes),
                                                                               1 / num_classes) / n_inner_folds
 
@@ -408,166 +518,130 @@ def main(config_path):
                     base_model_preds_on_outer_test_sum['teco'] += np.full((len(y_outer_test), num_classes),
                                                                           1 / num_classes) / n_inner_folds
 
-            # --- 3. Train STM-GNN (Inner Fold - Conceptual: Needs real data loader and graph features) --- STM-GNN REMOVED ---
-            # if config.get('ensemble', {}).get('train_stm_gnn', True):
-            #     logger.info(f"Inner Fold {inner_fold_idx + 1}: Training STM-GNN (Conceptual - requires graph data)...")
-            #     # STM-GNN requires graph-structured data (node features, edge indices per snapshot)
-            #     # This part needs a dedicated graph data loader and feature engineering pipeline.
-            #     # For now, we'll use placeholder predictions as in the original script.
-            #     try:
-            #         stm_gnn_config = config.get('ensemble', {}).get('stm_gnn_params', {})
-            #         # This is a placeholder. Real STM-GNN training is complex.
-            #         # 1. Prepare graph data for STM-GNN (e.g., from X_inner_fold_train_balanced)
-            #         #    This would involve creating graph snapshots.
-            #         #    num_node_features_stm = X_inner_fold_train_balanced.shape[1] # if using tabular as node features
-            #
-            #         # For this conceptual run, simulate predictions based on class distribution
-            #         class_probs_stm = np.bincount(y_inner_fold_train_balanced) / len(
-            #             y_inner_fold_train_balanced) if len(y_inner_fold_train_balanced) > 0 else np.full(num_classes,
-            #                                                                                               1 / num_classes)
-            #         if len(class_probs_stm) < num_classes:  # Ensure correct shape if some classes are missing
-            #             temp_p = np.full(num_classes, 1e-6)  # Small probability for missing classes
-            #             temp_p[:len(class_probs_stm)] = class_probs_stm
-            #             class_probs_stm = temp_p / np.sum(temp_p)
-            #
-            #         num_val_samples_stm = len(y_inner_fold_val)
-            #         dummy_stm_oof = np.random.multinomial(1, class_probs_stm, size=num_val_samples_stm) * 0.8 + \
-            #                         np.random.rand(num_val_samples_stm, num_classes) * 0.2
-            #         oof_preds_inner['stm_gnn'][inner_val_idx] = dummy_stm_oof / np.sum(dummy_stm_oof, axis=1,
-            #                                                                            keepdims=True)
-            #
-            #         num_outer_test_samples_stm = len(y_outer_test)
-            #         dummy_stm_test = np.random.multinomial(1, class_probs_stm, size=num_outer_test_samples_stm) * 0.8 + \
-            #                          np.random.rand(num_outer_test_samples_stm, num_classes) * 0.2
-            #         base_model_preds_on_outer_test_sum['stm_gnn'] += (dummy_stm_test / np.sum(dummy_stm_test, axis=1,
-            #                                                                                   keepdims=True)) / n_inner_folds
-            #         logger.info(
-            #             f"Inner Fold {inner_fold_idx + 1}: STM-GNN (conceptual placeholder) prediction complete.")
-            #     except Exception as e:
-            #         logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during STM-GNN (conceptual): {e}")
-            #         oof_preds_inner['stm_gnn'][inner_val_idx] = np.full((len(inner_val_idx), num_classes),
-            #                                                             1 / num_classes)
-            #         base_model_preds_on_outer_test_sum['stm_gnn'] += np.full((len(y_outer_test), num_classes),
-            #                                                                  1 / num_classes) / n_inner_folds
-
-        # --- Meta-Learner Training and Evaluation for Outer Fold ---
         logger.info(f"Outer Fold {outer_fold_idx + 1}: Finished generating OOF predictions from inner CV.")
         meta_features_train_outer_list = []
         if config.get('ensemble', {}).get('train_lgbm', True): meta_features_train_outer_list.append(
             oof_preds_inner['lgbm'])
         if config.get('ensemble', {}).get('train_teco', True): meta_features_train_outer_list.append(
             oof_preds_inner['teco'])
-        # if config.get('ensemble', {}).get('train_stm_gnn', True): meta_features_train_outer_list.append( # STM-GNN Removed
-        #     oof_preds_inner['stm_gnn'])
 
         if not meta_features_train_outer_list:
-            logger.error(f"Outer Fold {outer_fold_idx + 1}: No base models for meta-learner. Skipping.")
-        else:
-            X_meta_train_outer = np.concatenate(meta_features_train_outer_list, axis=1)
-            y_meta_train_outer = y_outer_train
-            logger.info(
-                f"Outer Fold {outer_fold_idx + 1}: Meta-learner training features shape: {X_meta_train_outer.shape}")
+            logger.error(
+                f"Outer Fold {outer_fold_idx + 1}: No base models for meta-learner. Skipping meta-learner and soft voting for this fold.")
+            for key in outer_fold_metrics_meta.keys(): outer_fold_metrics_meta[key].append(np.nan)
+            for key in outer_fold_metrics_soft_vote.keys(): outer_fold_metrics_soft_vote[key].append(np.nan)
+            # Continue to next outer fold
+            # wandb.log({f"outer_fold_{outer_fold_idx + 1}/meta_auroc": np.nan, "outer_fold": outer_fold_idx + 1})
+            # wandb.log({f"outer_fold_{outer_fold_idx + 1}/sv_auroc": np.nan, "outer_fold": outer_fold_idx + 1})
+            continue
 
-            if config.get('ensemble', {}).get('train_meta_learner', True):
-                logger.info(f"Outer Fold {outer_fold_idx + 1}: Training XGBoost Meta-Learner...")
+        X_meta_train_outer = np.concatenate(meta_features_train_outer_list, axis=1)
+        y_meta_train_outer = y_outer_train
+        logger.info(
+            f"Outer Fold {outer_fold_idx + 1}: Meta-learner training features shape: {X_meta_train_outer.shape}")
+
+        if config.get('ensemble', {}).get('train_meta_learner', True):
+            logger.info(f"Outer Fold {outer_fold_idx + 1}: Training XGBoost Meta-Learner...")
+            try:
+                meta_config = config.get('ensemble', {}).get('meta_learner_xgb_params', {})
+                xgb_meta_model_outer = XGBoostMetaLearner(
+                    params=meta_config.get('model_specific_params'),
+                    depth=meta_config.get('depth', 3)
+                )
+                xgb_meta_model_outer.train(
+                    X_meta_train_outer, y_meta_train_outer,
+                    num_boost_round=meta_config.get('num_boost_round', 200),
+                    early_stopping_rounds=meta_config.get('early_stopping_rounds', 20)
+                )
+                logger.info(f"Outer Fold {outer_fold_idx + 1}: XGBoost Meta-Learner trained.")
+
+                meta_features_test_outer_list = []
+                if config.get('ensemble', {}).get('train_lgbm', True): meta_features_test_outer_list.append(
+                    base_model_preds_on_outer_test_sum['lgbm'])
+                if config.get('ensemble', {}).get('train_teco', True): meta_features_test_outer_list.append(
+                    base_model_preds_on_outer_test_sum['teco'])
+
+                X_meta_test_outer = np.concatenate(meta_features_test_outer_list, axis=1)
+                final_preds_meta_proba_outer = xgb_meta_model_outer.predict_proba(X_meta_test_outer)
+                final_preds_meta_labels_outer = xgb_meta_model_outer.predict(X_meta_test_outer)
+
+                acc_meta_outer = accuracy_score(y_outer_test, final_preds_meta_labels_outer)
+                f1_meta_outer = f1_score(y_outer_test, final_preds_meta_labels_outer,
+                                         average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+                prec_meta_outer = precision_score(y_outer_test, final_preds_meta_labels_outer,
+                                                  average='weighted' if num_classes > 2 else 'binary',
+                                                  zero_division=0)
+                rec_meta_outer = recall_score(y_outer_test, final_preds_meta_labels_outer,
+                                              average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+                auroc_meta_outer = -1.0
                 try:
-                    meta_config = config.get('ensemble', {}).get('meta_learner_xgb_params', {})
-                    xgb_meta_model_outer = XGBoostMetaLearner(
-                        params=meta_config.get('model_specific_params'),
-                        depth=meta_config.get('depth', 3)
-                    )
-                    xgb_meta_model_outer.train(
-                        X_meta_train_outer, y_meta_train_outer,
-                        num_boost_round=meta_config.get('num_boost_round', 200),  # Full run
-                        early_stopping_rounds=meta_config.get('early_stopping_rounds', 20)  # Full run
-                    )
-                    logger.info(f"Outer Fold {outer_fold_idx + 1}: XGBoost Meta-Learner trained.")
+                    probas_for_auc = final_preds_meta_proba_outer[:,
+                                     1] if num_classes == 2 and final_preds_meta_proba_outer.ndim == 2 and \
+                                           final_preds_meta_proba_outer.shape[
+                                               1] >= 2 else final_preds_meta_proba_outer
+                    auroc_meta_outer = roc_auc_score(y_outer_test, probas_for_auc, multi_class='ovr',
+                                                     average='weighted')
+                except ValueError as e:
+                    logger.warning(
+                        f"Outer Fold {outer_fold_idx + 1} Meta AUROC calc error: {e}. Proba shape: {final_preds_meta_proba_outer.shape if isinstance(final_preds_meta_proba_outer, np.ndarray) else 'N/A'}")
 
-                    meta_features_test_outer_list = []
-                    if config.get('ensemble', {}).get('train_lgbm', True): meta_features_test_outer_list.append(
-                        base_model_preds_on_outer_test_sum['lgbm'])
-                    if config.get('ensemble', {}).get('train_teco', True): meta_features_test_outer_list.append(
-                        base_model_preds_on_outer_test_sum['teco'])
-                    # if config.get('ensemble', {}).get('train_stm_gnn', True): meta_features_test_outer_list.append( # STM-GNN Removed
-                    #     base_model_preds_on_outer_test_sum['stm_gnn'])
+                outer_fold_metrics_meta['accuracy'].append(acc_meta_outer)
+                outer_fold_metrics_meta['auroc'].append(auroc_meta_outer)
+                outer_fold_metrics_meta['f1'].append(f1_meta_outer)
+                outer_fold_metrics_meta['precision'].append(prec_meta_outer)
+                outer_fold_metrics_meta['recall'].append(rec_meta_outer)
+                wandb.log({f"outer_fold_{outer_fold_idx + 1}/meta_auroc": auroc_meta_outer,
+                           f"outer_fold_{outer_fold_idx + 1}/meta_acc": acc_meta_outer,
+                           "outer_fold": outer_fold_idx + 1})
+                logger.info(
+                    f"Outer Fold {outer_fold_idx + 1} Meta-Learner: AUROC={auroc_meta_outer:.4f}, Acc={acc_meta_outer:.4f}")
+            except Exception as e:
+                logger.error(f"Outer Fold {outer_fold_idx + 1}: Error during Meta-Learner: {e}")
+                for key in outer_fold_metrics_meta.keys(): outer_fold_metrics_meta[key].append(np.nan)
+                wandb.log({f"outer_fold_{outer_fold_idx + 1}/meta_auroc": np.nan, "outer_fold": outer_fold_idx + 1})
 
-                    X_meta_test_outer = np.concatenate(meta_features_test_outer_list, axis=1)
-                    final_preds_meta_proba_outer = xgb_meta_model_outer.predict_proba(X_meta_test_outer)
-                    final_preds_meta_labels_outer = xgb_meta_model_outer.predict(X_meta_test_outer)
-
-                    acc_meta_outer = accuracy_score(y_outer_test, final_preds_meta_labels_outer)
-                    f1_meta_outer = f1_score(y_outer_test, final_preds_meta_labels_outer,
-                                             average='weighted' if num_classes > 2 else 'binary', zero_division=0)
-                    prec_meta_outer = precision_score(y_outer_test, final_preds_meta_labels_outer,
-                                                      average='weighted' if num_classes > 2 else 'binary',
-                                                      zero_division=0)
-                    rec_meta_outer = recall_score(y_outer_test, final_preds_meta_labels_outer,
-                                                  average='weighted' if num_classes > 2 else 'binary', zero_division=0)
-                    auroc_meta_outer = -1.0
-                    try:
-                        probas_for_auc = final_preds_meta_proba_outer[:,
-                                         1] if num_classes == 2 and final_preds_meta_proba_outer.ndim == 2 and \
-                                               final_preds_meta_proba_outer.shape[
-                                                   1] >= 2 else final_preds_meta_proba_outer
-                        auroc_meta_outer = roc_auc_score(y_outer_test, probas_for_auc, multi_class='ovr',
-                                                         average='weighted')
-                    except ValueError as e:
-                        logger.warning(
-                            f"Outer Fold {outer_fold_idx + 1} Meta AUROC calc error: {e}. Proba shape: {final_preds_meta_proba_outer.shape}")
-
-                    outer_fold_metrics_meta['accuracy'].append(acc_meta_outer)
-                    outer_fold_metrics_meta['auroc'].append(auroc_meta_outer)  # Key metric for GTscore
-                    outer_fold_metrics_meta['f1'].append(f1_meta_outer)
-                    outer_fold_metrics_meta['precision'].append(prec_meta_outer)
-                    outer_fold_metrics_meta['recall'].append(rec_meta_outer)
-                    wandb.log({f"outer_fold_{outer_fold_idx + 1}/meta_auroc": auroc_meta_outer,
-                               "outer_fold": outer_fold_idx + 1})
-                    logger.info(
-                        f"Outer Fold {outer_fold_idx + 1} Meta-Learner: AUROC={auroc_meta_outer:.4f}, Acc={acc_meta_outer:.4f}")
-                except Exception as e:
-                    logger.error(f"Outer Fold {outer_fold_idx + 1}: Error during Meta-Learner: {e}")
-                    for key in outer_fold_metrics_meta.keys(): outer_fold_metrics_meta[key].append(np.nan)
-
-        # --- Soft Voting Evaluation for Outer Fold ---
         soft_vote_weights = config.get('ensemble', {}).get('soft_vote_weights', {})
-        if soft_vote_weights and any(
-                config.get('ensemble', {}).get(f'train_{model_key}', False) for model_key in soft_vote_weights):
-            logger.info(f"Outer Fold {outer_fold_idx + 1}: Performing Soft Voting...")
-            # ... (Soft voting logic remains largely the same, ensure it uses base_model_preds_on_outer_test_sum correctly) ...
-            # Ensure this part is also robust to model failures and logs AUROC
+        active_models_for_sv = [model_key for model_key in ['lgbm', 'teco']  # Add other models if they return
+                                if config.get('ensemble', {}).get(f'train_{model_key}',
+                                                                  True) and model_key in soft_vote_weights]
+
+        if soft_vote_weights and active_models_for_sv:
+            logger.info(
+                f"Outer Fold {outer_fold_idx + 1}: Performing Soft Voting with models: {active_models_for_sv}...")
             try:
                 final_preds_soft_vote_proba_outer = np.zeros((len(y_outer_test), num_classes))
-                total_weight = 0.0  # Ensure float for division
-                active_models_count = 0
+                total_weight = 0.0
 
-                if config.get('ensemble', {}).get('train_lgbm', True) and 'lgbm' in soft_vote_weights:
-                    weight = soft_vote_weights['lgbm']
-                    final_preds_soft_vote_proba_outer += weight * base_model_preds_on_outer_test_sum['lgbm']
-                    total_weight += weight
-                    active_models_count += 1
-                if config.get('ensemble', {}).get('train_teco', True) and 'teco' in soft_vote_weights:
-                    weight = soft_vote_weights['teco']
-                    final_preds_soft_vote_proba_outer += weight * base_model_preds_on_outer_test_sum['teco']
-                    total_weight += weight
-                    active_models_count += 1
-                # if config.get('ensemble', {}).get('train_stm_gnn', True) and 'stm_gnn' in soft_vote_weights: # STM-GNN Removed
-                #     weight = soft_vote_weights['stm_gnn']
-                #     final_preds_soft_vote_proba_outer += weight * base_model_preds_on_outer_test_sum['stm_gnn']
-                #     total_weight += weight
-                #     active_models_count += 1
+                for model_key in active_models_for_sv:
+                    weight = soft_vote_weights.get(model_key, 0)
+                    if weight > 0:
+                        # Ensure the predictions are valid before adding
+                        preds_to_add = base_model_preds_on_outer_test_sum.get(model_key)
+                        if preds_to_add is not None and preds_to_add.shape == final_preds_soft_vote_proba_outer.shape:
+                            final_preds_soft_vote_proba_outer += weight * preds_to_add
+                            total_weight += weight
+                        else:
+                            logger.warning(
+                                f"Soft Voting: Skipping model {model_key} due to invalid predictions (shape mismatch or missing).")
 
-                if active_models_count > 0 and total_weight > 1e-6:  # Avoid division by zero or tiny weights
-                    # Normalize if weights don't sum to 1 (or if only some models contributed)
-                    # final_preds_soft_vote_proba_outer /= total_weight # if weights are just ratios
+                if total_weight > 1e-6:
+                    # Normalize probabilities if total_weight is not 1 (or close to it)
+                    # This is more robust if weights are relative importance rather than summing to 1.
+                    final_preds_soft_vote_proba_outer /= total_weight
                     # Ensure probabilities sum to 1 per sample after weighting and summing
                     row_sums = final_preds_soft_vote_proba_outer.sum(axis=1, keepdims=True)
-                    row_sums[row_sums == 0] = 1  # Avoid division by zero
+                    row_sums[row_sums == 0] = 1
                     final_preds_soft_vote_proba_outer = final_preds_soft_vote_proba_outer / row_sums
 
                     final_preds_soft_vote_labels_outer = np.argmax(final_preds_soft_vote_proba_outer, axis=1)
                     acc_sv_outer = accuracy_score(y_outer_test, final_preds_soft_vote_labels_outer)
                     f1_sv_outer = f1_score(y_outer_test, final_preds_soft_vote_labels_outer,
                                            average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+                    prec_sv_outer = precision_score(y_outer_test, final_preds_soft_vote_labels_outer,
+                                                    average='weighted' if num_classes > 2 else 'binary',
+                                                    zero_division=0)
+                    rec_sv_outer = recall_score(y_outer_test, final_preds_soft_vote_labels_outer,
+                                                average='weighted' if num_classes > 2 else 'binary', zero_division=0)
                     auroc_sv_outer = -1.0
                     try:
                         probas_for_auc_sv = final_preds_soft_vote_proba_outer[:,
@@ -578,52 +652,71 @@ def main(config_path):
                                                        average='weighted')
                     except ValueError as e:
                         logger.warning(
-                            f"Outer Fold {outer_fold_idx + 1} SoftVote AUROC calculation error: {e}. Proba shape: {final_preds_soft_vote_proba_outer.shape}")
+                            f"Outer Fold {outer_fold_idx + 1} SoftVote AUROC calculation error: {e}. Proba shape: {final_preds_soft_vote_proba_outer.shape if isinstance(final_preds_soft_vote_proba_outer, np.ndarray) else 'N/A'}")
 
-                    outer_fold_metrics_soft_vote['auroc'].append(auroc_sv_outer)  # Key metric
                     outer_fold_metrics_soft_vote['accuracy'].append(acc_sv_outer)
-                    # ... other metrics ...
+                    outer_fold_metrics_soft_vote['auroc'].append(auroc_sv_outer)
+                    outer_fold_metrics_soft_vote['f1'].append(f1_sv_outer)
+                    outer_fold_metrics_soft_vote['precision'].append(prec_sv_outer)
+                    outer_fold_metrics_soft_vote['recall'].append(rec_sv_outer)
                     wandb.log(
-                        {f"outer_fold_{outer_fold_idx + 1}/sv_auroc": auroc_sv_outer, "outer_fold": outer_fold_idx + 1})
+                        {f"outer_fold_{outer_fold_idx + 1}/sv_auroc": auroc_sv_outer,
+                         f"outer_fold_{outer_fold_idx + 1}/sv_acc": acc_sv_outer,
+                         "outer_fold": outer_fold_idx + 1})
                     logger.info(
                         f"Outer Fold {outer_fold_idx + 1} Soft Vote: AUROC={auroc_sv_outer:.4f}, Acc={acc_sv_outer:.4f}")
                 else:
                     logger.warning(
-                        f"Outer Fold {outer_fold_idx + 1}: Soft Voting not performed (no active models or zero total weight).")
-                    for key in outer_fold_metrics_soft_vote.keys(): outer_fold_metrics_soft_vote[key].append(np.nan)
+                        f"Outer Fold {outer_fold_idx + 1}: Soft Voting not performed (no active models with positive weights or zero total weight).")
+                    for key_sv in outer_fold_metrics_soft_vote.keys(): outer_fold_metrics_soft_vote[key_sv].append(
+                        np.nan)
+                    wandb.log({f"outer_fold_{outer_fold_idx + 1}/sv_auroc": np.nan, "outer_fold": outer_fold_idx + 1})
 
             except Exception as e:
                 logger.error(f"Outer Fold {outer_fold_idx + 1}: Error during Soft Voting: {e}")
-                for key in outer_fold_metrics_soft_vote.keys(): outer_fold_metrics_soft_vote[key].append(np.nan)
+                for key_sv_err in outer_fold_metrics_soft_vote.keys(): outer_fold_metrics_soft_vote[key_sv_err].append(
+                    np.nan)
+                wandb.log({f"outer_fold_{outer_fold_idx + 1}/sv_auroc": np.nan, "outer_fold": outer_fold_idx + 1})
+        elif not soft_vote_weights:
+            logger.info(f"Outer Fold {outer_fold_idx + 1}: Soft voting weights not configured. Skipping soft voting.")
+            for key_sv_skip in outer_fold_metrics_soft_vote.keys(): outer_fold_metrics_soft_vote[key_sv_skip].append(
+                np.nan)
+        elif not active_models_for_sv:
+            logger.info(f"Outer Fold {outer_fold_idx + 1}: No active models for soft voting based on config. Skipping.")
+            for key_sv_skip_active in outer_fold_metrics_soft_vote.keys(): outer_fold_metrics_soft_vote[
+                key_sv_skip_active].append(np.nan)
 
-    # --- Nested Cross-Validation Summary ---
     logger.info("===== Nested Cross-Validation Summary =====")
-    # Log average AUROC for meta-learner (primary GTscore optimization target)
-    if config.get('ensemble', {}).get('train_meta_learner', True) and len(outer_fold_metrics_meta['auroc']) > 0:
+    if config.get('ensemble', {}).get('train_meta_learner', True) and any(
+            not np.isnan(v) for v in outer_fold_metrics_meta['auroc']):
         avg_meta_auroc = np.nanmean(outer_fold_metrics_meta['auroc'])
         std_meta_auroc = np.nanstd(outer_fold_metrics_meta['auroc'])
         logger.info(f"Meta-Learner Average AUROC: {avg_meta_auroc:.4f} +/- {std_meta_auroc:.4f}")
-        wandb.summary["ncv_meta_avg_auroc"] = avg_meta_auroc  # Key summary metric
+        wandb.summary["ncv_meta_avg_auroc"] = avg_meta_auroc
         wandb.summary["ncv_meta_std_auroc"] = std_meta_auroc
-        # Log other average metrics as well
         for metric_name, values in outer_fold_metrics_meta.items():
-            if metric_name not in ['auroc']:  # AUROC already logged with std
+            if metric_name != 'auroc':
                 avg_val = np.nanmean(values)
                 wandb.summary[f"ncv_meta_avg_{metric_name}"] = avg_val
                 logger.info(f"Meta-Learner Average {metric_name.capitalize()}: {avg_val:.4f}")
+    else:
+        logger.info("Meta-Learner metrics not computed or all NaN.")
+        wandb.summary["ncv_meta_avg_auroc"] = np.nan
 
-    if soft_vote_weights and sum(soft_vote_weights.values()) > 0 and len(outer_fold_metrics_soft_vote['auroc']) > 0:
+    if soft_vote_weights and any(not np.isnan(v) for v in outer_fold_metrics_soft_vote['auroc']):
         avg_sv_auroc = np.nanmean(outer_fold_metrics_soft_vote['auroc'])
         std_sv_auroc = np.nanstd(outer_fold_metrics_soft_vote['auroc'])
         logger.info(f"Soft Voting Average AUROC: {avg_sv_auroc:.4f} +/- {std_sv_auroc:.4f}")
         wandb.summary["ncv_sv_avg_auroc"] = avg_sv_auroc
         wandb.summary["ncv_sv_std_auroc"] = std_sv_auroc
-        # Log other average metrics for soft voting
         for metric_name, values in outer_fold_metrics_soft_vote.items():
-            if metric_name not in ['auroc']:
+            if metric_name != 'auroc':
                 avg_val = np.nanmean(values)
                 wandb.summary[f"ncv_sv_avg_{metric_name}"] = avg_val
                 logger.info(f"Soft Voting Average {metric_name.capitalize()}: {avg_val:.4f}")
+    else:
+        logger.info("Soft Voting metrics not computed or all NaN.")
+        wandb.summary["ncv_sv_avg_auroc"] = np.nan
 
     wandb.finish()
     logger.info("Full Nested Cross-Validation ensemble training run finished successfully.")
@@ -632,24 +725,11 @@ def main(config_path):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Main training script for Clinical Prediction Model with NCV.")
     parser.add_argument('--config', type=str, default='configs/dummy_train_config.yaml',
-                        # Or point to a new 'full_train_config.yaml'
                         help='Path to the training configuration file.')
     args = parser.parse_args()
 
-    # The part that auto-creates dummy_train_config.yaml can be removed or adapted
-    # if we expect a dedicated config file for full runs.
-    # For now, let's assume the dummy_train_config.yaml will be updated for "fuller" settings.
     if not os.path.exists(args.config):
-        logger.error(f"Configuration file {args.config} not found. Please create it.")
-        # Optionally, create a more comprehensive default config here if needed for a "full run"
-        # For now, it relies on the existing dummy config creation logic if file is missing,
-        # which might not be ideal for a "full" run.
-        # Consider removing auto-creation for full runs and requiring a specific config.
-        # Fallback to original dummy creation for now if not found
-        print(f"Warning: Configuration file {args.config} not found. Attempting to create a dummy one.")
-        # ... (dummy config creation code from original script - may need updates for full run defaults)
-        # This dummy creation should ideally be in a separate utility or test setup.
-        # For this task, we assume the user will provide an appropriate config.
-        sys.exit(1)  # Exit if config is not found, rather than creating a minimal dummy for a full run.
+        logger.error(f"Configuration file {args.config} not found. Please create it or provide a valid path.")
+        sys.exit(1)
 
     main(args.config)
