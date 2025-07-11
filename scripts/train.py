@@ -25,11 +25,18 @@ from data_utils.data_loader import load_raw_data
 from data_utils.preprocess import get_preprocessor
 from models import LightGBMModel, XGBoostMetaLearner
 from models.teco_transformer import TECOTransformerModel
-# from models.stm_gnn import STMGNN  # STM-GNN Removed
 from data_utils.sequence_loader import TabularSequenceDataset, basic_collate_fn  # For TECO
 
+# --- GNN Imports ---
+from data_utils.graph_schema import NODE_TYPES as GNN_NODE_TYPES, EDGE_TYPES as GNN_EDGE_TYPES # Graph Schema
+from data_utils.graph_loader import PatientHeteroGraphDataset, create_global_mappers
+from models.hetero_temporal_gnn import HeteroTemporalGNN
+from torch_geometric.loader import DataLoader as PyGDataLoader # DataLoader for PyG graph batches
+# --- End GNN Imports ---
+
+
 # For STM-GNN, data loading might be more complex (graph snapshots)
-# from data_utils.graph_loader import GraphSnapshotDataset, graph_collate_fn # Conceptual
+# from data_utils.graph_loader import GraphSnapshotDataset, graph_collate_fn # Conceptual - now replaced by PatientHeteroGraphDataset
 
 # --- Logger Setup ---
 logging.basicConfig(
@@ -116,7 +123,69 @@ def main(config_path):
     if num_classes < 2:
         raise ValueError(f"Number of classes must be at least 2. Found {num_classes}.")
 
-    # --- Preprocessing Setup ---
+    # --- GNN Global Setup (Mappers & Patient ID Column) ---
+    gnn_config = config.get('ensemble', {}).get('gnn_params', {})
+    train_gnn = config.get('ensemble', {}).get('train_gnn', False)
+    global_concept_mappers = None
+    patient_id_col_name_for_gnn = config.get('patient_id_column') # Get from top-level config
+
+    if train_gnn:
+        # Generate 'graph_instance_id' if specified in config, or use existing patient_id_column
+        # This allows flexibility: either use a pre-existing unique ID per row/encounter,
+        # or generate one if each row is an independent graph unit.
+        # The YAML should set patient_id_column to 'graph_instance_id' if generation is desired.
+        if patient_id_col_name_for_gnn == 'graph_instance_id': # Special value to trigger generation
+            logger.info(f"Generating '{patient_id_col_name_for_gnn}' for GNN processing.")
+            X_full_raw_df = X_full_raw_df.reset_index(drop=True)
+            X_full_raw_df[patient_id_col_name_for_gnn] = X_full_raw_df.index
+            y_full_raw_series.index = X_full_raw_df.index # Align y_series index
+            logger.info(f"'{patient_id_col_name_for_gnn}' column created and y_series index aligned.")
+        elif patient_id_col_name_for_gnn not in X_full_raw_df.columns and X_full_raw_df.index.name != patient_id_col_name_for_gnn:
+            logger.error(f"Specified GNN patient ID column '{patient_id_col_name_for_gnn}' not found in X_full_raw_df columns or as index name. Disabling GNN.")
+            train_gnn = False
+        elif X_full_raw_df.index.name == patient_id_col_name_for_gnn:
+             # If patient_id_col_name is the index, make it a regular column for consistent handling downstream
+             # (e.g. in PatientHeteroGraphDataset's y_map creation, create_global_mappers)
+             X_full_raw_df[patient_id_col_name_for_gnn] = X_full_raw_df.index
+             logger.info(f"Using index '{patient_id_col_name_for_gnn}' as GNN patient ID column and made it a regular column.")
+
+
+        if train_gnn: # Re-check after potential modification of X_full_raw_df
+            logger.info("GNN training is enabled. Creating global concept mappers...")
+            gnn_data_cols = gnn_config.get('data_columns', {})
+
+            vital_cols_for_gnn = gnn_data_cols.get('vital_columns', [])
+            diag_col_for_gnn = gnn_data_cols.get('diagnosis_column')
+            med_col_for_gnn = gnn_data_cols.get('medication_column') # Might be None if not configured
+            proc_col_for_gnn = gnn_data_cols.get('procedure_column') # Might be None if not configured
+            timestamp_col_for_gnn = gnn_data_cols.get('event_timestamp_column')
+
+            # Check essential GNN column configurations
+            # Medication and Procedure columns are optional for mapper creation
+            if not all([patient_id_col_name_for_gnn, vital_cols_for_gnn, diag_col_for_gnn, timestamp_col_for_gnn]):
+                logger.error("Missing critical GNN data column configurations (patient_id, vitals, diagnosis, timestamp) in YAML. Disabling GNN.")
+                train_gnn = False
+            else:
+                try:
+                    global_concept_mappers = create_global_mappers(
+                        all_patient_data_df=X_full_raw_df.copy(), # Pass a copy
+                        patient_id_col=patient_id_col_name_for_gnn,
+                        vital_col_names=vital_cols_for_gnn,
+                        diagnosis_col_name=diag_col_for_gnn,
+                        medication_col_name=med_col_for_gnn, # Pass it, create_global_mappers will handle if None/missing
+                        procedure_col_name=proc_col_for_gnn, # Pass it
+                        timestamp_col=timestamp_col_for_gnn
+                    )
+                    logger.info("Global concept mappers created for GNN.")
+                except Exception as e_map:
+                    logger.error(f"Error creating global concept mappers for GNN: {e_map}. Disabling GNN training.")
+                    logger.error(traceback.format_exc())
+                    train_gnn = False
+
+    if not train_gnn:
+        logger.info("GNN training is disabled for this run.")
+
+    # --- Preprocessing Setup (for tabular models like LGBM, TECO) ---
     preproc_cfg = config.get('preprocessing', {})
     numerical_cols_from_config = preproc_cfg.get('numerical_cols', [])
     categorical_cols_from_config = preproc_cfg.get('categorical_cols', [])
@@ -319,12 +388,79 @@ def main(config_path):
         inner_skf = StratifiedKFold(n_splits=n_inner_folds, shuffle=True, random_state=seed + outer_fold_idx)
         oof_preds_inner = {
             'lgbm': np.zeros((len(y_outer_train), num_classes)),
-            'teco': np.zeros((len(y_outer_train), num_classes))
+            'teco': np.zeros((len(y_outer_train), num_classes)),
+            # Add GNN entry if training GNN
         }
         base_model_preds_on_outer_test_sum = {
             'lgbm': np.zeros((len(y_outer_test), num_classes)),
-            'teco': np.zeros((len(y_outer_test), num_classes))
+            'teco': np.zeros((len(y_outer_test), num_classes)),
+            # Add GNN entry if training GNN
         }
+        if train_gnn:
+            oof_preds_inner['gnn'] = np.zeros((len(y_outer_train), num_classes)) # Assuming num_classes for GNN output
+            base_model_preds_on_outer_test_sum['gnn'] = np.zeros((len(y_outer_test), num_classes))
+
+
+        # --- GNN Dataset Instantiation for Outer Test Fold (if GNN is active) ---
+        # This dataset is used by the GNN model trained on the full outer_train split
+        # to make predictions on the outer_test data.
+        outer_test_graph_dataset = None
+        if train_gnn and global_concept_mappers is not None:
+            try:
+                logger.info(f"Outer Fold {outer_fold_idx + 1}: Preparing GNN Dataset for X_outer_test_raw_fold_df...")
+                # Ensure y_outer_test_fold_series is indexed by patient_id for y_map construction
+                # This part is tricky: y_map needs patient_id -> (label, label_timestamp_abs)
+                # We need to reconstruct this from X_outer_test_raw_fold_df and y_outer_test_fold_series
+                # Assume patient_id_col_name is the index of X_outer_test_raw_fold_df for simplicity here
+                # And label_timestamp_col is present in X_outer_test_raw_fold_df (e.g. 'dischargeDate' or similar)
+
+                # This y_map construction needs to be robust.
+                # It assumes X_outer_test_raw_fold_df is indexed by patient_id_col_name
+                # and y_outer_test_fold_series is also indexed by patient_id_col_name.
+                # It also needs a reliable 'label_timestamp_col' (e.g. 'dischargeDate') in X_outer_test_raw_fold_df.
+
+                # Placeholder for y_map for test set (label can be dummy, timestamp is important)
+                y_map_outer_test = {}
+                if X_outer_test_raw_fold_df.index.name != patient_id_col_name:
+                     X_outer_test_raw_fold_df_indexed = X_outer_test_raw_fold_df.set_index(patient_id_col_name, drop=False)
+                else:
+                     X_outer_test_raw_fold_df_indexed = X_outer_test_raw_fold_df
+
+                for pid_test in X_outer_test_raw_fold_df_indexed.index.unique():
+                    # This assumes label_timestamp_col is available in X_outer_test_raw_fold_df_indexed
+                    # and represents the event time for which a prediction is made (e.g., discharge time)
+                    # Using the first available timestamp for that patient as a proxy for label event time. This is a simplification.
+                    label_ts_val = X_outer_test_raw_fold_df_indexed.loc[pid_test, gnn_config['data_columns']['label_timestamp_column']].iloc[0] \
+                        if isinstance(X_outer_test_raw_fold_df_indexed.loc[pid_test, gnn_config['data_columns']['label_timestamp_column']], pd.Series) \
+                        else X_outer_test_raw_fold_df_indexed.loc[pid_test, gnn_config['data_columns']['label_timestamp_column']]
+
+                    y_map_outer_test[pid_test] = (y_outer_test_fold_series.loc[pid_test] if pid_test in y_outer_test_fold_series.index else 0,
+                                                  pd.to_datetime(label_ts_val))
+
+                gnn_construction_params_outer = gnn_config.get('graph_construction_params', {}).copy()
+                gnn_construction_params_outer['global_concept_mappers'] = global_concept_mappers
+
+                outer_test_graph_dataset = PatientHeteroGraphDataset(
+                    root_dir=os.path.join(config.get('output_dir', 'outputs'), f'fold_{outer_fold_idx+1}', 'gnn_processed_test'),
+                    patient_df_split=X_outer_test_raw_fold_df, # Raw features for this outer test fold
+                    patient_id_col=patient_id_col_name,
+                    y_map=y_map_outer_test, # Map of patient_id to (label, label_timestamp_abs)
+                    target_variable_name=y_full_for_split.name, # Original target column name
+                    label_timestamp_col=gnn_config['data_columns']['label_timestamp_column'], # To identify event time for snapshot
+                    timestamp_col=gnn_config['data_columns']['event_timestamp_column'],
+                    time_rel_col_name=gnn_config['data_columns'].get('relative_time_column', 'hours_since_admission'),
+                    admission_timestamp_col=gnn_config['data_columns']['admission_timestamp_column'],
+                    graph_construction_params=gnn_construction_params_outer,
+                    vital_col_names=gnn_config['data_columns']['vital_columns'],
+                    diagnosis_col_name=gnn_config['data_columns']['diagnosis_column'],
+                    medication_col_name=gnn_config['data_columns']['medication_column'],
+                    procedure_col_name=gnn_config['data_columns']['procedure_column'],
+                    force_reprocess=gnn_config.get('force_reprocess_graphs', False)
+                )
+            except Exception as e_ds_test:
+                logger.error(f"Outer Fold {outer_fold_idx + 1}: Error creating GNN test dataset: {e_ds_test}. GNN predictions for outer test will be defaults.")
+                outer_test_graph_dataset = None # Ensure it's None if creation fails
+        # --- End GNN Dataset for Outer Test ---
 
         for inner_fold_idx, (inner_train_idx, inner_val_idx) in enumerate(
                 inner_skf.split(X_outer_train_processed, y_outer_train)):
@@ -498,57 +634,256 @@ def main(config_path):
                                                       lr=teco_config.get('lr_teco', 1e-4))
                     epochs_teco_inner = teco_config.get('epochs_teco_inner', 10)
 
-                    for epoch in range(epochs_teco_inner):
-                        teco_model_inner.train()
-                        epoch_loss_sum = 0.0
-                        for batch in train_teco_loader_inner:
-                            teco_optimizer_inner.zero_grad()
-                            sequences = batch['sequence'].to(device)
-                            padding_masks = batch['padding_mask'].to(device)
-                            targets = batch['target'].to(device)
+                    # --- TECO Training Phase ---
+                    try:
+                        for epoch in range(epochs_teco_inner):
+                            teco_model_inner.train()
+                            epoch_loss_sum = 0.0
+                            for batch_idx, batch in enumerate(train_teco_loader_inner):
+                                teco_optimizer_inner.zero_grad()
+                                sequences = batch['sequence'].to(device)
+                                padding_masks = batch['padding_mask'].to(device)
+                                targets = batch['target'].to(device)
 
-                            outputs = teco_model_inner(sequences, padding_masks)
-                            loss = teco_criterion_inner(outputs, targets)
-                            loss.backward()
-                            teco_optimizer_inner.step()
-                            epoch_loss_sum += loss.item()
-                        logger.debug(
-                            f"Inner Fold {inner_fold_idx + 1}, TECO Epoch {epoch + 1}/{epochs_teco_inner}, Avg Train Loss: {epoch_loss_sum / len(train_teco_loader_inner):.4f}")
+                                outputs = teco_model_inner(sequences, padding_masks)
+                                loss = teco_criterion_inner(outputs, targets)
+                                loss.backward()
+                                teco_optimizer_inner.step()
+                                epoch_loss_sum += loss.item()
+                            logger.debug(
+                                f"Inner Fold {inner_fold_idx + 1}, TECO Epoch {epoch + 1}/{epochs_teco_inner}, Avg Train Loss: {epoch_loss_sum / len(train_teco_loader_inner):.4f}")
+                    except Exception as e_train_teco:
+                        logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during TECO Training Loop: {e_train_teco}")
+                        logger.error(f"Error occurred in TECO training, epoch {epoch+1 if 'epoch' in locals() else 'unknown'}, batch_idx {batch_idx if 'batch_idx' in locals() else 'unknown'}")
+                        raise  # Re-raise to be caught by the outer TECO try-except
 
-                    teco_model_inner.eval()
-                    inner_val_preds_teco_list = []
-                    with torch.no_grad():
-                        for batch in val_teco_loader_inner:
-                            outputs = teco_model_inner(batch['sequence'].to(device), batch['padding_mask'].to(device))
-                            inner_val_preds_teco_list.append(torch.softmax(outputs, dim=1).cpu().numpy())
+                    # --- TECO Validation Prediction Phase ---
+                    try:
+                        teco_model_inner.eval()
+                        inner_val_preds_teco_list = []
+                        with torch.no_grad():
+                            for batch in val_teco_loader_inner:
+                                outputs = teco_model_inner(batch['sequence'].to(device), batch['padding_mask'].to(device))
+                                inner_val_preds_teco_list.append(torch.softmax(outputs, dim=1).cpu().numpy())
 
-                    if inner_val_preds_teco_list:
-                        oof_preds_inner['teco'][inner_val_idx] = np.concatenate(inner_val_preds_teco_list, axis=0)[:,
-                                                                 :num_classes]
-                    else:
-                        oof_preds_inner['teco'][inner_val_idx] = np.full((len(inner_val_idx), num_classes),
-                                                                         1 / num_classes)
+                        if inner_val_preds_teco_list:
+                            oof_preds_inner['teco'][inner_val_idx] = np.concatenate(inner_val_preds_teco_list, axis=0)[:, :num_classes]
+                        else:
+                            logger.warning(f"Inner Fold {inner_fold_idx + 1}: TECO validation prediction list is empty. Filling with defaults.")
+                            oof_preds_inner['teco'][inner_val_idx] = np.full((len(inner_val_idx), num_classes), 1 / num_classes)
+                    except Exception as e_val_pred_teco:
+                        logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during TECO Validation Prediction: {e_val_pred_teco}")
+                        raise # Re-raise to be caught by the outer TECO try-except
 
-                    outer_test_preds_teco_list = []
-                    with torch.no_grad():
-                        for batch in outer_test_teco_loader:
-                            outputs = teco_model_inner(batch['sequence'].to(device), batch['padding_mask'].to(device))
-                            outer_test_preds_teco_list.append(torch.softmax(outputs, dim=1).cpu().numpy())
+                    # --- TECO Outer Test Prediction Phase ---
+                    try:
+                        outer_test_preds_teco_list = []
+                        with torch.no_grad():
+                            for batch in outer_test_teco_loader:
+                                outputs = teco_model_inner(batch['sequence'].to(device), batch['padding_mask'].to(device))
+                                outer_test_preds_teco_list.append(torch.softmax(outputs, dim=1).cpu().numpy())
 
-                    if outer_test_preds_teco_list:
-                        base_model_preds_on_outer_test_sum['teco'] += np.concatenate(outer_test_preds_teco_list,
-                                                                                     axis=0)[:,
-                                                                      :num_classes] / n_inner_folds
-                    else:
-                        base_model_preds_on_outer_test_sum['teco'] += np.full((len(y_outer_test), num_classes),
-                                                                              1 / num_classes) / n_inner_folds
+                        if outer_test_preds_teco_list:
+                            base_model_preds_on_outer_test_sum['teco'] += np.concatenate(outer_test_preds_teco_list, axis=0)[:, :num_classes] / n_inner_folds
+                        else:
+                            logger.warning(f"Inner Fold {inner_fold_idx + 1}: TECO outer test prediction list is empty. Adding defaults.")
+                            base_model_preds_on_outer_test_sum['teco'] += np.full((len(y_outer_test), num_classes), 1 / num_classes) / n_inner_folds
+                    except Exception as e_test_pred_teco:
+                        logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during TECO Outer Test Prediction: {e_test_pred_teco}")
+                        raise # Re-raise to be caught by the outer TECO try-except
 
                     logger.info(f"Inner Fold {inner_fold_idx + 1}: TECO-Transformer training and prediction complete.")
-                except Exception as e:
-                    logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during TECO-Transformer: {e}")
+                except Exception as e: # This is the main TECO exception handler (line 548 in original)
+                    logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during TECO-Transformer (Main Block): {e}")
+                    # Ensure traceback is logged for unexpected errors not caught by more specific blocks above
+                    import traceback
+                    logger.error(f"Traceback: {traceback.format_exc()}")
                     oof_preds_inner['teco'][inner_val_idx] = np.full((len(inner_val_idx), num_classes), 1 / num_classes)
                     base_model_preds_on_outer_test_sum['teco'] += np.full((len(y_outer_test), num_classes),
                                                                           1 / num_classes) / n_inner_folds
+
+            # --- GNN Training and Prediction within Inner Fold ---
+            if train_gnn and global_concept_mappers is not None:
+                logger.info(f"Inner Fold {inner_fold_idx + 1}: Training HeteroTemporalGNN...")
+                try:
+                    # Prepare GNN datasets for this inner fold
+                    # X_outer_train_raw_fold_df needs to be split into inner_train_raw and inner_val_raw
+                    # These DFs are used to instantiate PatientHeteroGraphDataset
+
+                    # Important: X_outer_train_raw_fold_df contains the *original features*, not the preprocessed ones.
+                    # We need to use inner_train_idx and inner_val_idx on X_outer_train_raw_fold_df and y_outer_train_fold_series
+
+                    X_inner_train_raw_gnn = X_outer_train_raw_fold_df.iloc[inner_train_idx]
+                    y_inner_train_gnn_series = y_outer_train_fold_series.iloc[inner_train_idx]
+
+                    X_inner_val_raw_gnn = X_outer_train_raw_fold_df.iloc[inner_val_idx]
+                    y_inner_val_gnn_series = y_outer_train_fold_series.iloc[inner_val_idx]
+
+                    # Construct y_map for inner train and val GNN datasets
+                    y_map_inner_train_gnn = {pid: (y_inner_train_gnn_series.loc[pid], pd.to_datetime(X_inner_train_raw_gnn.loc[pid, gnn_config['data_columns']['label_timestamp_column']]))
+                                             for pid in X_inner_train_raw_gnn.index.unique() if pid in y_inner_train_gnn_series.index}
+                    y_map_inner_val_gnn = {pid: (y_inner_val_gnn_series.loc[pid], pd.to_datetime(X_inner_val_raw_gnn.loc[pid, gnn_config['data_columns']['label_timestamp_column']]))
+                                           for pid in X_inner_val_raw_gnn.index.unique() if pid in y_inner_val_gnn_series.index}
+
+                    gnn_construction_params_inner = gnn_config.get('graph_construction_params', {}).copy()
+                    gnn_construction_params_inner['global_concept_mappers'] = global_concept_mappers
+
+                    inner_train_graph_dataset = PatientHeteroGraphDataset(
+                        root_dir=os.path.join(config.get('output_dir', 'outputs'), f'fold_{outer_fold_idx+1}_inner_{inner_fold_idx+1}', 'gnn_processed_train'),
+                        patient_df_split=X_inner_train_raw_gnn,
+                        patient_id_col=patient_id_col_name, y_map=y_map_inner_train_gnn,
+                        target_variable_name=y_full_for_split.name,
+                        label_timestamp_col=gnn_config['data_columns']['label_timestamp_column'],
+                        timestamp_col=gnn_config['data_columns']['event_timestamp_column'],
+                        time_rel_col_name=gnn_config['data_columns'].get('relative_time_column', 'hours_since_admission'),
+                        admission_timestamp_col=gnn_config['data_columns']['admission_timestamp_column'],
+                        graph_construction_params=gnn_construction_params_inner,
+                        vital_col_names=gnn_config['data_columns']['vital_columns'],
+                        diagnosis_col_name=gnn_config['data_columns']['diagnosis_column'],
+                        medication_col_name=gnn_config['data_columns']['medication_column'],
+                        procedure_col_name=gnn_config['data_columns']['procedure_column'],
+                        force_reprocess=gnn_config.get('force_reprocess_graphs', False)
+                    )
+                    inner_val_graph_dataset = PatientHeteroGraphDataset(
+                        root_dir=os.path.join(config.get('output_dir', 'outputs'), f'fold_{outer_fold_idx+1}_inner_{inner_fold_idx+1}', 'gnn_processed_val'),
+                        patient_df_split=X_inner_val_raw_gnn,
+                        patient_id_col=patient_id_col_name, y_map=y_map_inner_val_gnn,
+                        # ... other params same as inner_train_graph_dataset ...
+                        target_variable_name=y_full_for_split.name,
+                        label_timestamp_col=gnn_config['data_columns']['label_timestamp_column'],
+                        timestamp_col=gnn_config['data_columns']['event_timestamp_column'],
+                        time_rel_col_name=gnn_config['data_columns'].get('relative_time_column', 'hours_since_admission'),
+                        admission_timestamp_col=gnn_config['data_columns']['admission_timestamp_column'],
+                        graph_construction_params=gnn_construction_params_inner,
+                        vital_col_names=gnn_config['data_columns']['vital_columns'],
+                        diagnosis_col_name=gnn_config['data_columns']['diagnosis_column'],
+                        medication_col_name=gnn_config['data_columns']['medication_column'],
+                        procedure_col_name=gnn_config['data_columns']['procedure_column'],
+                        force_reprocess=gnn_config.get('force_reprocess_graphs', False)
+                    )
+
+                    if not inner_train_graph_dataset.patient_ids or not inner_val_graph_dataset.patient_ids:
+                        raise ValueError("GNN dataset for inner fold resulted in no patients.")
+
+                    gnn_batch_size = gnn_config.get('batch_size', 32)
+                    # PyG DataLoader for graph data
+                    train_gnn_loader = PyGDataLoader(inner_train_graph_dataset, batch_size=gnn_batch_size, shuffle=True)
+                    val_gnn_loader = PyGDataLoader(inner_val_graph_dataset, batch_size=gnn_batch_size, shuffle=False)
+
+                    # GNN Model Instantiation
+                    # Need to get timeslice_feat_dim from a sample graph or config
+                    # This is data['timeslice'].x.shape[1]
+                    # For now, placeholder - this needs to be robustly determined.
+                    # Example: sample_graph_data = inner_train_graph_dataset[0]
+                    # timeslice_input_dim_gnn = sample_graph_data['timeslice'].x.shape[1]
+
+                    # This is a temporary hack to get the feature dimension.
+                    # A more robust way would be to define it based on time_embedding_dim + num_vital_features
+                    # from graph_constructor and make it available.
+                    # For now, let's assume it's configured or can be inferred if datasets are non-empty.
+                    timeslice_input_dim_gnn = gnn_config.get('timeslice_feature_dim', 16 + len(gnn_config['data_columns']['vital_columns'])) # Placeholder calculation
+                    if inner_train_graph_dataset.patient_ids:
+                        try:
+                            sample_graph_data_for_dim = inner_train_graph_dataset.get(0) # Use .get() to load from disk if processed
+                            if sample_graph_data_for_dim and 'timeslice' in sample_graph_data_for_dim.node_types and sample_graph_data_for_dim['timeslice'].num_nodes > 0:
+                                timeslice_input_dim_gnn = sample_graph_data_for_dim['timeslice'].x.shape[1]
+                            else:
+                                logger.warning("Sample graph for GNN timeslice dim is empty/invalid. Using configured/default.")
+                        except Exception as e_sample_dim:
+                             logger.warning(f"Could not get sample graph for GNN timeslice dim: {e_sample_dim}. Using configured/default.")
+
+
+                    gnn_model_inner = HeteroTemporalGNN(
+                        data_schema={'NODE_TYPES': GNN_NODE_TYPES, 'EDGE_TYPES': GNN_EDGE_TYPES}, # Pass the schema
+                        num_nodes_dict={ntype: len(mapper) for ntype, mapper in global_concept_mappers.items()},
+                        timeslice_feat_dim=timeslice_input_dim_gnn,
+                        concept_embedding_dim=gnn_config.get('concept_embedding_dim', 64),
+                        gnn_hidden_dim=gnn_config.get('gnn_hidden_dim', 128),
+                        gnn_output_dim=gnn_config.get('gnn_output_dim', 128), # Output of GNN layers before final FC
+                        num_gnn_layers=gnn_config.get('num_gnn_layers', 2),
+                        num_gat_heads=gnn_config.get('num_gat_heads', 4),
+                        output_classes=1 if num_classes == 2 else num_classes, # BCEWithLogitsLoss if binary
+                        dropout_rate=gnn_config.get('dropout', 0.3)
+                    ).to(device)
+
+                    gnn_criterion_inner = nn.BCEWithLogitsLoss() if num_classes == 2 else nn.CrossEntropyLoss()
+                    gnn_optimizer_inner = optim.Adam(gnn_model_inner.parameters(), lr=gnn_config.get('lr', 1e-3))
+                    epochs_gnn_inner = gnn_config.get('epochs_inner', 10)
+
+                    # --- GNN Training Loop ---
+                    for epoch in range(epochs_gnn_inner):
+                        gnn_model_inner.train()
+                        epoch_loss_gnn_sum = 0.0
+                        for gnn_batch in train_gnn_loader:
+                            gnn_batch = gnn_batch.to(device)
+                            gnn_optimizer_inner.zero_grad()
+                            gnn_outputs = gnn_model_inner(gnn_batch) # HeteroData batch
+                            gnn_loss = gnn_criterion_inner(gnn_outputs, gnn_batch.y.float()) # Ensure y is float for BCE
+                            gnn_loss.backward()
+                            gnn_optimizer_inner.step()
+                            epoch_loss_gnn_sum += gnn_loss.item()
+                        logger.debug(f"Inner Fold {inner_fold_idx + 1}, GNN Epoch {epoch + 1}/{epochs_gnn_inner}, Avg Train Loss: {epoch_loss_gnn_sum / len(train_gnn_loader):.4f}")
+
+                    # --- GNN Validation Predictions (OOF for meta-learner) ---
+                    gnn_model_inner.eval()
+                    inner_val_preds_gnn_list = []
+                    with torch.no_grad():
+                        for gnn_batch_val in val_gnn_loader:
+                            gnn_batch_val = gnn_batch_val.to(device)
+                            gnn_outputs_val = gnn_model_inner(gnn_batch_val)
+                            # Sigmoid for BCEWithLogitsLoss, then get class 1 prob
+                            gnn_probs_val = torch.sigmoid(gnn_outputs_val).cpu().numpy()
+                            inner_val_preds_gnn_list.append(gnn_probs_val)
+
+                    if inner_val_preds_gnn_list:
+                        concatenated_preds_gnn = np.concatenate(inner_val_preds_gnn_list)
+                        # Ensure 2D for binary: [prob_class_0, prob_class_1]
+                        if num_classes == 2:
+                             gnn_oof_probas_2d = np.hstack([1 - concatenated_preds_gnn.reshape(-1,1), concatenated_preds_gnn.reshape(-1,1)])
+                        else: # Multiclass: ensure shape is (N, num_classes) - GNN output needs adjustment if not
+                             gnn_oof_probas_2d = concatenated_preds_gnn # This assumes GNN outputs (N,num_classes) for multiclass
+
+                        if oof_preds_inner['gnn'][inner_val_idx].shape == gnn_oof_probas_2d.shape:
+                             oof_preds_inner['gnn'][inner_val_idx] = gnn_oof_probas_2d
+                        else:
+                             logger.error(f"GNN OOF shape mismatch. Target: {oof_preds_inner['gnn'][inner_val_idx].shape}, Value: {gnn_oof_probas_2d.shape}")
+                             # Fill with default if mismatch
+                             oof_preds_inner['gnn'][inner_val_idx] = np.full((len(inner_val_idx), num_classes), 1/num_classes)
+
+                    # --- GNN Outer Test Predictions (from this inner fold's GNN model) ---
+                    # This requires outer_test_graph_dataset to be ready
+                    if outer_test_graph_dataset and len(outer_test_graph_dataset) > 0:
+                        outer_test_gnn_loader = PyGDataLoader(outer_test_graph_dataset, batch_size=gnn_batch_size, shuffle=False)
+                        outer_test_preds_gnn_list = []
+                        with torch.no_grad():
+                            for gnn_batch_test in outer_test_gnn_loader:
+                                gnn_batch_test = gnn_batch_test.to(device)
+                                gnn_outputs_test = gnn_model_inner(gnn_batch_test)
+                                gnn_probs_test = torch.sigmoid(gnn_outputs_test).cpu().numpy()
+                                outer_test_preds_gnn_list.append(gnn_probs_test)
+
+                        if outer_test_preds_gnn_list:
+                            concatenated_test_preds_gnn = np.concatenate(outer_test_preds_gnn_list)
+                            if num_classes == 2:
+                                gnn_test_probas_2d = np.hstack([1 - concatenated_test_preds_gnn.reshape(-1,1), concatenated_test_preds_gnn.reshape(-1,1)])
+                            else:
+                                gnn_test_probas_2d = concatenated_test_preds_gnn # Adjust if multiclass output from GNN is different
+
+                            if base_model_preds_on_outer_test_sum['gnn'].shape == gnn_test_probas_2d.shape:
+                                base_model_preds_on_outer_test_sum['gnn'] += gnn_test_probas_2d / n_inner_folds
+                            else:
+                                logger.error(f"GNN Test Sum shape mismatch. Target: {base_model_preds_on_outer_test_sum['gnn'].shape}, Value: {gnn_test_probas_2d.shape}")
+
+                    logger.info(f"Inner Fold {inner_fold_idx + 1}: HeteroTemporalGNN training and prediction complete.")
+
+                except Exception as e_gnn_inner:
+                    logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during HeteroTemporalGNN: {e_gnn_inner}")
+                    import traceback
+                    logger.error(f"GNN Traceback: {traceback.format_exc()}")
+                    # Fill with defaults if GNN fails for this inner fold
+                    oof_preds_inner['gnn'][inner_val_idx] = np.full((len(inner_val_idx), num_classes), 1 / num_classes)
+                    base_model_preds_on_outer_test_sum['gnn'] += np.full((len(y_outer_test), num_classes), 1 / num_classes) / n_inner_folds
+            # --- End GNN Block ---
 
         logger.info(f"Outer Fold {outer_fold_idx + 1}: Finished generating OOF predictions from inner CV.")
         meta_features_train_outer_list = []
@@ -556,6 +891,9 @@ def main(config_path):
             oof_preds_inner['lgbm'])
         if config.get('ensemble', {}).get('train_teco', True): meta_features_train_outer_list.append(
             oof_preds_inner['teco'])
+        if train_gnn: # Add GNN OOF preds if GNN was trained
+            meta_features_train_outer_list.append(oof_preds_inner['gnn'])
+
 
         if not meta_features_train_outer_list:
             logger.error(
@@ -592,9 +930,19 @@ def main(config_path):
                     base_model_preds_on_outer_test_sum['lgbm'])
                 if config.get('ensemble', {}).get('train_teco', True): meta_features_test_outer_list.append(
                     base_model_preds_on_outer_test_sum['teco'])
+                if train_gnn: # Add GNN test preds if GNN was trained
+                    meta_features_test_outer_list.append(base_model_preds_on_outer_test_sum['gnn'])
 
-                X_meta_test_outer = np.concatenate(meta_features_test_outer_list, axis=1)
-                final_preds_meta_proba_outer = xgb_meta_model_outer.predict_proba(X_meta_test_outer)
+                if not meta_features_test_outer_list: # Should not happen if train_meta_learner is true and at least one base model ran
+                    logger.error(f"Outer Fold {outer_fold_idx + 1}: No base model predictions available for meta-learner test set. Skipping meta-learner prediction.")
+                    # Fill meta metrics with NaN for this fold
+                    for key in outer_fold_metrics_meta.keys(): outer_fold_metrics_meta[key].append(np.nan)
+                    wandb.log({f"outer_fold_{outer_fold_idx + 1}/meta_auroc": np.nan, "outer_fold": outer_fold_idx + 1})
+                    # Skip to soft voting or next part of the loop for this outer fold
+                    # This requires careful restructuring of the following soft-voting block or a continue
+                else:
+                    X_meta_test_outer = np.concatenate(meta_features_test_outer_list, axis=1)
+                    final_preds_meta_proba_outer = xgb_meta_model_outer.predict_proba(X_meta_test_outer)
                 final_preds_meta_labels_outer = xgb_meta_model_outer.predict(X_meta_test_outer)
 
                 acc_meta_outer = accuracy_score(y_outer_test, final_preds_meta_labels_outer)
@@ -633,9 +981,17 @@ def main(config_path):
                 wandb.log({f"outer_fold_{outer_fold_idx + 1}/meta_auroc": np.nan, "outer_fold": outer_fold_idx + 1})
 
         soft_vote_weights = config.get('ensemble', {}).get('soft_vote_weights', {})
-        active_models_for_sv = [model_key for model_key in ['lgbm', 'teco']  # Add other models if they return
-                                if config.get('ensemble', {}).get(f'train_{model_key}',
-                                                                  True) and model_key in soft_vote_weights]
+
+        # Determine active models for soft voting, now potentially including GNN
+        potential_sv_models = ['lgbm', 'teco']
+        if train_gnn:
+            potential_sv_models.append('gnn')
+
+        active_models_for_sv = [model_key for model_key in potential_sv_models
+                                if config.get('ensemble', {}).get(f'train_{model_key}', True) and \
+                                   model_key in soft_vote_weights and \
+                                   model_key in base_model_preds_on_outer_test_sum # Ensure predictions exist
+                               ]
 
         if soft_vote_weights and active_models_for_sv:
             logger.info(
@@ -644,19 +1000,19 @@ def main(config_path):
                 final_preds_soft_vote_proba_outer = np.zeros((len(y_outer_test), num_classes))
                 total_weight = 0.0
 
-                for model_key in active_models_for_sv:
-                    weight = soft_vote_weights.get(model_key, 0)
-                    if weight > 0:
-                        # Ensure the predictions are valid before adding
-                        preds_to_add = base_model_preds_on_outer_test_sum.get(model_key)
-                        if preds_to_add is not None and preds_to_add.shape == final_preds_soft_vote_proba_outer.shape:
-                            final_preds_soft_vote_proba_outer += weight * preds_to_add
-                            total_weight += weight
-                        else:
-                            logger.warning(
-                                f"Soft Voting: Skipping model {model_key} due to invalid predictions (shape mismatch or missing).")
+                for model_key in active_models_for_sv: # Iterate only over active, weighted models
+                    weight = soft_vote_weights.get(model_key, 0) # Should be >0 due to check above
+                    # Ensure the predictions are valid before adding
+                    preds_to_add = base_model_preds_on_outer_test_sum.get(model_key)
 
-                if total_weight > 1e-6:
+                    if preds_to_add is not None and preds_to_add.shape == final_preds_soft_vote_proba_outer.shape:
+                        final_preds_soft_vote_proba_outer += weight * preds_to_add
+                        total_weight += weight
+                    else:
+                        logger.warning(
+                            f"Soft Voting: Skipping model {model_key} due to invalid predictions (shape {preds_to_add.shape if preds_to_add is not None else 'None'} vs target {final_preds_soft_vote_proba_outer.shape} or missing).")
+
+                if total_weight > 1e-6: # Check if any valid weighted predictions were actually added
                     # Normalize probabilities if total_weight is not 1 (or close to it)
                     # This is more robust if weights are relative importance rather than summing to 1.
                     final_preds_soft_vote_proba_outer /= total_weight
