@@ -54,21 +54,55 @@ class LightGBMModel:
                                          Stops training if validation metric doesn't improve.
             categorical_feature (str or list): Categorical features for LightGBM.
                                                'auto' or list of column names/indices.
+            categorical_feature (str or list): Categorical features for LightGBM.
+                                               'auto' or list of column names/indices.
         """
-        # Determine objective and metric based on number of unique classes in y_train
-        num_classes = len(np.unique(y_train))
-        if num_classes == 2:
-            self.params['objective'] = 'binary'
-            self.params['metric'] = 'binary_logloss' # Or 'auc'
-            # For binary, class_weight might need adjustment if it's a dict.
-            # 'balanced' works for both.
+        # Use a local copy of params for modification within this method call
+        current_params = self.params.copy()
+
+        original_objective_from_init = current_params.get('objective', '').lower()
+        original_metric_from_init = current_params.get('metric', '').lower()
+
+        print(f"[DEBUG] LightGBMModel.train() - Start. Objective from __init__: {original_objective_from_init}, Metric from __init__: {original_metric_from_init}")
+
+        is_regression_task = any(reg_obj in original_objective_from_init for reg_obj in
+                                 ['regression', 'regression_l1', 'regression_l2', 'mae', 'mse', 'huber', 'quantile', 'poisson', 'gamma', 'tweedie'])
+
+        if is_regression_task:
+            current_params['objective'] = original_objective_from_init # Explicitly set regression objective
+            # Ensure metric is regression-appropriate
+            if not original_metric_from_init or not any(reg_metric in original_metric_from_init for reg_metric in ['mae', 'mse', 'rmse', 'huber', 'quantile', 'poisson', 'gamma', 'tweedie', 'l1', 'l2']): # l1/l2 can be metrics too
+                current_params['metric'] = 'mae' # Default regression metric
+            else:
+                current_params['metric'] = original_metric_from_init # Keep user-defined regression metric
+
+            if 'num_class' in current_params:
+                del current_params['num_class']
         else:
-            self.params['objective'] = 'multiclass'
-            self.params['metric'] = 'multi_logloss' # Or 'multi_error'
-            self.params['num_class'] = num_classes
+            # Auto-detect for classification (binary/multiclass)
+            num_unique_labels = len(np.unique(y_train))
+            if num_unique_labels == 2:
+                current_params['objective'] = 'binary'
+                # Keep original metric if suitable (e.g. 'auc'), else default to 'binary_logloss'
+                if not original_metric_from_init or \
+                   any(cls_metric in original_metric_from_init for cls_metric in ['multi_logloss', 'multi_error', 'regression', 'mae', 'mse']): # if metric seems non-binary classification
+                    current_params['metric'] = 'binary_logloss'
+                else:
+                    current_params['metric'] = original_metric_from_init
 
-        print(f"LightGBM using objective: {self.params['objective']} and metric: {self.params['metric']}")
+                if 'num_class' in current_params: # Not needed for binary
+                    del current_params['num_class']
+            else:
+                current_params['objective'] = 'multiclass'
+                current_params['num_class'] = num_unique_labels
+                # Keep original metric if suitable, else default to 'multi_logloss'
+                if not original_metric_from_init or \
+                   any(cls_metric in original_metric_from_init for cls_metric in ['binary_logloss', 'auc', 'binary_error', 'regression', 'mae', 'mse']): # if metric seems non-multiclass classification
+                     current_params['metric'] = 'multi_logloss'
+                else:
+                    current_params['metric'] = original_metric_from_init
 
+        print(f"LightGBM using effective objective: {current_params.get('objective')} and effective metric: {current_params.get('metric')}")
 
         lgb_train = lgb.Dataset(X_train, y_train, categorical_feature=categorical_feature, free_raw_data=False)
 
@@ -88,7 +122,7 @@ class LightGBMModel:
             valid_names.append('valid')
 
         self.model = lgb.train(
-            self.params,
+            current_params, # USE THE MODIFIED current_params
             lgb_train,
             num_boost_round=num_boost_round,
             valid_sets=valid_sets,
