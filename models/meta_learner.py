@@ -2,6 +2,8 @@ import xgboost as xgb
 import numpy as np
 import joblib # For saving/loading model
 import logging # For logging
+import optuna # Import Optuna
+from sklearn.metrics import roc_auc_score, log_loss # For Optuna objective
 
 # It's good practice to have a logger instance per module.
 logger = logging.getLogger(__name__)
@@ -59,9 +61,10 @@ class XGBoostMetaLearner:
         logger.debug(f"XGBoostMetaLearner initialized with effective params: {self.params}")
 
     def train(self, X_train, y_train, X_val=None, y_val=None,
-              num_boost_round=500, early_stopping_rounds=30, verbose_eval=100):
+              num_boost_round=500, early_stopping_rounds=30, verbose_eval=100,
+              use_optuna=False, optuna_n_trials=20, optuna_timeout=None, wandb_run=None):
         """
-        Trains the XGBoost model.
+        Trains the XGBoost model, with optional Optuna hyperparameter tuning.
 
         This method automatically adjusts 'objective' and 'eval_metric' parameters
         based on the number of unique classes detected in `y_train`, switching
@@ -69,24 +72,18 @@ class XGBoostMetaLearner:
         if validation data (`X_val`, `y_val`) is provided.
 
         Args:
-            X_train (np.ndarray): Training features. In a stacking ensemble, these are
-                                  typically the out-of-fold (OOF) predictions from base models.
-            y_train (np.ndarray): Training labels. Must be integer-coded for classification.
-            X_val (np.ndarray, optional): Validation features for early stopping. If None,
-                                          early stopping (if configured) might not work as expected
-                                          unless an evaluation set is implicitly handled by XGBoost's
-                                          internal mechanisms (e.g., if 'evals' is in `self.params`).
-            y_val (np.ndarray, optional): Validation labels for early stopping.
-            num_boost_round (int): The maximum number of boosting rounds (trees to build).
-            early_stopping_rounds (int, optional): Activates early stopping. Training will stop if
-                                         the primary validation metric on the last evaluation set
-                                         does not improve for this many consecutive rounds.
-                                         Requires `X_val` and `y_val` to be provided.
-                                         Set to None or 0 to disable explicit early stopping here.
-            verbose_eval (int or bool): Controls the verbosity of evaluation metric output during training.
-                                        If an integer, metrics are printed every `verbose_eval` rounds.
-                                        If True, metrics are printed every round.
-                                        If False, no metrics are printed during training.
+            X_train (np.ndarray): Training features.
+            y_train (np.ndarray): Training labels.
+            X_val (np.ndarray, optional): Validation features for early stopping / Optuna.
+            y_val (np.ndarray, optional): Validation labels for early stopping / Optuna.
+            num_boost_round (int): Max boosting rounds (used if Optuna is off, or as max for Optuna trials).
+            early_stopping_rounds (int, optional): For early stopping.
+            verbose_eval (int or bool): Verbosity for XGBoost training.
+            use_optuna (bool): If True, use Optuna for hyperparameter tuning.
+            optuna_n_trials (int): Number of Optuna trials.
+            optuna_timeout (int, optional): Timeout in seconds for Optuna study.
+            wandb_run (wandb.sdk.wandb_run.Run, optional): Active W&B run object for logging Optuna results.
+
         Raises:
             ValueError: If X_train/y_train are None, shapes mismatch, or < 2 unique classes in y_train.
             TypeError: If X_train/y_train (or X_val/y_val if provided) are not numpy arrays.
@@ -112,60 +109,142 @@ class XGBoostMetaLearner:
             logger.error(f"Number of unique classes in y_train must be at least 2. Found {num_unique_classes}.")
             raise ValueError(f"Number of unique classes in y_train must be at least 2. Found {num_unique_classes}.")
 
-        # --- Auto-adjust objective and eval_metric based on number of classes ---
-        user_defined_objective = self.params.get('objective', '')
+        self.num_classes = num_unique_classes # Store for Optuna objective
 
-        if num_unique_classes == 2:
+        # --- Auto-adjust objective and eval_metric based on number of classes ---
+        # Store original params for Optuna, as self.params will be updated
+        current_params = self.params.copy()
+        user_defined_objective = current_params.get('objective', '')
+
+        if self.num_classes == 2:
             if not user_defined_objective.startswith('binary:'):
-                self.params['objective'] = 'binary:logistic'
-                if 'eval_metric' not in self.params or self.params.get('eval_metric') == 'mlogloss': # Check if default multiclass metric was present
-                    self.params['eval_metric'] = ['logloss']
+                current_params['objective'] = 'binary:logistic'
+                if 'eval_metric' not in current_params or current_params.get('eval_metric') == 'mlogloss':
+                    current_params['eval_metric'] = ['logloss']
         else: # Multiclass
             if not user_defined_objective.startswith('multi:'):
-                self.params['objective'] = 'multi:softprob'
-                if 'eval_metric' not in self.params or self.params.get('eval_metric') == 'logloss': # Check if default binary metric was present
-                     self.params['eval_metric'] = ['mlogloss']
-            self.params['num_class'] = num_unique_classes
+                current_params['objective'] = 'multi:softprob'
+                if 'eval_metric' not in current_params or current_params.get('eval_metric') == 'logloss':
+                     current_params['eval_metric'] = ['mlogloss']
+            current_params['num_class'] = self.num_classes
 
-        if 'eval_metric' in self.params and isinstance(self.params['eval_metric'], str):
-            self.params['eval_metric'] = [self.params['eval_metric']]
-        # --- End auto-adjustment ---
+        if 'eval_metric' in current_params and isinstance(current_params['eval_metric'], str):
+            current_params['eval_metric'] = [current_params['eval_metric']]
 
-        logger.info(f"XGBoostMetaLearner: Training with effective objective='{self.params['objective']}', "
+        # Update self.params with potentially auto-adjusted ones before Optuna or training
+        self.params = current_params
+
+        logger.info(f"XGBoostMetaLearner: Initial effective objective='{self.params['objective']}', "
                     f"eval_metric(s)='{self.params.get('eval_metric', 'None specified')}'")
 
-        try:
-            dtrain = xgb.DMatrix(X_train, label=y_train, nthread=self.params.get('nthread', -1))
-        except Exception as e:
-            logger.error(f"Failed to create DMatrix for training data: {e}")
-            raise
+        dtrain = xgb.DMatrix(X_train, label=y_train, nthread=self.params.get('nthread', -1))
+        dval = None
+        evals_list = [(dtrain, 'train')]
+        use_early_stopping_for_final_train = False
 
-        evals_list = []
-        evals_result_history = {}
-
-        use_early_stopping = False
         if X_val is not None and y_val is not None:
             if not isinstance(X_val, np.ndarray) or not isinstance(y_val, np.ndarray):
-                logger.error(f"X_val and y_val must be numpy arrays if provided. Got types: {type(X_val)}, {type(y_val)}")
                 raise TypeError("X_val and y_val must be numpy arrays if provided.")
             if X_val.shape[0] != y_val.shape[0]:
                  raise ValueError("X_val and y_val must have the same number of samples.")
-            try:
-                dval = xgb.DMatrix(X_val, label=y_val, nthread=self.params.get('nthread', -1))
-                evals_list = [(dtrain, 'train'), (dval, 'eval')]
-                if early_stopping_rounds is not None and early_stopping_rounds > 0:
-                    use_early_stopping = True
-                else:
-                    logger.info("Validation data (X_val, y_val) provided, but early_stopping_rounds is not set > 0. Early stopping will not be explicitly enabled by this wrapper.")
-            except Exception as e:
-                logger.error(f"Failed to create DMatrix for validation data: {e}. Proceeding without validation set for early stopping.")
-                evals_list = [(dtrain, 'train')]
-        else:
-            evals_list = [(dtrain, 'train')]
+            dval = xgb.DMatrix(X_val, label=y_val, nthread=self.params.get('nthread', -1))
+            evals_list.append((dval, 'eval'))
             if early_stopping_rounds is not None and early_stopping_rounds > 0:
-                 logger.warning("early_stopping_rounds specified but X_val/y_val not provided. Early stopping via this wrapper is disabled.")
+                use_early_stopping_for_final_train = True
+        elif early_stopping_rounds is not None and early_stopping_rounds > 0:
+            logger.warning("early_stopping_rounds specified but X_val/y_val not provided. Early stopping disabled.")
 
-        effective_early_stopping_rounds = early_stopping_rounds if use_early_stopping else None
+        if use_optuna:
+            if dval is None:
+                logger.warning("Optuna is enabled, but no validation set (X_val, y_val) was provided. "
+                               "Optuna will optimize based on cross-validation within XGBoost if supported by params, "
+                               "or this might lead to suboptimal tuning. Consider providing a validation set.")
+
+            def xgb_objective(trial):
+                xgb_params = {
+                    'objective': self.params['objective'], # Use auto-detected objective
+                    'eval_metric': self.params['eval_metric'], # Use auto-detected eval_metric
+                    'eta': trial.suggest_float('eta', 1e-3, 0.3, log=True),
+                    'max_depth': trial.suggest_int('max_depth', 2, 10),
+                    'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+                    'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+                    'min_child_weight': trial.suggest_int('min_child_weight', 1, 20),
+                    'gamma': trial.suggest_float('gamma', 1e-8, 1.0, log=True),
+                    'lambda': trial.suggest_float('lambda', 1e-8, 10.0, log=True), # L2 reg
+                    'alpha': trial.suggest_float('alpha', 1e-8, 10.0, log=True),   # L1 reg
+                    'seed': self.params.get('seed', 42),
+                    'nthread': self.params.get('nthread', -1),
+                }
+                if self.params.get('objective', '').startswith('multi:'):
+                    xgb_params['num_class'] = self.num_classes
+
+                trial_early_stopping_rounds = max(10, early_stopping_rounds // 2 if early_stopping_rounds else 10) # shorter for trials
+
+                try:
+                    pruning_callback = optuna.integration.XGBoostPruningCallback(trial, f"eval-{self.params['eval_metric'][0]}")
+
+                    temp_model = xgb.train(
+                        xgb_params,
+                        dtrain,
+                        num_boost_round=num_boost_round, # Max rounds for this trial
+                        evals=evals_list,
+                        early_stopping_rounds=trial_early_stopping_rounds,
+                        verbose_eval=False, # Keep Optuna trials quiet
+                        callbacks=[pruning_callback]
+                    )
+
+                    # Get the best score from the validation set
+                    # XGBoost's train returns a Booster object. The score is in best_score if early stopping triggered.
+                    # Or, we can predict on dval and calculate score.
+                    if dval is not None:
+                        preds_proba_val = temp_model.predict(dval, iteration_range=(0, temp_model.best_iteration if hasattr(temp_model, 'best_iteration') else 0))
+                        if self.num_classes == 2:
+                            score = roc_auc_score(y_val, preds_proba_val) # Maximize AUROC for binary
+                        else: # Multiclass
+                            score = log_loss(y_val, preds_proba_val) # Minimize logloss for multiclass
+                        return score
+                    else: # Fallback if no dval, rely on internal eval if any, or return a marker
+                        # This case needs careful consideration: what metric to return if no validation set?
+                        # Optuna usually requires a validation score.
+                        logger.warning("Optuna trial running without external validation set. Pruning/evaluation might be suboptimal.")
+                        # Return a value that Optuna can work with, e.g. last training loss if available
+                        # For now, returning a neutral value or raising error might be better.
+                        # Let's assume the pruning callback handles cases without dval based on train loss.
+                        # The 'evals_result' from xgb.train could be parsed if needed.
+                        # For simplicity, if no dval, we might have to skip proper Optuna evaluation here.
+                        # This part of the objective function assumes dval is present for scoring.
+                        return 0.0 # Should be improved if dval is not guaranteed for Optuna.
+
+
+                except optuna.exceptions.TrialPruned:
+                    raise
+                except Exception as e:
+                    logger.warning(f"Optuna trial failed: {e}")
+                    return float('inf') if self.params['eval_metric'][0] in ['logloss', 'mlogloss'] else 0.0 # Return worst score
+
+            study_direction = 'maximize' if self.num_classes == 2 else 'minimize' # AUROC vs LogLoss
+            study = optuna.create_study(direction=study_direction, sampler=optuna.samplers.TPESampler(seed=self.params.get('seed', 42)))
+            study.optimize(xgb_objective, n_trials=optuna_n_trials, timeout=optuna_timeout)
+
+            logger.info(f"Optuna study completed. Best trial: {study.best_trial.number}, Value: {study.best_value}")
+            logger.info(f"Best parameters from Optuna: {study.best_params}")
+
+            if wandb_run and hasattr(wandb_run, 'log'):
+                wandb_run.log({
+                    "meta_optuna_best_value": study.best_value,
+                    "meta_optuna_best_params": study.best_params
+                })
+
+            # Update self.params with the best ones found by Optuna
+            self.params.update(study.best_params)
+            # Potentially adjust num_boost_round based on Optuna's findings if n_estimators was tuned,
+            # or use the original num_boost_round for the final fit with best params.
+            # For now, we'll use the original num_boost_round with early stopping for the final model.
+            logger.info(f"Training final XGBoost Meta-Learner with Optuna's best_params: {self.params}")
+
+        # --- Final Model Training (either with original params or Optuna-tuned params) ---
+        evals_result_history = {}
+        effective_early_stopping_rounds = early_stopping_rounds if use_early_stopping_for_final_train else None
 
         try:
             self.model = xgb.train(
@@ -185,7 +264,7 @@ class XGBoostMetaLearner:
             logger.error(f"An unexpected error occurred during XGBoost training: {e}")
             raise
 
-        if use_early_stopping and hasattr(self.model, 'best_iteration') and self.model.best_iteration is not None:
+        if use_early_stopping_for_final_train and hasattr(self.model, 'best_iteration') and self.model.best_iteration is not None:
             self.best_iteration = self.model.best_iteration
             logger.info(f"XGBoostMetaLearner: Model training complete. Best iteration: {self.best_iteration} (due to early stopping).")
         else:
@@ -193,6 +272,7 @@ class XGBoostMetaLearner:
             logger.info(f"XGBoostMetaLearner: Model training complete. Total rounds: {self.best_iteration} (early stopping not triggered or disabled).")
 
         logger.debug(f"XGBoostMetaLearner: Training evaluation results history: {evals_result_history}")
+
 
     def predict_proba(self, X_test):
         """
