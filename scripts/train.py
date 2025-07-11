@@ -185,12 +185,10 @@ def main(config_path):
     if not train_gnn:
         logger.info("GNN training is disabled for this run.")
 
-import time # Added for timing (should be at the top, but ensuring it's present)
-
 # ... (other imports)
 
 # --- Preprocessing Setup (for tabular models like LGBM, TECO) ---
-    logger.info("Starting preprocessing setup...")
+    logger.info("Starting preprocessing setup...") # This line was indented
     preproc_setup_start_time = time.time()
 
     preproc_cfg = config.get('preprocessing', {})
@@ -324,7 +322,7 @@ import time # Added for timing (should be at the top, but ensuring it's present)
     # Note: For NCV, the preprocessor should be fit *inside each outer fold* on its training split.
     # This `global_preprocessor` is a template; a new one is instantiated per outer fold.
 
-    # --- Nested Cross-Validation Setup ---
+# --- Nested Cross-Validation Setup ---
     n_outer_folds = config.get('ensemble', {}).get('n_outer_folds', 5)
     n_inner_folds = config.get('ensemble', {}).get('n_inner_folds_for_oof', 5)
     outer_skf = StratifiedKFold(n_splits=n_outer_folds, shuffle=True, random_state=seed)
