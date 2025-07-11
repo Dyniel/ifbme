@@ -61,6 +61,7 @@ def create_global_mappers(all_patient_data_df, patient_id_col,
           f"{len(mappers['diagnosis_to_id'])} diagnoses, "
           f"{len(mappers.get('medication_to_id', {}))} medications, " # Use .get for safety
           f"{len(mappers.get('procedure_to_id', {}))} procedures.") # Use .get for safety
+
     return mappers
 
 

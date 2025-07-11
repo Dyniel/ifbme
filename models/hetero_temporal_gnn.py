@@ -58,6 +58,7 @@ class HeteroTemporalGNN(nn.Module):
         active_concept_node_types = [nt for nt in ['vital', 'diagnosis', 'medication', 'procedure'] if nt in self.node_types]
 
         for node_type in active_concept_node_types:
+
             if node_type in self.num_nodes_dict and self.num_nodes_dict[node_type] > 0:
                 self.embeddings[node_type] = nn.Embedding(
                     num_embeddings=self.num_nodes_dict[node_type],

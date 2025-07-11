@@ -8,11 +8,13 @@ import logging
 # Assuming logger is configured appropriately at the application level
 logger = logging.getLogger(__name__)
 
+
 class PositionalEncoding(nn.Module):
     """
     Standard Positional Encoding for Transformers.
     Adds positional information to input embeddings.
     """
+
     def __init__(self, d_model, dropout=0.1, max_len=5000):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
@@ -22,8 +24,8 @@ class PositionalEncoding(nn.Module):
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0) # Shape: (1, max_len, d_model) - for batch compatibility
-        self.register_buffer('pe', pe) # Not a parameter, but part of state
+        pe = pe.unsqueeze(0)  # Shape: (1, max_len, d_model) - for batch compatibility
+        self.register_buffer('pe', pe)  # Not a parameter, but part of state
 
     def forward(self, x):
         """
@@ -51,11 +53,13 @@ class TECOTransformerModel(nn.Module):
 
     This model processes sequences of features (e.g., time-series EHR data).
     """
+
     # Defaults d_model=512, num_encoder_layers=4 as per AUROC spec
     # nhead=8, dim_feedforward=2048 are common for d_model=512
     def __init__(self, input_feature_dim, d_model=512, num_encoder_layers=4,
                  nhead=8, dim_feedforward=2048, dropout=0.1, num_classes=None,
                  max_seq_len=500): # max_seq_len for PositionalEncoding
+
         """
         Args:
             input_feature_dim (int): Dimensionality of input features at each time step.
@@ -72,6 +76,7 @@ class TECOTransformerModel(nn.Module):
         self.d_model = d_model
         self.max_seq_len_config = max_seq_len # Store for clarity if needed for debug
 
+
         # 1. Input Embedding/Projection
         # Project input features to d_model if they are not already that dimension.
         self.input_projection = nn.Linear(input_feature_dim, self.d_model)
@@ -85,7 +90,7 @@ class TECOTransformerModel(nn.Module):
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            batch_first=True # Assumes input shape (batch, seq_len, features)
+            batch_first=True  # Assumes input shape (batch, seq_len, features)
         )
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer,
@@ -97,12 +102,14 @@ class TECOTransformerModel(nn.Module):
         if self.num_classes is not None:
             self.output_classifier = nn.Linear(self.d_model, self.num_classes) # Use self.d_model and self.num_classes
 
+
         self._init_weights()
 
     def _init_weights(self):
         # Initialize weights for linear layers
         for name, p in self.named_parameters():
-            if p.dim() > 1 and ("transformer_encoder" in name or "input_projection" in name or "output_classifier" in name):
+            if p.dim() > 1 and (
+                    "transformer_encoder" in name or "input_projection" in name or "output_classifier" in name):
                 if "weight" in name:
                     nn.init.xavier_uniform_(p)
                 elif "bias" in name:
@@ -142,6 +149,7 @@ class TECOTransformerModel(nn.Module):
 
         # --- Start Debugging/Assertion Block for TransformerEncoder input ---
         assert isinstance(x, torch.Tensor), f"Input 'x' to TransformerEncoder (after pos_encoder) must be a Tensor. Got {type(x)}"
+
         assert x.dim() == 3, f"Input 'x' to TransformerEncoder must be 3D (batch, seq, d_model). Got {x.dim()}D, shape {x.shape}"
 
         # Batch size check (can be done once, e.g. on src_sequences.shape[0])
@@ -160,6 +168,7 @@ class TECOTransformerModel(nn.Module):
             assert src_padding_mask.dim() == 2, f"src_padding_mask must be 2D (batch, seq). Got {src_padding_mask.dim()}D, shape {src_padding_mask.shape}"
             assert src_padding_mask.shape[0] == batch_size, f"src_padding_mask batch size ({src_padding_mask.shape[0]}) must match input 'x' batch size ({batch_size})."
             assert src_padding_mask.shape[1] == current_seq_len, f"src_padding_mask sequence length ({src_padding_mask.shape[1]}) must match input 'x' sequence length ({current_seq_len})."
+
             assert src_padding_mask.dtype == torch.bool, f"src_padding_mask dtype must be torch.bool. Got {src_padding_mask.dtype}"
         # --- End Debugging/Assertion Block ---
 
@@ -173,6 +182,7 @@ class TECOTransformerModel(nn.Module):
             if src_padding_mask is not None:
                 logger.error(f"  src_padding_mask properties: shape={src_padding_mask.shape}, dtype={src_padding_mask.dtype}, device={src_padding_mask.device}")
                 if src_padding_mask.numel() > 0 and src_padding_mask.shape[0] > 0: # Check if mask has elements and at least one batch item
+
                     sample_mask_slice = src_padding_mask[0, :min(5, src_padding_mask.shape[1])]
                     logger.error(f"  src_padding_mask sample (first batch item, up to 5 elements): {sample_mask_slice}")
                 else:
@@ -196,6 +206,7 @@ class TECOTransformerModel(nn.Module):
                 num_valid_tokens_per_sequence = inverted_padding_mask.sum(dim=1).float()
                 num_valid_tokens_per_sequence = torch.clamp(num_valid_tokens_per_sequence, min=1) # Avoid division by zero
 
+
                 pooled_output = sum_embeddings / num_valid_tokens_per_sequence.unsqueeze(-1)
             else:
                 # No padding mask provided, assume all tokens are valid
@@ -215,13 +226,13 @@ if __name__ == '__main__':
 
     # Configuration
     batch_size_ex = 4
-    seq_len_ex = 50    # Length of input sequences (e.g., time steps)
-    input_feats_ex = 20 # Number of features at each time step
+    seq_len_ex = 50  # Length of input sequences (e.g., time steps)
+    input_feats_ex = 20  # Number of features at each time step
 
-    d_model_ex = 128 # For faster test, spec says 512
+    d_model_ex = 128  # For faster test, spec says 512
     n_layers_ex = 2  # For faster test, spec says 4
-    n_heads_ex = 4   # Number of attention heads
-    n_classes_ex = 3 # Example for 3-class classification
+    n_heads_ex = 4  # Number of attention heads
+    n_classes_ex = 3  # Example for 3-class classification
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -233,7 +244,7 @@ if __name__ == '__main__':
         num_encoder_layers=n_layers_ex,
         nhead=n_heads_ex,
         num_classes=n_classes_ex,
-        max_seq_len=seq_len_ex + 10 # Ensure max_len is sufficient
+        max_seq_len=seq_len_ex + 10  # Ensure max_len is sufficient
     ).to(device)
     print(f"\nTECO-Transformer Model structure:\n{teco_model}")
 
@@ -249,11 +260,10 @@ if __name__ == '__main__':
     print(f"\nInput sequences shape: {dummy_sequences.shape}")
     print(f"Padding mask shape: {dummy_padding_mask.shape}, example sum: {dummy_padding_mask[1].sum()}")
 
-
     # 3. Forward pass
     try:
         logits_output = teco_model(dummy_sequences, src_padding_mask=dummy_padding_mask)
-        print(f"\nModel output (logits) shape: {logits_output.shape}") # (batch_size, num_classes)
+        print(f"\nModel output (logits) shape: {logits_output.shape}")  # (batch_size, num_classes)
 
         # Conceptual: Training step
         # dummy_targets = torch.randint(0, n_classes_ex, (batch_size_ex,), device=device)
@@ -272,9 +282,9 @@ if __name__ == '__main__':
         d_model=d_model_ex,
         num_encoder_layers=n_layers_ex,
         nhead=n_heads_ex,
-        num_classes=None # Output embeddings
+        num_classes=None  # Output embeddings
     ).to(device)
     sequence_embeddings = teco_embedder(dummy_sequences, src_padding_mask=dummy_padding_mask)
-    print(f"\nModel output (sequence embeddings) shape: {sequence_embeddings.shape}") # (batch, seq, d_model)
+    print(f"\nModel output (sequence embeddings) shape: {sequence_embeddings.shape}")  # (batch, seq, d_model)
 
     print("\n--- TECO-Transformer Example Finished ---")

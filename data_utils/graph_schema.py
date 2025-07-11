@@ -16,6 +16,7 @@ NODE_TYPES = [
     'diagnosis',  # Represents an ICD code (D_k)
     # 'medication', # Represents an ATC medication code/class (M_j) - Commented out as not in sample data
     # 'procedure',  # Represents a procedure code (P_l) - Commented out
+
 ]
 
 # Edge Types
@@ -44,6 +45,7 @@ EDGE_TYPES = [
     # Connections between time slices and procedure codes - Commented out
     # ('timeslice', 'has_procedure', 'procedure'),
     # ('procedure', 'procedure_performed_in', 'timeslice'),
+
 
     # Potentially, relationships between concept nodes themselves if using an ontology
     # e.g., ('diagnosis', 'is_a_parent_of', 'diagnosis') - for future extension

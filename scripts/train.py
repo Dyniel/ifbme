@@ -186,6 +186,7 @@ def main(config_path):
         logger.info("GNN training is disabled for this run.")
 
     # --- Preprocessing Setup (for tabular models like LGBM, TECO) ---
+
     preproc_cfg = config.get('preprocessing', {})
     numerical_cols_from_config = preproc_cfg.get('numerical_cols', [])
     categorical_cols_from_config = preproc_cfg.get('categorical_cols', [])

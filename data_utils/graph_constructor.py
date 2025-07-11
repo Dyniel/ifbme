@@ -299,6 +299,8 @@ def build_patient_graph(patient_df, patient_id, target_variable_name, label_time
     if 'procedure' in NODE_TYPES: # Only set if node type is active in schema
         data['procedure'].num_nodes = len(global_concept_mappers.get('procedure_to_id', {}))
 
+        
+
     # Node features for concept nodes (V,D,M,P) are not set as 'x' here.
     # Instead, the GNN model will use nn.Embedding layers, taking node IDs as input.
     # If we wanted to store the global IDs as a feature, we could do:
