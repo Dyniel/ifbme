@@ -498,54 +498,70 @@ def main(config_path):
                                                       lr=teco_config.get('lr_teco', 1e-4))
                     epochs_teco_inner = teco_config.get('epochs_teco_inner', 10)
 
-                    for epoch in range(epochs_teco_inner):
-                        teco_model_inner.train()
-                        epoch_loss_sum = 0.0
-                        for batch in train_teco_loader_inner:
-                            teco_optimizer_inner.zero_grad()
-                            sequences = batch['sequence'].to(device)
-                            padding_masks = batch['padding_mask'].to(device)
-                            targets = batch['target'].to(device)
+                    # --- TECO Training Phase ---
+                    try:
+                        for epoch in range(epochs_teco_inner):
+                            teco_model_inner.train()
+                            epoch_loss_sum = 0.0
+                            for batch_idx, batch in enumerate(train_teco_loader_inner):
+                                teco_optimizer_inner.zero_grad()
+                                sequences = batch['sequence'].to(device)
+                                padding_masks = batch['padding_mask'].to(device)
+                                targets = batch['target'].to(device)
 
-                            outputs = teco_model_inner(sequences, padding_masks)
-                            loss = teco_criterion_inner(outputs, targets)
-                            loss.backward()
-                            teco_optimizer_inner.step()
-                            epoch_loss_sum += loss.item()
-                        logger.debug(
-                            f"Inner Fold {inner_fold_idx + 1}, TECO Epoch {epoch + 1}/{epochs_teco_inner}, Avg Train Loss: {epoch_loss_sum / len(train_teco_loader_inner):.4f}")
+                                outputs = teco_model_inner(sequences, padding_masks)
+                                loss = teco_criterion_inner(outputs, targets)
+                                loss.backward()
+                                teco_optimizer_inner.step()
+                                epoch_loss_sum += loss.item()
+                            logger.debug(
+                                f"Inner Fold {inner_fold_idx + 1}, TECO Epoch {epoch + 1}/{epochs_teco_inner}, Avg Train Loss: {epoch_loss_sum / len(train_teco_loader_inner):.4f}")
+                    except Exception as e_train_teco:
+                        logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during TECO Training Loop: {e_train_teco}")
+                        logger.error(f"Error occurred in TECO training, epoch {epoch+1 if 'epoch' in locals() else 'unknown'}, batch_idx {batch_idx if 'batch_idx' in locals() else 'unknown'}")
+                        raise  # Re-raise to be caught by the outer TECO try-except
 
-                    teco_model_inner.eval()
-                    inner_val_preds_teco_list = []
-                    with torch.no_grad():
-                        for batch in val_teco_loader_inner:
-                            outputs = teco_model_inner(batch['sequence'].to(device), batch['padding_mask'].to(device))
-                            inner_val_preds_teco_list.append(torch.softmax(outputs, dim=1).cpu().numpy())
+                    # --- TECO Validation Prediction Phase ---
+                    try:
+                        teco_model_inner.eval()
+                        inner_val_preds_teco_list = []
+                        with torch.no_grad():
+                            for batch in val_teco_loader_inner:
+                                outputs = teco_model_inner(batch['sequence'].to(device), batch['padding_mask'].to(device))
+                                inner_val_preds_teco_list.append(torch.softmax(outputs, dim=1).cpu().numpy())
 
-                    if inner_val_preds_teco_list:
-                        oof_preds_inner['teco'][inner_val_idx] = np.concatenate(inner_val_preds_teco_list, axis=0)[:,
-                                                                 :num_classes]
-                    else:
-                        oof_preds_inner['teco'][inner_val_idx] = np.full((len(inner_val_idx), num_classes),
-                                                                         1 / num_classes)
+                        if inner_val_preds_teco_list:
+                            oof_preds_inner['teco'][inner_val_idx] = np.concatenate(inner_val_preds_teco_list, axis=0)[:, :num_classes]
+                        else:
+                            logger.warning(f"Inner Fold {inner_fold_idx + 1}: TECO validation prediction list is empty. Filling with defaults.")
+                            oof_preds_inner['teco'][inner_val_idx] = np.full((len(inner_val_idx), num_classes), 1 / num_classes)
+                    except Exception as e_val_pred_teco:
+                        logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during TECO Validation Prediction: {e_val_pred_teco}")
+                        raise # Re-raise to be caught by the outer TECO try-except
 
-                    outer_test_preds_teco_list = []
-                    with torch.no_grad():
-                        for batch in outer_test_teco_loader:
-                            outputs = teco_model_inner(batch['sequence'].to(device), batch['padding_mask'].to(device))
-                            outer_test_preds_teco_list.append(torch.softmax(outputs, dim=1).cpu().numpy())
+                    # --- TECO Outer Test Prediction Phase ---
+                    try:
+                        outer_test_preds_teco_list = []
+                        with torch.no_grad():
+                            for batch in outer_test_teco_loader:
+                                outputs = teco_model_inner(batch['sequence'].to(device), batch['padding_mask'].to(device))
+                                outer_test_preds_teco_list.append(torch.softmax(outputs, dim=1).cpu().numpy())
 
-                    if outer_test_preds_teco_list:
-                        base_model_preds_on_outer_test_sum['teco'] += np.concatenate(outer_test_preds_teco_list,
-                                                                                     axis=0)[:,
-                                                                      :num_classes] / n_inner_folds
-                    else:
-                        base_model_preds_on_outer_test_sum['teco'] += np.full((len(y_outer_test), num_classes),
-                                                                              1 / num_classes) / n_inner_folds
+                        if outer_test_preds_teco_list:
+                            base_model_preds_on_outer_test_sum['teco'] += np.concatenate(outer_test_preds_teco_list, axis=0)[:, :num_classes] / n_inner_folds
+                        else:
+                            logger.warning(f"Inner Fold {inner_fold_idx + 1}: TECO outer test prediction list is empty. Adding defaults.")
+                            base_model_preds_on_outer_test_sum['teco'] += np.full((len(y_outer_test), num_classes), 1 / num_classes) / n_inner_folds
+                    except Exception as e_test_pred_teco:
+                        logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during TECO Outer Test Prediction: {e_test_pred_teco}")
+                        raise # Re-raise to be caught by the outer TECO try-except
 
                     logger.info(f"Inner Fold {inner_fold_idx + 1}: TECO-Transformer training and prediction complete.")
-                except Exception as e:
-                    logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during TECO-Transformer: {e}")
+                except Exception as e: # This is the main TECO exception handler (line 548 in original)
+                    logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during TECO-Transformer (Main Block): {e}")
+                    # Ensure traceback is logged for unexpected errors not caught by more specific blocks above
+                    import traceback
+                    logger.error(f"Traceback: {traceback.format_exc()}")
                     oof_preds_inner['teco'][inner_val_idx] = np.full((len(inner_val_idx), num_classes), 1 / num_classes)
                     base_model_preds_on_outer_test_sum['teco'] += np.full((len(y_outer_test), num_classes),
                                                                           1 / num_classes) / n_inner_folds
