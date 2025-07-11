@@ -47,13 +47,21 @@ def create_global_mappers(all_patient_data_df, patient_id_col,
         return {code: i for i, code in enumerate(sorted(list(unique_codes)))}
 
     mappers['diagnosis_to_id'] = extract_unique_codes(all_patient_data_df, diagnosis_col_name)
-    mappers['medication_to_id'] = extract_unique_codes(all_patient_data_df, medication_col_name)
-    mappers['procedure_to_id'] = extract_unique_codes(all_patient_data_df, procedure_col_name)
+    # Commenting out med/proc mappers as these columns are optional/placeholders
+    # mappers['medication_to_id'] = extract_unique_codes(all_patient_data_df, medication_col_name)
+    # mappers['procedure_to_id'] = extract_unique_codes(all_patient_data_df, procedure_col_name)
+
+    # Initialize to empty dicts if not created, to prevent KeyErrors later
+    if 'medication_to_id' not in mappers:
+        mappers['medication_to_id'] = {}
+    if 'procedure_to_id' not in mappers:
+        mappers['procedure_to_id'] = {}
 
     print(f"Created mappers: {len(mappers['vital_to_id'])} vitals, "
           f"{len(mappers['diagnosis_to_id'])} diagnoses, "
-          f"{len(mappers['medication_to_id'])} medications, "
-          f"{len(mappers['procedure_to_id'])} procedures.")
+          f"{len(mappers.get('medication_to_id', {}))} medications, " # Use .get for safety
+          f"{len(mappers.get('procedure_to_id', {}))} procedures.") # Use .get for safety
+
     return mappers
 
 

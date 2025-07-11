@@ -206,6 +206,7 @@ class TECOTransformerModel(nn.Module):
                 num_valid_tokens_per_sequence = inverted_padding_mask.sum(dim=1).float()
                 num_valid_tokens_per_sequence = torch.clamp(num_valid_tokens_per_sequence, min=1) # Avoid division by zero
 
+
                 pooled_output = sum_embeddings / num_valid_tokens_per_sequence.unsqueeze(-1)
             else:
                 # No padding mask provided, assume all tokens are valid

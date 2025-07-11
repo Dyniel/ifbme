@@ -255,8 +255,11 @@ def build_patient_graph(patient_df, patient_id, target_variable_name, label_time
                         edge_lists[rev_edge]['dst'].append(current_time_bin_idx)
 
         process_codes(diagnosis_col_name, 'diagnosis', 'diagnosis_to_id', row, time_bin_idx)
-        process_codes(medication_col_name, 'medication', 'medication_to_id', row, time_bin_idx)
-        process_codes(procedure_col_name, 'procedure', 'procedure_to_id', row, time_bin_idx)
+        # Commenting out med/proc processing as they are optional and schema might exclude them
+        # if medication_col_name and global_concept_mappers.get('medication_to_id'):
+        #     process_codes(medication_col_name, 'medication', 'medication_to_id', row, time_bin_idx)
+        # if procedure_col_name and global_concept_mappers.get('procedure_to_id'):
+        #     process_codes(procedure_col_name, 'procedure', 'procedure_to_id', row, time_bin_idx)
 
     # Aggregate vital features for T_t nodes (e.g., mean) and update data['timeslice'].x
     temp_ts_features = data['timeslice'].x[:, time_embedding_dim:].clone() # Get the part for vital features
@@ -291,8 +294,12 @@ def build_patient_graph(patient_df, patient_id, target_variable_name, label_time
     # This is crucial for nn.Embedding layers in the GNN model if they use these global IDs.
     data['vital'].num_nodes = len(global_concept_mappers['vital_to_id'])
     data['diagnosis'].num_nodes = len(global_concept_mappers['diagnosis_to_id'])
-    data['medication'].num_nodes = len(global_concept_mappers['medication_to_id'])
-    data['procedure'].num_nodes = len(global_concept_mappers['procedure_to_id'])
+    if 'medication' in NODE_TYPES: # Only set if node type is active in schema
+        data['medication'].num_nodes = len(global_concept_mappers.get('medication_to_id', {}))
+    if 'procedure' in NODE_TYPES: # Only set if node type is active in schema
+        data['procedure'].num_nodes = len(global_concept_mappers.get('procedure_to_id', {}))
+
+        
 
     # Node features for concept nodes (V,D,M,P) are not set as 'x' here.
     # Instead, the GNN model will use nn.Embedding layers, taking node IDs as input.

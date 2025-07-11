@@ -123,71 +123,70 @@ def main(config_path):
     if num_classes < 2:
         raise ValueError(f"Number of classes must be at least 2. Found {num_classes}.")
 
-    # --- GNN Global Setup (Mappers) ---
-    # Create global concept mappers ONCE from the full raw dataset if GNN is to be trained
-    # These mappers will be passed to PatientHeteroGraphDataset instances for each fold.
-    global_concept_mappers = None
+    # --- GNN Global Setup (Mappers & Patient ID Column) ---
     gnn_config = config.get('ensemble', {}).get('gnn_params', {})
-    train_gnn = config.get('ensemble', {}).get('train_gnn', False) # New config flag
+    train_gnn = config.get('ensemble', {}).get('train_gnn', False)
+    global_concept_mappers = None
+    patient_id_col_name_for_gnn = config.get('patient_id_column') # Get from top-level config
 
     if train_gnn:
-        logger.info("GNN training is enabled. Creating global concept mappers...")
-        # These column names need to be in your config or defined constants
-        # Example: vital_cols from preproc_cfg, others might need specific keys in gnn_config
-        # For now, using placeholders - these MUST be correctly specified in your YAML or constants
-        gnn_data_cols = gnn_config.get('data_columns', {})
-        patient_id_col_name = config.get('patient_id_column', 'patientId') # Assuming a patient ID column
+        # Generate 'graph_instance_id' if specified in config, or use existing patient_id_column
+        # This allows flexibility: either use a pre-existing unique ID per row/encounter,
+        # or generate one if each row is an independent graph unit.
+        # The YAML should set patient_id_column to 'graph_instance_id' if generation is desired.
+        if patient_id_col_name_for_gnn == 'graph_instance_id': # Special value to trigger generation
+            logger.info(f"Generating '{patient_id_col_name_for_gnn}' for GNN processing.")
+            X_full_raw_df = X_full_raw_df.reset_index(drop=True)
+            X_full_raw_df[patient_id_col_name_for_gnn] = X_full_raw_df.index
+            y_full_raw_series.index = X_full_raw_df.index # Align y_series index
+            logger.info(f"'{patient_id_col_name_for_gnn}' column created and y_series index aligned.")
+        elif patient_id_col_name_for_gnn not in X_full_raw_df.columns and X_full_raw_df.index.name != patient_id_col_name_for_gnn:
+            logger.error(f"Specified GNN patient ID column '{patient_id_col_name_for_gnn}' not found in X_full_raw_df columns or as index name. Disabling GNN.")
+            train_gnn = False
+        elif X_full_raw_df.index.name == patient_id_col_name_for_gnn:
+             # If patient_id_col_name is the index, make it a regular column for consistent handling downstream
+             # (e.g. in PatientHeteroGraphDataset's y_map creation, create_global_mappers)
+             X_full_raw_df[patient_id_col_name_for_gnn] = X_full_raw_df.index
+             logger.info(f"Using index '{patient_id_col_name_for_gnn}' as GNN patient ID column and made it a regular column.")
 
-        # Vital columns might be the same as numerical_cols or a subset.
-        # For GNN, we might need all columns that represent distinct vital concepts.
-        # This needs careful mapping from your raw data columns to GNN concepts.
-        # Let's assume gnn_data_cols in config specifies these:
-        vital_cols_for_gnn = gnn_data_cols.get('vital_columns', []) # e.g. ['HR', 'RR', 'Temp', 'Lactate', ...]
-        diag_col_for_gnn = gnn_data_cols.get('diagnosis_column', 'icdCode')
-        med_col_for_gnn = gnn_data_cols.get('medication_column', 'med_codes') # Example name
-        proc_col_for_gnn = gnn_data_cols.get('procedure_column', 'proc_codes') # Example name
-        timestamp_col_for_gnn = gnn_data_cols.get('event_timestamp_column', 'requestDate') # Main event timestamp
 
-        if not all([patient_id_col_name, vital_cols_for_gnn, diag_col_for_gnn, med_col_for_gnn, proc_col_for_gnn, timestamp_col_for_gnn]):
-            logger.error("Missing GNN data column configurations in YAML. Cannot create mappers.")
-            train_gnn = False # Disable GNN training
-        else:
-            try:
-                # Ensure X_full_raw_df has the patient_id_col_name if it's not the index
-                # This is a simplification; patient ID handling needs to be robust.
-                # If patient_id_col_name is index, X_full_raw_df.index.name should match or be set.
-                # For create_global_mappers, it expects patient_id_col to be a column.
-                # If your X_full_raw_df is indexed by patient ID, you might need to reset_index()
-                # or pass X_full_raw_df.index.to_series() for patient IDs.
-                # This part is highly dependent on your actual DataFrame structure.
-                # Let's assume patient_id_col_name is a regular column in X_full_raw_df for now.
-                 if patient_id_col_name not in X_full_raw_df.columns and X_full_raw_df.index.name != patient_id_col_name:
-                    logger.error(f"Patient ID column '{patient_id_col_name}' not found in X_full_raw_df columns or index name.")
-                    train_gnn = False
-                 else:
-                    df_for_mappers = X_full_raw_df.copy()
-                    if X_full_raw_df.index.name == patient_id_col_name:
-                        df_for_mappers[patient_id_col_name] = X_full_raw_df.index # Make it a column
+        if train_gnn: # Re-check after potential modification of X_full_raw_df
+            logger.info("GNN training is enabled. Creating global concept mappers...")
+            gnn_data_cols = gnn_config.get('data_columns', {})
 
+            vital_cols_for_gnn = gnn_data_cols.get('vital_columns', [])
+            diag_col_for_gnn = gnn_data_cols.get('diagnosis_column')
+            med_col_for_gnn = gnn_data_cols.get('medication_column') # Might be None if not configured
+            proc_col_for_gnn = gnn_data_cols.get('procedure_column') # Might be None if not configured
+            timestamp_col_for_gnn = gnn_data_cols.get('event_timestamp_column')
+
+            # Check essential GNN column configurations
+            # Medication and Procedure columns are optional for mapper creation
+            if not all([patient_id_col_name_for_gnn, vital_cols_for_gnn, diag_col_for_gnn, timestamp_col_for_gnn]):
+                logger.error("Missing critical GNN data column configurations (patient_id, vitals, diagnosis, timestamp) in YAML. Disabling GNN.")
+                train_gnn = False
+            else:
+                try:
                     global_concept_mappers = create_global_mappers(
-                        all_patient_data_df=df_for_mappers, # Full raw data before splitting
-                        patient_id_col=patient_id_col_name,
+                        all_patient_data_df=X_full_raw_df.copy(), # Pass a copy
+                        patient_id_col=patient_id_col_name_for_gnn,
                         vital_col_names=vital_cols_for_gnn,
                         diagnosis_col_name=diag_col_for_gnn,
-                        medication_col_name=med_col_for_gnn,
-                        procedure_col_name=proc_col_for_gnn,
+                        medication_col_name=med_col_for_gnn, # Pass it, create_global_mappers will handle if None/missing
+                        procedure_col_name=proc_col_for_gnn, # Pass it
                         timestamp_col=timestamp_col_for_gnn
                     )
                     logger.info("Global concept mappers created for GNN.")
-            except Exception as e_map:
-                logger.error(f"Error creating global concept mappers for GNN: {e_map}. Disabling GNN training.")
-                train_gnn = False
+                except Exception as e_map:
+                    logger.error(f"Error creating global concept mappers for GNN: {e_map}. Disabling GNN training.")
+                    logger.error(traceback.format_exc())
+                    train_gnn = False
 
-    if not train_gnn: # If disabled for any reason above
+    if not train_gnn:
         logger.info("GNN training is disabled for this run.")
 
+    # --- Preprocessing Setup (for tabular models like LGBM, TECO) ---
 
-    # --- Preprocessing Setup ---
     preproc_cfg = config.get('preprocessing', {})
     numerical_cols_from_config = preproc_cfg.get('numerical_cols', [])
     categorical_cols_from_config = preproc_cfg.get('categorical_cols', [])

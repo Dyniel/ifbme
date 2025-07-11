@@ -53,7 +53,12 @@ class HeteroTemporalGNN(nn.Module):
         self.initial_projections = nn.ModuleDict()
 
         # Embeddings for concept nodes (V, D, M, P)
-        for node_type in ['vital', 'diagnosis', 'medication', 'procedure']:
+        # Only create embeddings for node types that are active (not commented out in schema)
+        # and have a non-zero number of unique items in their mappers.
+        active_concept_node_types = [nt for nt in ['vital', 'diagnosis', 'medication', 'procedure'] if nt in self.node_types]
+
+        for node_type in active_concept_node_types:
+
             if node_type in self.num_nodes_dict and self.num_nodes_dict[node_type] > 0:
                 self.embeddings[node_type] = nn.Embedding(
                     num_embeddings=self.num_nodes_dict[node_type],

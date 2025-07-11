@@ -14,8 +14,9 @@ NODE_TYPES = [
     'timeslice',  # Represents a binned moment in time for a patient (T_t)
     'vital',      # Represents a type of vital sign or lab test (V_i)
     'diagnosis',  # Represents an ICD code (D_k)
-    'medication', # Represents an ATC medication code/class (M_j)
-    'procedure',  # Represents a procedure code (P_l)
+    # 'medication', # Represents an ATC medication code/class (M_j) - Commented out as not in sample data
+    # 'procedure',  # Represents a procedure code (P_l) - Commented out
+
 ]
 
 # Edge Types
@@ -37,13 +38,14 @@ EDGE_TYPES = [
     ('timeslice', 'has_diagnosis', 'diagnosis'),
     ('diagnosis', 'diagnosis_active_in', 'timeslice'), # Reverse of has_diagnosis
 
-    # Connections between time slices and medication codes/classes
-    ('timeslice', 'has_medication', 'medication'),
-    ('medication', 'medication_given_in', 'timeslice'), # Reverse of has_medication
+    # Connections between time slices and medication codes/classes - Commented out
+    # ('timeslice', 'has_medication', 'medication'),
+    # ('medication', 'medication_given_in', 'timeslice'),
 
-    # Connections between time slices and procedure codes
-    ('timeslice', 'has_procedure', 'procedure'),
-    ('procedure', 'procedure_performed_in', 'timeslice'), # Reverse of has_procedure
+    # Connections between time slices and procedure codes - Commented out
+    # ('timeslice', 'has_procedure', 'procedure'),
+    # ('procedure', 'procedure_performed_in', 'timeslice'),
+
 
     # Potentially, relationships between concept nodes themselves if using an ontology
     # e.g., ('diagnosis', 'is_a_parent_of', 'diagnosis') - for future extension
