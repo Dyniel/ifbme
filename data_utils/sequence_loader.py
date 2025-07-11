@@ -28,7 +28,7 @@ class TabularSequenceDataset(Dataset):
 
         self.ensure_float32 = ensure_float32
 
-        if feature_columns:
+        if feature_columns is not None: # Check for existence, not truthiness of content
             self.feature_columns = [col for col in feature_columns if col in data_frame.columns]
             missing_cols = set(feature_columns) - set(self.feature_columns)
             if missing_cols:
