@@ -17,3 +17,4 @@ shap
 
 # Specific versions can be pinned later based on compatibility needs.
 torch-geometric
+PyYAML

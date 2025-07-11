@@ -27,6 +27,7 @@ from data_utils.preprocess import get_preprocessor
 from models import LightGBMModel, XGBoostMetaLearner
 from models.teco_transformer import TECOTransformerModel
 from data_utils.sequence_loader import TabularSequenceDataset, basic_collate_fn  # For TECO
+from utils.metrics import dt_score_calc, ls_score_calc, gl_score_calc # Score calculation functions
 
 # --- GNN Imports ---
 from data_utils.graph_schema import NODE_TYPES as GNN_NODE_TYPES, EDGE_TYPES as GNN_EDGE_TYPES # Graph Schema
@@ -335,7 +336,8 @@ def main(config_path):
     # For accumulating predictions and actuals for final CSV logging
     all_test_indices_list = []
     all_y_test_list = []
-    all_preds_meta_list = [] # For DTestimation.csv (predicted outcomeType)
+    all_preds_meta_list = [] # For DTestimation.csv (predicted outcomeType based on default 0.5 threshold or model's predict())
+    all_probas_meta_list = [] # For DTestimation.csv (predicted probabilities for 'Death' class, to allow custom thresholding later)
     all_actual_los_list = [] # For LSestimation.csv (actual lengthOfStay)
     all_predicted_los_list = [] # For LSestimation.csv (predicted lengthOfStay)
     # If patient IDs are consistently available and aligned with X_full_raw_df.index:
@@ -995,24 +997,27 @@ def main(config_path):
         predicted_los_outer_test = np.full(len(y_outer_test), np.nan) # Default to NaN
 
         if los_column_name in X_outer_train_raw_fold_df.columns and los_column_name in X_outer_test_raw_fold_df.columns:
-            y_los_outer_train = X_outer_train_raw_fold_df[los_column_name].values
-            y_los_outer_test_actual = X_outer_test_raw_fold_df[los_column_name].values
+            y_los_outer_train_raw = X_outer_train_raw_fold_df[los_column_name].values
+            y_los_outer_test_actual_orig_scale = X_outer_test_raw_fold_df[los_column_name].values # Keep original scale for final MAE
 
-            # Ensure no NaN values in target for LoS training, or handle them
-            # For simplicity, we'll drop rows with NaN LoS for training the LoS model
-            # This should ideally be handled by imputation if NaNs are expected and meaningful
-            valid_los_train_indices = ~np.isnan(y_los_outer_train)
-            if np.sum(valid_los_train_indices) > 0: # Check if there's any data left to train on
+            # Ensure no NaN values in target for LoS training
+            valid_los_train_indices = ~np.isnan(y_los_outer_train_raw)
+
+            if np.sum(valid_los_train_indices) > 0:
                 X_los_train_fold_processed = X_outer_train_processed[valid_los_train_indices]
-                y_los_outer_train_cleaned = y_los_outer_train[valid_los_train_indices]
+                y_los_outer_train_cleaned_orig_scale = y_los_outer_train_raw[valid_los_train_indices]
 
-                logger.info(f"Outer Fold {outer_fold_idx + 1}: Training LightGBM Regressor for Length of Stay...")
+                # Apply log1p transformation to the LoS target for training
+                y_los_outer_train_transformed = np.log1p(y_los_outer_train_cleaned_orig_scale)
+
+                logger.info(f"Outer Fold {outer_fold_idx + 1}: Training Quantile LightGBM Regressor for Length of Stay (log1p transformed target)...")
                 try:
-                    lgbm_los_config = config.get('ensemble', {}).get('lgbm_los_params', {}) # Separate config for LoS regressor
-                    # Basic default parameters for LoS regressor
+                    lgbm_los_config = config.get('ensemble', {}).get('lgbm_los_params', {})
+
                     los_regressor_params = {
-                        'objective': 'regression_l1',  # MAE
-                        'metric': 'mae',
+                        'objective': 'quantile',  # Quantile regression
+                        'alpha': 0.5,             # For median (L1 loss equivalent for quantile)
+                        'metric': 'quantile',     # Use quantile metric
                         'n_estimators': lgbm_los_config.get('n_estimators', 200),
                         'learning_rate': lgbm_los_config.get('learning_rate', 0.05),
                         'num_leaves': lgbm_los_config.get('num_leaves', 31),
@@ -1024,7 +1029,7 @@ def main(config_path):
                         'n_jobs': -1,
                         'verbose': -1,
                     }
-                    los_model = LightGBMModel(params=los_regressor_params) # Initialize with base params
+                    los_model = LightGBMModel(params=los_regressor_params)
 
                     optuna_los_config = config.get('optuna', {}).get('lgbm_los', {})
                     use_optuna_for_los = optuna_los_config.get('use_optuna_for_los', False) # Control flag
@@ -1040,17 +1045,17 @@ def main(config_path):
                         from sklearn.model_selection import train_test_split as los_optuna_split
 
                         X_optuna_los_train, X_optuna_los_val, \
-                        y_optuna_los_train, y_optuna_los_val = los_optuna_split(
-                            X_los_train_fold_processed, y_los_outer_train_cleaned,
-                            test_size=0.25, # e.g. 25% for Optuna validation
-                            random_state=seed + outer_fold_idx + 100 # Different seed offset
+                        y_optuna_los_train_transformed, y_optuna_los_val_transformed = los_optuna_split(
+                            X_los_train_fold_processed, y_los_outer_train_transformed, # Use transformed target for Optuna
+                            test_size=0.25,
+                            random_state=seed + outer_fold_idx + 100
                         )
 
                         def los_objective(trial):
-                            # Define hyperparameter search space for LoS Optuna
                             trial_los_params = {
-                                'objective': 'regression_l1', # Fixed for MAE
-                                'metric': 'mae',             # Fixed for MAE
+                                'objective': 'quantile',
+                                'alpha': 0.5,
+                                'metric': 'quantile',
                                 'n_estimators': trial.suggest_int('n_estimators', 50, 500),
                                 'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.2, log=True),
                                 'num_leaves': trial.suggest_int('num_leaves', 10, 100, log=True),
@@ -1064,55 +1069,68 @@ def main(config_path):
                                 'n_jobs': -1,
                                 'verbose': -1,
                             }
-
                             temp_los_model = LightGBMModel(params=trial_los_params)
-                            temp_los_model.train(
-                                X_optuna_los_train, y_optuna_los_train,
-                                X_optuna_los_val, y_optuna_los_val, # Pass validation set to Optuna trial
-                                early_stopping_rounds=optuna_los_config.get('early_stopping_rounds_trial', 10) # Short ES for trials
+                            temp_los_model.train( # Train on transformed data
+                                X_optuna_los_train, y_optuna_los_train_transformed,
+                                X_optuna_los_val, y_optuna_los_val_transformed,
+                                early_stopping_rounds=optuna_los_config.get('early_stopping_rounds_trial', 10)
                             )
-                            preds_val_los = temp_los_model.predict(X_optuna_los_val)
-                            mae = mean_absolute_error(y_optuna_los_val, preds_val_los)
-                            return mae # Optuna minimizes this
+                            preds_val_los_transformed = temp_los_model.predict(X_optuna_los_val)
+                            preds_val_los_orig_scale = np.expm1(preds_val_los_transformed)
+                            # Optuna needs to evaluate on original scale MAE if possible, or transformed MAE
+                            # For simplicity, let's use MAE on transformed scale for Optuna, as it's simpler for ES.
+                            # The final model will be evaluated on original scale.
+                            # Alternatively, transform y_optuna_los_val_transformed back for MAE calculation here.
+                            y_optuna_los_val_orig_scale = np.expm1(y_optuna_los_val_transformed)
+                            mae_orig_scale = mean_absolute_error(y_optuna_los_val_orig_scale, preds_val_los_orig_scale)
+                            return mae_orig_scale # Optuna minimizes this
 
                         study_los = optuna.create_study(direction='minimize',
                                                         sampler=optuna.samplers.TPESampler(seed=seed + outer_fold_idx + 200))
                         study_los.optimize(los_objective, n_trials=n_trials_los, timeout=timeout_los)
 
                         best_los_params_optuna = study_los.best_params
-                        best_los_score_optuna = study_los.best_value
-                        logger.info(f"Outer Fold {outer_fold_idx + 1}: Best LoS Regressor params from Optuna: {best_los_params_optuna}, Best MAE: {best_los_score_optuna:.4f}")
+                        best_los_score_optuna = study_los.best_value # This is MAE on original scale from Optuna
+                        logger.info(f"Outer Fold {outer_fold_idx + 1}: Best LoS Regressor params from Optuna: {best_los_params_optuna}, Best MAE (Optuna eval): {best_los_score_optuna:.4f}")
                         wandb.log({
                             f"outer_fold_{outer_fold_idx+1}/los_optuna_best_params": best_los_params_optuna,
                             f"outer_fold_{outer_fold_idx+1}/los_optuna_best_mae": best_los_score_optuna
                         })
 
-                        # Update los_regressor_params with the best ones from Optuna for the final model
-                        # Ensure objective and metric are correctly set for regression, Optuna might only tune structural ones
-                        final_los_params = los_regressor_params.copy() # Start with base
-                        final_los_params.update(best_los_params_optuna) # Override with Optuna's best
-                        final_los_params['objective'] = 'regression_l1' # Ensure it's set
-                        final_los_params['metric'] = 'mae'              # Ensure it's set
+                        final_los_params = los_regressor_params.copy()
+                        final_los_params.update(best_los_params_optuna)
+                        final_los_params['objective'] = 'quantile'
+                        final_los_params['alpha'] = 0.5
+                        final_los_params['metric'] = 'quantile'
 
                         los_model = LightGBMModel(params=final_los_params)
-                        # Train final LoS model for this outer fold on all available LoS training data for this fold
-                        los_model.train(X_los_train_fold_processed, y_los_outer_train_cleaned,
-                                        early_stopping_rounds=lgbm_los_config.get('early_stopping_rounds_final', 20)) # Potentially different ES for final model
+                        los_model.train(X_los_train_fold_processed, y_los_outer_train_transformed, # Train on full transformed training data for the fold
+                                        early_stopping_rounds=lgbm_los_config.get('early_stopping_rounds_final', 20))
                     else:
-                        if use_optuna_for_los: # Log why Optuna was skipped if it was enabled
+                        if use_optuna_for_los:
                              logger.warning(f"Outer Fold {outer_fold_idx + 1}: Skipping Optuna for LoS due to insufficient data ({X_los_train_fold_processed.shape[0]} samples). Using base lgbm_los_params.")
-                        # No Optuna, or not enough data for Optuna split: train with predefined/base params
-                        los_model.train(X_los_train_fold_processed, y_los_outer_train_cleaned,
+                        los_model.train(X_los_train_fold_processed, y_los_outer_train_transformed, # Train on transformed
                                         early_stopping_rounds=lgbm_los_config.get('early_stopping_rounds_final', 20))
 
-                    predicted_los_outer_test = los_model.predict(X_outer_test_processed)
+                    predicted_los_transformed = los_model.predict(X_outer_test_processed)
+                    predicted_los_outer_test = np.expm1(predicted_los_transformed)
+                    predicted_los_outer_test = np.maximum(0, predicted_los_outer_test) # Ensure non-negativity after transform
 
-                    # Ensure predictions are non-negative
-                    predicted_los_outer_test = np.maximum(0, predicted_los_outer_test)
+                    valid_los_indices_for_mae = ~np.isnan(y_los_outer_test_actual_orig_scale) & ~np.isnan(predicted_los_outer_test)
+                    if np.sum(valid_los_indices_for_mae) > 0:
+                        mae_los_outer = mean_absolute_error(
+                            y_los_outer_test_actual_orig_scale[valid_los_indices_for_mae],
+                            predicted_los_outer_test[valid_los_indices_for_mae]
+                        )
+                    else:
+                        logger.warning(f"Outer Fold {outer_fold_idx + 1}: No valid (non-NaN) actual/predicted LoS pairs for MAE calculation. MAE set to NaN.")
+                        mae_los_outer = np.nan
 
-
-                    mae_los_outer = mean_absolute_error(y_los_outer_test_actual, predicted_los_outer_test)
-                    ls_score_outer = min(10.0, mae_los_outer)
+                    if np.isnan(mae_los_outer):
+                        logger.warning(f"Outer Fold {outer_fold_idx + 1}: MAE for LoS is NaN. Setting LSscore to 10.")
+                        ls_score_outer = ls_score_calc(np.nan)
+                    else:
+                        ls_score_outer = ls_score_calc(mae_los_outer)
 
                     outer_fold_los_metrics['mae_los'].append(mae_los_outer)
                     outer_fold_los_metrics['ls_score'].append(ls_score_outer)
@@ -1214,21 +1232,37 @@ def main(config_path):
                     # The warning in XGBoostMetaLearner about X_val/y_val not provided for early stopping applies.
                     pass # No explicit split here for X_meta_val_optuna
 
+                # Use fixed scale_pos_weight from config if provided, otherwise XGBoost default (or None)
+                # The meta_config['model_specific_params'] should ideally already contain scale_pos_weight if set in YAML
+                current_meta_params = meta_config.get('model_specific_params', {}).copy()
+
+                # If scale_pos_weight is explicitly in meta_config (e.g. at the same level as 'depth')
+                # and not in model_specific_params, add it to current_meta_params.
+                # The YAML structure has it inside meta_learner_xgb_params, so it should be in model_specific_params.
+                # Let's ensure it's logged if used.
+                if 'scale_pos_weight' in current_meta_params:
+                    logger.info(f"Outer Fold {outer_fold_idx + 1}: Using fixed scale_pos_weight for XGBoost meta-learner: {current_meta_params['scale_pos_weight']}")
+                elif meta_config.get('scale_pos_weight') is not None: # Check if it's at a higher level in meta_config
+                    logger.info(f"Outer Fold {outer_fold_idx + 1}: Using fixed scale_pos_weight from top-level meta_config for XGBoost meta-learner: {meta_config['scale_pos_weight']}")
+                    current_meta_params['scale_pos_weight'] = meta_config['scale_pos_weight']
+                else:
+                    logger.info(f"Outer Fold {outer_fold_idx + 1}: No fixed scale_pos_weight specified for XGBoost meta-learner. Using XGBoost defaults.")
+
+                xgb_meta_model_outer = XGBoostMetaLearner(
+                    params=current_meta_params, # This should now include scale_pos_weight if defined in YAML
+                    depth=meta_config.get('depth', 3)
+                )
+
                 xgb_meta_model_outer.train(
                     X_meta_train_outer, y_meta_train_outer,
-                    # X_val and y_val for meta-learner are typically None, as it trains on all OOF.
-                    # If Optuna needs a validation set, it should be handled by its configuration
-                    # or by passing a split of X_meta_train_outer here.
-                    # For now, we pass None, and Optuna in XGBoostMetaLearner will use training metrics
-                    # if no validation set is part of evals_list.
-                    X_val=None, # Or a split of X_meta_train_outer if desired for Optuna
-                    y_val=None, # Or a split of y_meta_train_outer
-                    num_boost_round=meta_config.get('num_boost_round', 200),
-                    early_stopping_rounds=meta_config.get('early_stopping_rounds', 20), # For final model
+                    X_val=None,
+                    y_val=None,
+                    num_boost_round=meta_config.get('num_boost_round', 100), # Updated value from new config
+                    early_stopping_rounds=meta_config.get('early_stopping_rounds', 15), # Updated value
                     use_optuna=optuna_meta_config.get('use_optuna_for_meta', False),
                     optuna_n_trials=optuna_meta_config.get('n_trials', 15),
                     optuna_timeout=optuna_meta_config.get('timeout_seconds_fold', 300),
-                    wandb_run=wandb.run # Pass the W&B run object
+                    wandb_run=wandb.run
                 )
                 logger.info(f"Outer Fold {outer_fold_idx + 1}: XGBoost Meta-Learner trained.")
 
@@ -1280,10 +1314,11 @@ def main(config_path):
                     f1_death_meta = f1_score(y_outer_test, final_preds_meta_labels_outer,
                                              labels=[death_label_value], pos_label=death_label_value,
                                              average='binary', zero_division=0)
-                    dt_score_meta_outer = 10 * (1 - f1_death_meta)
+                    dt_score_meta_outer = dt_score_calc(f1_death_meta) # Use function
                     logger.info(f"Outer Fold {outer_fold_idx + 1} Meta-Learner: F1_Death={f1_death_meta:.4f}, DTscore={dt_score_meta_outer:.4f}")
                 else:
                     logger.warning(f"Outer Fold {outer_fold_idx + 1} Meta-Learner: 'Death' class not found in class_mapping. DTscore set to 10.")
+                    dt_score_meta_outer = dt_score_calc(np.nan) # Ensure it's 10 if class not found
 
                 outer_fold_metrics_meta['accuracy'].append(acc_meta_outer)
                 outer_fold_metrics_meta['auroc'].append(auroc_meta_outer)
@@ -1293,23 +1328,40 @@ def main(config_path):
                 outer_fold_metrics_meta['dt_score'].append(dt_score_meta_outer)
 
                 # Calculate GLscore for Meta-Learner
-                current_ls_score = outer_fold_los_metrics['ls_score'][-1] if outer_fold_los_metrics['ls_score'] else 10.0 # Default to worst if no LS score
-                gl_score_meta_outer = dt_score_meta_outer + current_ls_score
+                current_ls_score_meta = outer_fold_los_metrics['ls_score'][-1] if outer_fold_los_metrics['ls_score'] else ls_score_calc(np.nan) # Default to worst if no LS score
+                gl_score_meta_outer = gl_score_calc(dt_score_meta_outer, current_ls_score_meta)
                 outer_fold_metrics_meta['gl_score'].append(gl_score_meta_outer)
 
-
-                wandb.log({f"outer_fold_{outer_fold_idx + 1}/meta_auroc": auroc_meta_outer,
-                           f"outer_fold_{outer_fold_idx + 1}/meta_acc": acc_meta_outer,
-                           f"outer_fold_{outer_fold_idx + 1}/meta_dt_score": dt_score_meta_outer,
-                           f"outer_fold_{outer_fold_idx + 1}/meta_gl_score": gl_score_meta_outer,
-                           "outer_fold": outer_fold_idx + 1})
+                wandb.log({
+                    f"outer_fold_{outer_fold_idx + 1}/meta_f1_death": f1_death_meta if death_label_value is not None else np.nan,
+                    f"outer_fold_{outer_fold_idx + 1}/meta_mae_los": outer_fold_los_metrics['mae_los'][-1] if outer_fold_los_metrics['mae_los'] else np.nan,
+                    f"outer_fold_{outer_fold_idx + 1}/meta_dt_score": dt_score_meta_outer,
+                    f"outer_fold_{outer_fold_idx + 1}/meta_ls_score": current_ls_score_meta,
+                    f"outer_fold_{outer_fold_idx + 1}/meta_gl_score": gl_score_meta_outer,
+                    f"outer_fold_{outer_fold_idx + 1}/meta_auroc": auroc_meta_outer,
+                    f"outer_fold_{outer_fold_idx + 1}/meta_acc": acc_meta_outer,
+                    "outer_fold": outer_fold_idx + 1
+                })
                 logger.info(
-                    f"Outer Fold {outer_fold_idx + 1} Meta-Learner: AUROC={auroc_meta_outer:.4f}, Acc={acc_meta_outer:.4f}, DTscore={dt_score_meta_outer:.4f}, GLscore={gl_score_meta_outer:.4f} (DTscore={dt_score_meta_outer:.4f} + LSscore={current_ls_score:.4f})")
+                    f"Outer Fold {outer_fold_idx + 1} Meta-Learner: "
+                    f"F1_Death={f1_death_meta if death_label_value is not None else np.nan:.4f}, "
+                    f"MAE_LoS={outer_fold_los_metrics['mae_los'][-1] if outer_fold_los_metrics['mae_los'] else np.nan:.4f}, "
+                    f"DTscore={dt_score_meta_outer:.4f}, LSscore={current_ls_score_meta:.4f}, GLscore={gl_score_meta_outer:.4f} | "
+                    f"AUROC={auroc_meta_outer:.4f}, Acc={acc_meta_outer:.4f}"
+                )
 
                 # --- Accumulate predictions for CSV logging ---
                 all_test_indices_list.append(outer_test_idx)
                 all_y_test_list.append(y_outer_test) # Actual outcomeType
-                all_preds_meta_list.append(final_preds_meta_labels_outer) # Predicted outcomeType by meta-learner
+                # Store probabilities for 'Death' class (class 0) for later thresholding if needed for CSV
+                # final_preds_meta_proba_outer is (N, num_classes), class_mapping['Death'] is its index
+                if final_preds_meta_proba_outer is not None and class_mapping.get('Death') is not None:
+                    probas_death_meta = final_preds_meta_proba_outer[:, class_mapping['Death']]
+                    all_probas_meta_list.append(probas_death_meta)
+                else: # Fallback if probas are not available, store NaNs or re-derive from labels if only labels are available
+                    all_probas_meta_list.append(np.full(len(y_outer_test), np.nan))
+
+                all_preds_meta_list.append(final_preds_meta_labels_outer) # Store labels derived from default threshold for metrics
 
                 # Get actual lengthOfStay for these test indices from the original X_full_raw_df
                 # Ensure 'lengthofStay' is a valid column name. From logs, it seems to be.
@@ -1421,10 +1473,11 @@ def main(config_path):
                         f1_death_sv = f1_score(y_outer_test, final_preds_soft_vote_labels_outer,
                                                labels=[death_label_value], pos_label=death_label_value,
                                                average='binary', zero_division=0)
-                        dt_score_sv_outer = 10 * (1 - f1_death_sv)
+                        dt_score_sv_outer = dt_score_calc(f1_death_sv) # Use function
                         logger.info(f"Outer Fold {outer_fold_idx + 1} Soft Vote: F1_Death={f1_death_sv:.4f}, DTscore={dt_score_sv_outer:.4f}")
                     else:
                         logger.warning(f"Outer Fold {outer_fold_idx + 1} Soft Vote: 'Death' class not found in class_mapping. DTscore set to 10.")
+                        dt_score_sv_outer = dt_score_calc(np.nan) # Ensure it's 10 if class not found
 
                     outer_fold_metrics_soft_vote['accuracy'].append(acc_sv_outer)
                     outer_fold_metrics_soft_vote['auroc'].append(auroc_sv_outer)
@@ -1434,18 +1487,27 @@ def main(config_path):
                     outer_fold_metrics_soft_vote['dt_score'].append(dt_score_sv_outer)
 
                     # Calculate GLscore for Soft Voting
-                    current_ls_score = outer_fold_los_metrics['ls_score'][-1] if outer_fold_los_metrics['ls_score'] else 10.0 # Default to worst if no LS score
-                    gl_score_sv_outer = dt_score_sv_outer + current_ls_score
+                    current_ls_score_sv = outer_fold_los_metrics['ls_score'][-1] if outer_fold_los_metrics['ls_score'] else ls_score_calc(np.nan) # Default to worst if no LS score
+                    gl_score_sv_outer = gl_score_calc(dt_score_sv_outer, current_ls_score_sv)
                     outer_fold_metrics_soft_vote['gl_score'].append(gl_score_sv_outer)
 
-                    wandb.log(
-                        {f"outer_fold_{outer_fold_idx + 1}/sv_auroc": auroc_sv_outer,
-                         f"outer_fold_{outer_fold_idx + 1}/sv_acc": acc_sv_outer,
-                         f"outer_fold_{outer_fold_idx + 1}/sv_dt_score": dt_score_sv_outer,
-                         f"outer_fold_{outer_fold_idx + 1}/sv_gl_score": gl_score_sv_outer,
-                         "outer_fold": outer_fold_idx + 1})
+                    wandb.log({
+                        f"outer_fold_{outer_fold_idx + 1}/sv_f1_death": f1_death_sv if death_label_value is not None else np.nan,
+                        f"outer_fold_{outer_fold_idx + 1}/sv_mae_los": outer_fold_los_metrics['mae_los'][-1] if outer_fold_los_metrics['mae_los'] else np.nan,
+                        f"outer_fold_{outer_fold_idx + 1}/sv_dt_score": dt_score_sv_outer,
+                        f"outer_fold_{outer_fold_idx + 1}/sv_ls_score": current_ls_score_sv,
+                        f"outer_fold_{outer_fold_idx + 1}/sv_gl_score": gl_score_sv_outer,
+                        f"outer_fold_{outer_fold_idx + 1}/sv_auroc": auroc_sv_outer,
+                        f"outer_fold_{outer_fold_idx + 1}/sv_acc": acc_sv_outer,
+                        "outer_fold": outer_fold_idx + 1
+                    })
                     logger.info(
-                        f"Outer Fold {outer_fold_idx + 1} Soft Vote: AUROC={auroc_sv_outer:.4f}, Acc={acc_sv_outer:.4f}, DTscore={dt_score_sv_outer:.4f}, GLscore={gl_score_sv_outer:.4f} (DTscore={dt_score_sv_outer:.4f} + LSscore={current_ls_score:.4f})")
+                        f"Outer Fold {outer_fold_idx + 1} Soft Vote: "
+                        f"F1_Death={f1_death_sv if death_label_value is not None else np.nan:.4f}, "
+                        f"MAE_LoS={outer_fold_los_metrics['mae_los'][-1] if outer_fold_los_metrics['mae_los'] else np.nan:.4f}, "
+                        f"DTscore={dt_score_sv_outer:.4f}, LSscore={current_ls_score_sv:.4f}, GLscore={gl_score_sv_outer:.4f} | "
+                        f"AUROC={auroc_sv_outer:.4f}, Acc={acc_sv_outer:.4f}"
+                    )
                 else:
                     logger.warning(
                         f"Outer Fold {outer_fold_idx + 1}: Soft Voting not performed (no active models with positive weights or zero total weight).")
@@ -1554,9 +1616,11 @@ def main(config_path):
             # Concatenate results from all folds
             all_indices_flat = np.concatenate(all_test_indices_list)
             all_y_test_flat = np.concatenate(all_y_test_list)
+            # all_preds_meta_flat contains labels based on default threshold (used for metrics during CV)
             all_preds_meta_flat = np.concatenate(all_preds_meta_list)
-            all_actual_los_flat = np.concatenate(all_actual_los_list) # Keep actuals for context if needed
-            all_predicted_los_flat = np.concatenate(all_predicted_los_list) # Newly added
+            all_probas_death_meta_flat = np.concatenate(all_probas_meta_list) # Probabilities for 'Death' class
+            all_actual_los_flat = np.concatenate(all_actual_los_list)
+            all_predicted_los_flat = np.concatenate(all_predicted_los_list)
             all_patient_ids_flat = np.concatenate(all_patient_ids_list)
 
             # Create a DataFrame for DTestimation.csv
@@ -1589,9 +1653,36 @@ def main(config_path):
             os.makedirs(output_dir, exist_ok=True) # Ensure the output directory exists
 
             # DTestimation.csv: vector of predicted discharge type (outcomeType)
-            dt_estimation_df = pd.DataFrame({'predicted_outcome': results_df_sorted['predicted_outcomeType']})
+            # Apply a threshold to probabilities to get final labels for CSV.
+            # For now, using a default 0.5 threshold on P(Death).
+            # class_mapping: {'Death': 0, 'Survival': 1} -> P(Death) is proba of class 0.
+            # If a best_thr is found (e.g., via grid search), it would be used here.
+            # Example: custom_threshold_for_death = 0.4 (predict Death if P(Death) > 0.4)
+            custom_threshold_for_death = 0.5 # Placeholder; ideally, this comes from validation.
+
+            # Check if all_probas_death_meta_flat contains NaNs, if so, can't use it directly
+            if not np.isnan(all_probas_death_meta_flat).all():
+                 # Predict 'Death' (class 0) if its probability is > custom_threshold_for_death
+                 # Otherwise predict 'Survival' (class 1)
+                 # Note: This logic might need inversion depending on how threshold is defined (e.g. threshold for P(Survival))
+                 # If P(Death) > threshold, outcome is Death (0). Else Survival (1).
+                predicted_labels_for_csv = np.where(
+                    all_probas_death_meta_flat > custom_threshold_for_death,
+                    class_mapping['Death'],
+                    class_mapping['Survival']
+                )
+                # Ensure the labels are from the original class labels if LabelEncoder was used
+                # This step might be redundant if class_mapping values are already the desired output labels.
+                # For now, assuming class_mapping values are the direct output.
+                logger.info(f"Generating DTestimation.csv using P(Death) and threshold {custom_threshold_for_death}.")
+            else:
+                logger.warning("Probabilities for meta-learner were not available. DTestimation.csv will use labels from default model.predict().")
+                predicted_labels_for_csv = results_df_sorted['predicted_outcomeType'].values
+
+
+            dt_estimation_df = pd.DataFrame({'predicted_outcome': predicted_labels_for_csv})
             dt_estimation_path = os.path.join(output_dir, "DTestimation.csv")
-            dt_estimation_df.to_csv(dt_estimation_path, index=False, header=True) # header=True for clarity
+            dt_estimation_df.to_csv(dt_estimation_path, index=False, header=True)
             logger.info(f"Saved DTestimation.csv to {dt_estimation_path}")
             wandb.log_artifact(dt_estimation_path, name="DTestimation", type="predictions")
 

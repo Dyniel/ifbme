@@ -50,19 +50,19 @@ preprocessing:
 
 # --- Balancing Configuration ---
 balancing:
-  use_rsmote_gan_in_cv: false # <<<< MODIFIED FOR QUICKER TEST - Balancing Disabled
+  use_rsmote_gan_in_cv: true # Re-enabled for more comprehensive run
   rsmote_gan_params:
     k: 5
     minority_upsample_factor: 3.0
 
 # --- Ensemble Configuration ---
 ensemble:
-  n_outer_folds: 2 # <<<< MODIFIED FOR QUICKER TEST
-  n_inner_folds_for_oof: 2 # <<<< MODIFIED FOR QUICKER TEST
+  n_outer_folds: 5 # Increased for comprehensive evaluation
+  n_inner_folds_for_oof: 5 # Increased for comprehensive evaluation
 
   train_lgbm: true
   train_teco: true
-  train_gnn: false # <<<< MODIFIED FOR QUICKER TEST - GNN Disabled
+  train_gnn: false # Keeping GNN Disabled for now to manage complexity
   train_meta_learner: true
 
   lgbm_params:
@@ -74,8 +74,8 @@ ensemble:
     min_child_samples: 20
     colsample_bytree: 0.7
     subsample: 0.7
-    num_boost_round: 100 # <<<< MODIFIED FOR QUICKER TEST
-    early_stopping_rounds: 20 # <<<< MODIFIED FOR QUICKER TEST
+    num_boost_round: 200 # Increased for comprehensive evaluation
+    early_stopping_rounds: 30 # Increased for comprehensive evaluation
     save_path: 'models_output/lgbm_final_ncv_trained.joblib'
 
   teco_params:
@@ -87,7 +87,7 @@ ensemble:
     dropout: 0.1
     num_classes: null
     max_seq_len: 150
-    epochs_teco_inner: 5 # <<<< MODIFIED FOR QUICKER TEST
+    epochs_teco_inner: 10 # Increased for comprehensive evaluation
     batch_size_teco: 32
     lr_teco: 0.00005
     save_path: 'models_output/teco_final_ncv_trained.pth'
@@ -131,8 +131,9 @@ ensemble:
 
   meta_learner_xgb_params:
     depth: 3
-    num_boost_round: 50       # <<<< MODIFIED FOR QUICKER TEST
-    early_stopping_rounds: 10  # <<<< MODIFIED FOR QUICKER TEST
+    num_boost_round: 100      # Increased for comprehensive evaluation
+    early_stopping_rounds: 15 # Increased for comprehensive evaluation
+    scale_pos_weight: 2.5     # Fixed value for cost-sensitive learning
     save_path: 'models_output/meta_learner_xgb_ncv_trained.joblib'
 
   soft_vote_weights:
