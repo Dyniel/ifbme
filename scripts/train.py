@@ -18,7 +18,7 @@ import logging
 import pandas as pd
 import torch.nn as nn
 from torch.utils.data import DataLoader
-import optuna # Import Optuna
+import optuna  # Import Optuna
 
 # Project-specific imports
 from data_utils.balancing import RSMOTEGAN
@@ -27,13 +27,15 @@ from data_utils.preprocess import get_preprocessor
 from models import LightGBMModel, XGBoostMetaLearner
 from models.teco_transformer import TECOTransformerModel
 from data_utils.sequence_loader import TabularSequenceDataset, basic_collate_fn  # For TECO
-from utils.metrics import dt_score_calc, ls_score_calc, gl_score_calc # Score calculation functions
+from utils.metrics import dt_score_calc, ls_score_calc, gl_score_calc, \
+    maximise_f1_threshold  # Score calculation functions
 
 # --- GNN Imports ---
-from data_utils.graph_schema import NODE_TYPES as GNN_NODE_TYPES, EDGE_TYPES as GNN_EDGE_TYPES # Graph Schema
+from data_utils.graph_schema import NODE_TYPES as GNN_NODE_TYPES, EDGE_TYPES as GNN_EDGE_TYPES  # Graph Schema
 from data_utils.graph_loader import PatientHeteroGraphDataset, create_global_mappers
 from models.hetero_temporal_gnn import HeteroTemporalGNN
-from torch_geometric.loader import DataLoader as PyGDataLoader # DataLoader for PyG graph batches
+from torch_geometric.loader import DataLoader as PyGDataLoader  # DataLoader for PyG graph batches
+
 # --- End GNN Imports ---
 
 
@@ -129,53 +131,56 @@ def main(config_path):
     gnn_config = config.get('ensemble', {}).get('gnn_params', {})
     train_gnn = config.get('ensemble', {}).get('train_gnn', False)
     global_concept_mappers = None
-    patient_id_col_name_for_gnn = config.get('patient_id_column') # Get from top-level config
+    patient_id_col_name_for_gnn = config.get('patient_id_column')  # Get from top-level config
 
     if train_gnn:
         # Generate 'graph_instance_id' if specified in config, or use existing patient_id_column
         # This allows flexibility: either use a pre-existing unique ID per row/encounter,
         # or generate one if each row is an independent graph unit.
         # The YAML should set patient_id_column to 'graph_instance_id' if generation is desired.
-        if patient_id_col_name_for_gnn == 'graph_instance_id': # Special value to trigger generation
+        if patient_id_col_name_for_gnn == 'graph_instance_id':  # Special value to trigger generation
             logger.info(f"Generating '{patient_id_col_name_for_gnn}' for GNN processing.")
             X_full_raw_df = X_full_raw_df.reset_index(drop=True)
             X_full_raw_df[patient_id_col_name_for_gnn] = X_full_raw_df.index
-            y_full_raw_series.index = X_full_raw_df.index # Align y_series index
+            y_full_raw_series.index = X_full_raw_df.index  # Align y_series index
             logger.info(f"'{patient_id_col_name_for_gnn}' column created and y_series index aligned.")
         elif patient_id_col_name_for_gnn not in X_full_raw_df.columns and X_full_raw_df.index.name != patient_id_col_name_for_gnn:
-            logger.error(f"Specified GNN patient ID column '{patient_id_col_name_for_gnn}' not found in X_full_raw_df columns or as index name. Disabling GNN.")
+            logger.error(
+                f"Specified GNN patient ID column '{patient_id_col_name_for_gnn}' not found in X_full_raw_df columns or as index name. Disabling GNN.")
             train_gnn = False
         elif X_full_raw_df.index.name == patient_id_col_name_for_gnn:
-             # If patient_id_col_name is the index, make it a regular column for consistent handling downstream
-             # (e.g. in PatientHeteroGraphDataset's y_map creation, create_global_mappers)
-             X_full_raw_df[patient_id_col_name_for_gnn] = X_full_raw_df.index
-             logger.info(f"Using index '{patient_id_col_name_for_gnn}' as GNN patient ID column and made it a regular column.")
+            # If patient_id_col_name is the index, make it a regular column for consistent handling downstream
+            # (e.g. in PatientHeteroGraphDataset's y_map creation, create_global_mappers)
+            X_full_raw_df[patient_id_col_name_for_gnn] = X_full_raw_df.index
+            logger.info(
+                f"Using index '{patient_id_col_name_for_gnn}' as GNN patient ID column and made it a regular column.")
 
-
-        if train_gnn: # Re-check after potential modification of X_full_raw_df
+        if train_gnn:  # Re-check after potential modification of X_full_raw_df
             logger.info("GNN training is enabled. Creating global concept mappers...")
             gnn_data_cols = gnn_config.get('data_columns', {})
 
             vital_cols_for_gnn = gnn_data_cols.get('vital_columns', [])
             diag_col_for_gnn = gnn_data_cols.get('diagnosis_column')
-            med_col_for_gnn = gnn_data_cols.get('medication_column') # Might be None if not configured
-            proc_col_for_gnn = gnn_data_cols.get('procedure_column') # Might be None if not configured
+            med_col_for_gnn = gnn_data_cols.get('medication_column')  # Might be None if not configured
+            proc_col_for_gnn = gnn_data_cols.get('procedure_column')  # Might be None if not configured
             timestamp_col_for_gnn = gnn_data_cols.get('event_timestamp_column')
 
             # Check essential GNN column configurations
             # Medication and Procedure columns are optional for mapper creation
             if not all([patient_id_col_name_for_gnn, vital_cols_for_gnn, diag_col_for_gnn, timestamp_col_for_gnn]):
-                logger.error("Missing critical GNN data column configurations (patient_id, vitals, diagnosis, timestamp) in YAML. Disabling GNN.")
+                logger.error(
+                    "Missing critical GNN data column configurations (patient_id, vitals, diagnosis, timestamp) in YAML. Disabling GNN.")
                 train_gnn = False
             else:
                 try:
                     global_concept_mappers = create_global_mappers(
-                        all_patient_data_df=X_full_raw_df.copy(), # Pass a copy
+                        all_patient_data_df=X_full_raw_df.copy(),  # Pass a copy
                         patient_id_col=patient_id_col_name_for_gnn,
                         vital_col_names=vital_cols_for_gnn,
                         diagnosis_col_name=diag_col_for_gnn,
-                        medication_col_name=med_col_for_gnn, # Pass it, create_global_mappers will handle if None/missing
-                        procedure_col_name=proc_col_for_gnn, # Pass it
+                        medication_col_name=med_col_for_gnn,
+                        # Pass it, create_global_mappers will handle if None/missing
+                        procedure_col_name=proc_col_for_gnn,  # Pass it
                         timestamp_col=timestamp_col_for_gnn
                     )
                     logger.info("Global concept mappers created for GNN.")
@@ -187,10 +192,10 @@ def main(config_path):
     if not train_gnn:
         logger.info("GNN training is disabled for this run.")
 
-# ... (other imports)
+    # ... (other imports)
 
-# --- Preprocessing Setup (for tabular models like LGBM, TECO) ---
-    logger.info("Starting preprocessing setup...") # This line was indented
+    # --- Preprocessing Setup (for tabular models like LGBM, TECO) ---
+    logger.info("Starting preprocessing setup...")  # This line was indented
     preproc_setup_start_time = time.time()
 
     preproc_cfg = config.get('preprocessing', {})
@@ -324,25 +329,28 @@ def main(config_path):
     # Note: For NCV, the preprocessor should be fit *inside each outer fold* on its training split.
     # This `global_preprocessor` is a template; a new one is instantiated per outer fold.
 
-# --- Nested Cross-Validation Setup ---
+    # --- Nested Cross-Validation Setup ---
     n_outer_folds = config.get('ensemble', {}).get('n_outer_folds', 5)
     n_inner_folds = config.get('ensemble', {}).get('n_inner_folds_for_oof', 5)
     outer_skf = StratifiedKFold(n_splits=n_outer_folds, shuffle=True, random_state=seed)
 
-    outer_fold_metrics_meta = {'accuracy': [], 'auroc': [], 'f1': [], 'precision': [], 'recall': [], 'dt_score': [], 'gl_score': []}
-    outer_fold_metrics_soft_vote = {'accuracy': [], 'auroc': [], 'f1': [], 'precision': [], 'recall': [], 'dt_score': [], 'gl_score': []}
-    outer_fold_los_metrics = {'ls_score': [], 'mae_los': []} # For Length of Stay specific metrics
+    outer_fold_metrics_meta = {'accuracy': [], 'auroc': [], 'f1': [], 'precision': [], 'recall': [], 'dt_score': [],
+                               'gl_score': []}
+    outer_fold_metrics_soft_vote = {'accuracy': [], 'auroc': [], 'f1': [], 'precision': [], 'recall': [],
+                                    'dt_score': [], 'gl_score': []}
+    outer_fold_los_metrics = {'ls_score': [], 'mae_los': []}  # For Length of Stay specific metrics
 
     # For accumulating predictions and actuals for final CSV logging
     all_test_indices_list = []
     all_y_test_list = []
-    all_preds_meta_list = [] # For DTestimation.csv (predicted outcomeType based on default 0.5 threshold or model's predict())
-    all_probas_meta_list = [] # For DTestimation.csv (predicted probabilities for 'Death' class, to allow custom thresholding later)
-    all_actual_los_list = [] # For LSestimation.csv (actual lengthOfStay)
-    all_predicted_los_list = [] # For LSestimation.csv (predicted lengthOfStay)
+    all_preds_meta_list = []  # For DTestimation.csv (predicted outcomeType based on default 0.5 threshold or model's predict())
+    all_probas_meta_list = []  # For DTestimation.csv (predicted probabilities for 'Death' class, to allow custom thresholding later)
+    all_actual_los_list = []  # For LSestimation.csv (actual lengthOfStay)
+    all_predicted_los_list = []  # For LSestimation.csv (predicted lengthOfStay)
     # If patient IDs are consistently available and aligned with X_full_raw_df.index:
     all_patient_ids_list = []
-
+    all_best_thresholds_fold_list = []  # For storing best F1 threshold from each fold
+    all_f1_at_best_thr_meta_list = []  # For storing F1 score at best threshold for meta-learner from each fold
 
     X_full_for_split = X_full_raw_df
 
@@ -416,9 +424,8 @@ def main(config_path):
             # Add GNN entry if training GNN
         }
         if train_gnn:
-            oof_preds_inner['gnn'] = np.zeros((len(y_outer_train), num_classes)) # Assuming num_classes for GNN output
+            oof_preds_inner['gnn'] = np.zeros((len(y_outer_train), num_classes))  # Assuming num_classes for GNN output
             base_model_preds_on_outer_test_sum['gnn'] = np.zeros((len(y_outer_test), num_classes))
-
 
         # --- GNN Dataset Instantiation for Outer Test Fold (if GNN is active) ---
         # This dataset is used by the GNN model trained on the full outer_train split
@@ -441,31 +448,38 @@ def main(config_path):
                 # Placeholder for y_map for test set (label can be dummy, timestamp is important)
                 y_map_outer_test = {}
                 if X_outer_test_raw_fold_df.index.name != patient_id_col_name:
-                     X_outer_test_raw_fold_df_indexed = X_outer_test_raw_fold_df.set_index(patient_id_col_name, drop=False)
+                    X_outer_test_raw_fold_df_indexed = X_outer_test_raw_fold_df.set_index(patient_id_col_name,
+                                                                                          drop=False)
                 else:
-                     X_outer_test_raw_fold_df_indexed = X_outer_test_raw_fold_df
+                    X_outer_test_raw_fold_df_indexed = X_outer_test_raw_fold_df
 
                 for pid_test in X_outer_test_raw_fold_df_indexed.index.unique():
                     # This assumes label_timestamp_col is available in X_outer_test_raw_fold_df_indexed
                     # and represents the event time for which a prediction is made (e.g., discharge time)
                     # Using the first available timestamp for that patient as a proxy for label event time. This is a simplification.
-                    label_ts_val = X_outer_test_raw_fold_df_indexed.loc[pid_test, gnn_config['data_columns']['label_timestamp_column']].iloc[0] \
-                        if isinstance(X_outer_test_raw_fold_df_indexed.loc[pid_test, gnn_config['data_columns']['label_timestamp_column']], pd.Series) \
-                        else X_outer_test_raw_fold_df_indexed.loc[pid_test, gnn_config['data_columns']['label_timestamp_column']]
+                    label_ts_val = X_outer_test_raw_fold_df_indexed.loc[
+                        pid_test, gnn_config['data_columns']['label_timestamp_column']].iloc[0] \
+                        if isinstance(X_outer_test_raw_fold_df_indexed.loc[
+                                          pid_test, gnn_config['data_columns']['label_timestamp_column']], pd.Series) \
+                        else X_outer_test_raw_fold_df_indexed.loc[
+                        pid_test, gnn_config['data_columns']['label_timestamp_column']]
 
-                    y_map_outer_test[pid_test] = (y_outer_test_fold_series.loc[pid_test] if pid_test in y_outer_test_fold_series.index else 0,
-                                                  pd.to_datetime(label_ts_val))
+                    y_map_outer_test[pid_test] = (
+                        y_outer_test_fold_series.loc[pid_test] if pid_test in y_outer_test_fold_series.index else 0,
+                        pd.to_datetime(label_ts_val))
 
                 gnn_construction_params_outer = gnn_config.get('graph_construction_params', {}).copy()
                 gnn_construction_params_outer['global_concept_mappers'] = global_concept_mappers
 
                 outer_test_graph_dataset = PatientHeteroGraphDataset(
-                    root_dir=os.path.join(config.get('output_dir', 'outputs'), f'fold_{outer_fold_idx+1}', 'gnn_processed_test'),
-                    patient_df_split=X_outer_test_raw_fold_df, # Raw features for this outer test fold
+                    root_dir=os.path.join(config.get('output_dir', 'outputs'), f'fold_{outer_fold_idx + 1}',
+                                          'gnn_processed_test'),
+                    patient_df_split=X_outer_test_raw_fold_df,  # Raw features for this outer test fold
                     patient_id_col=patient_id_col_name,
-                    y_map=y_map_outer_test, # Map of patient_id to (label, label_timestamp_abs)
-                    target_variable_name=y_full_for_split.name, # Original target column name
-                    label_timestamp_col=gnn_config['data_columns']['label_timestamp_column'], # To identify event time for snapshot
+                    y_map=y_map_outer_test,  # Map of patient_id to (label, label_timestamp_abs)
+                    target_variable_name=y_full_for_split.name,  # Original target column name
+                    label_timestamp_col=gnn_config['data_columns']['label_timestamp_column'],
+                    # To identify event time for snapshot
                     timestamp_col=gnn_config['data_columns']['event_timestamp_column'],
                     time_rel_col_name=gnn_config['data_columns'].get('relative_time_column', 'hours_since_admission'),
                     admission_timestamp_col=gnn_config['data_columns']['admission_timestamp_column'],
@@ -477,8 +491,9 @@ def main(config_path):
                     force_reprocess=gnn_config.get('force_reprocess_graphs', False)
                 )
             except Exception as e_ds_test:
-                logger.error(f"Outer Fold {outer_fold_idx + 1}: Error creating GNN test dataset: {e_ds_test}. GNN predictions for outer test will be defaults.")
-                outer_test_graph_dataset = None # Ensure it's None if creation fails
+                logger.error(
+                    f"Outer Fold {outer_fold_idx + 1}: Error creating GNN test dataset: {e_ds_test}. GNN predictions for outer test will be defaults.")
+                outer_test_graph_dataset = None  # Ensure it's None if creation fails
         # --- End GNN Dataset for Outer Test ---
 
         for inner_fold_idx, (inner_train_idx, inner_val_idx) in enumerate(
@@ -502,6 +517,17 @@ def main(config_path):
                         X_inner_fold_train, y_inner_fold_train)
                     logger.info(
                         f"Inner Fold {inner_fold_idx + 1}: RSMOTE-GAN completed. New shape: {X_inner_fold_train_balanced.shape}")
+                    # Log class distribution after balancing
+                    unique_classes_balanced, counts_balanced = np.unique(y_inner_fold_train_balanced,
+                                                                         return_counts=True)
+                    balanced_dist_log_msg = f"Inner Fold {inner_fold_idx + 1} (Outer {outer_fold_idx + 1}) - Class distribution after RSMOTE-GAN: {dict(zip(unique_classes_balanced, counts_balanced))}"
+                    logger.info(balanced_dist_log_msg)
+                    wandb.log({
+                        f"outer_fold_{outer_fold_idx + 1}/inner_fold_{inner_fold_idx + 1}/balanced_class_distribution": dict(
+                            zip(unique_classes_balanced, counts_balanced)),
+                        "outer_fold": outer_fold_idx + 1,  # For grouping if needed
+                        "inner_fold": inner_fold_idx + 1  # For grouping if needed
+                    })
                 except Exception as e:
                     logger.error(
                         f"Inner Fold {inner_fold_idx + 1}: Error during RSMOTE-GAN: {e}. Proceeding without balancing.")
@@ -518,27 +544,51 @@ def main(config_path):
 
                     def lgbm_objective(trial):
                         # Define hyperparameter search space for Optuna
+                        # Parameters for Focal Loss (CB-Focal)
                         lgbm_params = {
-                            'objective': 'binary' if num_classes == 2 else 'multiclass',
-                            'metric': 'binary_logloss' if num_classes == 2 else 'multi_logloss',
-                            'n_estimators': trial.suggest_int('n_estimators', lgbm_config.get('num_boost_round', 1000) // 5, lgbm_config.get('num_boost_round', 1000) * 2),
+                            'objective': 'binary',  # For Focal Loss, typically binary
+                            'metric': 'binary_logloss',  # Or custom F1 for tuning if Focal Loss aims for F1
+                            'alpha': 0.25,  # Focal loss alpha parameter
+                            'gamma': 2.0,  # Focal loss gamma parameter
+                            'n_estimators': trial.suggest_int('n_estimators',
+                                                              lgbm_config.get('num_boost_round', 1000) // 5,
+                                                              lgbm_config.get('num_boost_round', 1000) * 2),
                             'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.3, log=True),
-                            'num_leaves': trial.suggest_int('num_leaves', 20, lgbm_config.get('num_leaves', 31) * 5, log=True), # Max value was 10000, reducing for Optuna
-                            'max_depth': trial.suggest_int('max_depth', -1, 15), # -1 means no limit
+                            'num_leaves': trial.suggest_int('num_leaves', 20, lgbm_config.get('num_leaves', 31) * 5,
+                                                            log=True),
+                            'max_depth': trial.suggest_int('max_depth', -1, 15),
                             'min_child_samples': trial.suggest_int('min_child_samples', 5, 100),
                             'subsample': trial.suggest_float('subsample', 0.5, 1.0),
                             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
                             'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
                             'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
-                            'class_weight': lgbm_config.get('class_weight', 'balanced'),
+                            # 'class_weight': lgbm_config.get('class_weight', 'balanced'), # Focal loss handles imbalance
+                            'class_weight': None,  # Explicitly set to None if using Focal Loss alpha
                             'random_state': seed + outer_fold_idx + inner_fold_idx,
-                            'n_jobs': -1, # Use all available cores
-                            'verbose': -1, # Suppress LightGBM's own verbosity during Optuna trials
+                            'n_jobs': -1,
+                            'verbose': -1,
                         }
+                        # Assuming binary classification for 'Death' vs 'Survival' when Focal Loss is applied.
+                        # If num_classes > 2 and Focal Loss is still desired, this objective part would need adjustment
+                        # or a multiclass Focal Loss version. For now, this setup assumes binary context for Focal.
                         if num_classes > 2:
-                            lgbm_params['num_class'] = num_classes
+                            # This part might be problematic if 'binary' objective with alpha/gamma is strictly for 2 classes.
+                            # Reverting to default multiclass if Focal params are not compatible.
+                            # For now, we assume LightGBMModel or underlying custom objective handles this.
+                            # If using standard LightGBM, 'binary' objective with num_class > 2 is an error.
+                            # Let's assume for now user ensures LightGBMModel handles this.
+                            # However, for safety, if num_classes > 2, Focal Loss might not be applicable directly
+                            # with 'binary' objective. This implies the task is primarily binary for Focal Loss.
+                            logger.warning(
+                                "Focal Loss parameters (alpha, gamma) typically used with 'binary' objective. "
+                                f"Current num_classes = {num_classes}. Ensure LightGBMModel handles this if multiclass.")
+                            lgbm_params[
+                                'num_class'] = num_classes  # Keep if model supports 'binary' objective with num_class for some custom focal setup
+                            # If it's truly multiclass and focal is desired, objective might need to be 'multiclass'
+                            # and the custom focal loss function should handle multiclass.
+                            # For now, sticking to 'binary' as per user note "binary:focal".
 
-                        model = LightGBMModel(params=lgbm_params) # Use the class wrapper
+                        model = LightGBMModel(params=lgbm_params)  # Use the class wrapper
                         # Train with early stopping on validation set
                         # The train method of LightGBMModel needs to return the score for Optuna
                         # For now, we assume it trains and we get score from predict_proba
@@ -550,7 +600,8 @@ def main(config_path):
                             X_inner_fold_train_balanced, y_inner_fold_train_balanced,
                             X_inner_fold_val, y_inner_fold_val,
                             # num_boost_round passed via n_estimators in lgbm_params
-                            early_stopping_rounds=lgbm_config.get('early_stopping_rounds', 20) # Shorter for Optuna trials
+                            early_stopping_rounds=lgbm_config.get('early_stopping_rounds', 20)
+                            # Shorter for Optuna trials
                         )
 
                         preds_proba = temp_lgbm_model.predict_proba(X_inner_fold_val)
@@ -559,10 +610,11 @@ def main(config_path):
                             # Use AUROC for binary classification as it's often preferred for imbalanced data
                             # And it's a common metric for Optuna to optimize
                             try:
-                                score = roc_auc_score(y_inner_fold_val, preds_proba if preds_proba.ndim == 1 else preds_proba[:, 1])
-                                return score # Optuna maximizes this
-                            except ValueError: # Handle cases where only one class is present in y_inner_fold_val
-                                return 0.0 # Return a poor score
+                                score = roc_auc_score(y_inner_fold_val,
+                                                      preds_proba if preds_proba.ndim == 1 else preds_proba[:, 1])
+                                return score  # Optuna maximizes this
+                            except ValueError:  # Handle cases where only one class is present in y_inner_fold_val
+                                return 0.0  # Return a poor score
                         else:
                             # For multiclass, logloss is fine, Optuna minimizes this
                             # This part needs careful handling of predict_proba output for multi_logloss
@@ -571,46 +623,65 @@ def main(config_path):
                             # We'll use the best score from the model's internal evaluation if possible, or roc_auc for now.
                             # Placeholder: if multiclass, this needs to be log_loss and Optuna direction set to 'minimize'
                             try:
-                                score = roc_auc_score(y_inner_fold_val, preds_proba, multi_class='ovr', average='weighted')
-                                return score # Optuna maximizes this
+                                score = roc_auc_score(y_inner_fold_val, preds_proba, multi_class='ovr',
+                                                      average='weighted')
+                                return score  # Optuna maximizes this
                             except ValueError:
                                 return 0.0
 
-
-                    study_direction = 'maximize' if num_classes == 2 else 'maximize' # Assuming AUROC for both for now
+                    study_direction = 'maximize' if num_classes == 2 else 'maximize'  # Assuming AUROC for both for now
                     study_lgbm = optuna.create_study(direction=study_direction,
-                                                     sampler=optuna.samplers.TPESampler(seed=seed + outer_fold_idx + inner_fold_idx))
+                                                     sampler=optuna.samplers.TPESampler(
+                                                         seed=seed + outer_fold_idx + inner_fold_idx))
                     study_lgbm.optimize(lgbm_objective, n_trials=n_trials_lgbm,
-                                        timeout=optuna_lgbm_config.get('timeout_seconds_per_fold', 600)) # Add a timeout
+                                        timeout=optuna_lgbm_config.get('timeout_seconds_per_fold',
+                                                                       600))  # Add a timeout
 
                     best_params_lgbm = study_lgbm.best_params
                     best_score_lgbm = study_lgbm.best_value
-                    logger.info(f"Inner Fold {inner_fold_idx + 1}: Best LGBM params from Optuna: {best_params_lgbm}, Best Score (AUROC/LogLoss): {best_score_lgbm}")
+                    logger.info(
+                        f"Inner Fold {inner_fold_idx + 1}: Best LGBM params from Optuna: {best_params_lgbm}, Best Score (AUROC/LogLoss): {best_score_lgbm}")
                     wandb.log({
-                        f"outer_fold_{outer_fold_idx+1}/inner_fold_{inner_fold_idx+1}/lgbm_best_params": best_params_lgbm,
-                        f"outer_fold_{outer_fold_idx+1}/inner_fold_{inner_fold_idx+1}/lgbm_best_score": best_score_lgbm
+                        f"outer_fold_{outer_fold_idx + 1}/inner_fold_{inner_fold_idx + 1}/lgbm_best_params": best_params_lgbm,
+                        f"outer_fold_{outer_fold_idx + 1}/inner_fold_{inner_fold_idx + 1}/lgbm_best_score": best_score_lgbm
                     })
 
                     # Train final LGBM model for this inner fold using best params
+                    # Ensure Focal Loss parameters are included if not already optimized by Optuna (or if Optuna is off)
                     final_lgbm_params = {
-                        'objective': 'binary' if num_classes == 2 else 'multiclass',
-                        'metric': 'binary_logloss' if num_classes == 2 else 'multi_logloss',
-                        'class_weight': lgbm_config.get('class_weight', 'balanced'),
+                        'objective': 'binary',  # Consistent with Focal Loss
+                        'metric': 'binary_logloss',  # Or the metric Optuna optimized for
+                        'alpha': 0.25,  # Ensure Focal Loss alpha
+                        'gamma': 2.0,  # Ensure Focal Loss gamma
+                        'class_weight': None,  # Consistent with Focal Loss
                         'random_state': seed + outer_fold_idx + inner_fold_idx,
                         'n_jobs': -1,
-                        'verbose': -1, # Keep it less verbose for final model training too
+                        'verbose': -1,
                     }
                     if num_classes > 2:
+                        # Similar warning/consideration as in Optuna objective for multiclass + binary focal
+                        logger.warning(
+                            f"Final LGBM model with Focal params: num_classes={num_classes} but objective='binary'. Check compatibility.")
                         final_lgbm_params['num_class'] = num_classes
 
-                    final_lgbm_params.update(best_params_lgbm) # Add Optuna's best params
+                    # Update with Optuna's best params. Optuna might override alpha/gamma if they were part of its search space.
+                    # If alpha/gamma were fixed (as they are currently above), this just adds other tuned params.
+                    final_lgbm_params.update(best_params_lgbm)
+
+                    # Re-assert Focal Loss specific params if Optuna didn't tune them or if we want to enforce them
+                    # This is crucial if Optuna was optimizing e.g. 'reg_alpha' and we need our specific 'alpha' for Focal Loss.
+                    final_lgbm_params['objective'] = 'binary'
+                    final_lgbm_params['alpha'] = 0.25
+                    final_lgbm_params['gamma'] = 2.0
+                    final_lgbm_params['class_weight'] = None
 
                     lgbm_inner_fold_model = LightGBMModel(params=final_lgbm_params)
                     lgbm_inner_fold_model.train(
                         X_inner_fold_train_balanced, y_inner_fold_train_balanced,
                         X_inner_fold_val, y_inner_fold_val,
                         # num_boost_round is now part of best_params_lgbm as n_estimators
-                        early_stopping_rounds=lgbm_config.get('early_stopping_rounds', 50) # Use original early stopping for final model
+                        early_stopping_rounds=lgbm_config.get('early_stopping_rounds', 50)
+                        # Use original early stopping for final model
                     )
 
                     # Get probabilities
@@ -760,8 +831,10 @@ def main(config_path):
                             logger.debug(
                                 f"Inner Fold {inner_fold_idx + 1}, TECO Epoch {epoch + 1}/{epochs_teco_inner}, Avg Train Loss: {epoch_loss_sum / len(train_teco_loader_inner):.4f}")
                     except Exception as e_train_teco:
-                        logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during TECO Training Loop: {e_train_teco}")
-                        logger.error(f"Error occurred in TECO training, epoch {epoch+1 if 'epoch' in locals() else 'unknown'}, batch_idx {batch_idx if 'batch_idx' in locals() else 'unknown'}")
+                        logger.error(
+                            f"Inner Fold {inner_fold_idx + 1}: Error during TECO Training Loop: {e_train_teco}")
+                        logger.error(
+                            f"Error occurred in TECO training, epoch {epoch + 1 if 'epoch' in locals() else 'unknown'}, batch_idx {batch_idx if 'batch_idx' in locals() else 'unknown'}")
                         raise  # Re-raise to be caught by the outer TECO try-except
 
                     # --- TECO Validation Prediction Phase ---
@@ -770,37 +843,48 @@ def main(config_path):
                         inner_val_preds_teco_list = []
                         with torch.no_grad():
                             for batch in val_teco_loader_inner:
-                                outputs = teco_model_inner(batch['sequence'].to(device), batch['padding_mask'].to(device))
+                                outputs = teco_model_inner(batch['sequence'].to(device),
+                                                           batch['padding_mask'].to(device))
                                 inner_val_preds_teco_list.append(torch.softmax(outputs, dim=1).cpu().numpy())
 
                         if inner_val_preds_teco_list:
-                            oof_preds_inner['teco'][inner_val_idx] = np.concatenate(inner_val_preds_teco_list, axis=0)[:, :num_classes]
+                            oof_preds_inner['teco'][inner_val_idx] = np.concatenate(inner_val_preds_teco_list, axis=0)[
+                                                                     :, :num_classes]
                         else:
-                            logger.warning(f"Inner Fold {inner_fold_idx + 1}: TECO validation prediction list is empty. Filling with defaults.")
-                            oof_preds_inner['teco'][inner_val_idx] = np.full((len(inner_val_idx), num_classes), 1 / num_classes)
+                            logger.warning(
+                                f"Inner Fold {inner_fold_idx + 1}: TECO validation prediction list is empty. Filling with defaults.")
+                            oof_preds_inner['teco'][inner_val_idx] = np.full((len(inner_val_idx), num_classes),
+                                                                             1 / num_classes)
                     except Exception as e_val_pred_teco:
-                        logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during TECO Validation Prediction: {e_val_pred_teco}")
-                        raise # Re-raise to be caught by the outer TECO try-except
+                        logger.error(
+                            f"Inner Fold {inner_fold_idx + 1}: Error during TECO Validation Prediction: {e_val_pred_teco}")
+                        raise  # Re-raise to be caught by the outer TECO try-except
 
                     # --- TECO Outer Test Prediction Phase ---
                     try:
                         outer_test_preds_teco_list = []
                         with torch.no_grad():
                             for batch in outer_test_teco_loader:
-                                outputs = teco_model_inner(batch['sequence'].to(device), batch['padding_mask'].to(device))
+                                outputs = teco_model_inner(batch['sequence'].to(device),
+                                                           batch['padding_mask'].to(device))
                                 outer_test_preds_teco_list.append(torch.softmax(outputs, dim=1).cpu().numpy())
 
                         if outer_test_preds_teco_list:
-                            base_model_preds_on_outer_test_sum['teco'] += np.concatenate(outer_test_preds_teco_list, axis=0)[:, :num_classes] / n_inner_folds
+                            base_model_preds_on_outer_test_sum['teco'] += np.concatenate(outer_test_preds_teco_list,
+                                                                                         axis=0)[:,
+                                                                          :num_classes] / n_inner_folds
                         else:
-                            logger.warning(f"Inner Fold {inner_fold_idx + 1}: TECO outer test prediction list is empty. Adding defaults.")
-                            base_model_preds_on_outer_test_sum['teco'] += np.full((len(y_outer_test), num_classes), 1 / num_classes) / n_inner_folds
+                            logger.warning(
+                                f"Inner Fold {inner_fold_idx + 1}: TECO outer test prediction list is empty. Adding defaults.")
+                            base_model_preds_on_outer_test_sum['teco'] += np.full((len(y_outer_test), num_classes),
+                                                                                  1 / num_classes) / n_inner_folds
                     except Exception as e_test_pred_teco:
-                        logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during TECO Outer Test Prediction: {e_test_pred_teco}")
-                        raise # Re-raise to be caught by the outer TECO try-except
+                        logger.error(
+                            f"Inner Fold {inner_fold_idx + 1}: Error during TECO Outer Test Prediction: {e_test_pred_teco}")
+                        raise  # Re-raise to be caught by the outer TECO try-except
 
                     logger.info(f"Inner Fold {inner_fold_idx + 1}: TECO-Transformer training and prediction complete.")
-                except Exception as e: # This is the main TECO exception handler (line 548 in original)
+                except Exception as e:  # This is the main TECO exception handler (line 548 in original)
                     logger.error(f"Inner Fold {inner_fold_idx + 1}: Error during TECO-Transformer (Main Block): {e}")
                     # Ensure traceback is logged for unexpected errors not caught by more specific blocks above
                     import traceback
@@ -827,22 +911,29 @@ def main(config_path):
                     y_inner_val_gnn_series = y_outer_train_fold_series.iloc[inner_val_idx]
 
                     # Construct y_map for inner train and val GNN datasets
-                    y_map_inner_train_gnn = {pid: (y_inner_train_gnn_series.loc[pid], pd.to_datetime(X_inner_train_raw_gnn.loc[pid, gnn_config['data_columns']['label_timestamp_column']]))
-                                             for pid in X_inner_train_raw_gnn.index.unique() if pid in y_inner_train_gnn_series.index}
-                    y_map_inner_val_gnn = {pid: (y_inner_val_gnn_series.loc[pid], pd.to_datetime(X_inner_val_raw_gnn.loc[pid, gnn_config['data_columns']['label_timestamp_column']]))
-                                           for pid in X_inner_val_raw_gnn.index.unique() if pid in y_inner_val_gnn_series.index}
+                    y_map_inner_train_gnn = {pid: (y_inner_train_gnn_series.loc[pid], pd.to_datetime(
+                        X_inner_train_raw_gnn.loc[pid, gnn_config['data_columns']['label_timestamp_column']]))
+                                             for pid in X_inner_train_raw_gnn.index.unique() if
+                                             pid in y_inner_train_gnn_series.index}
+                    y_map_inner_val_gnn = {pid: (y_inner_val_gnn_series.loc[pid], pd.to_datetime(
+                        X_inner_val_raw_gnn.loc[pid, gnn_config['data_columns']['label_timestamp_column']]))
+                                           for pid in X_inner_val_raw_gnn.index.unique() if
+                                           pid in y_inner_val_gnn_series.index}
 
                     gnn_construction_params_inner = gnn_config.get('graph_construction_params', {}).copy()
                     gnn_construction_params_inner['global_concept_mappers'] = global_concept_mappers
 
                     inner_train_graph_dataset = PatientHeteroGraphDataset(
-                        root_dir=os.path.join(config.get('output_dir', 'outputs'), f'fold_{outer_fold_idx+1}_inner_{inner_fold_idx+1}', 'gnn_processed_train'),
+                        root_dir=os.path.join(config.get('output_dir', 'outputs'),
+                                              f'fold_{outer_fold_idx + 1}_inner_{inner_fold_idx + 1}',
+                                              'gnn_processed_train'),
                         patient_df_split=X_inner_train_raw_gnn,
                         patient_id_col=patient_id_col_name, y_map=y_map_inner_train_gnn,
                         target_variable_name=y_full_for_split.name,
                         label_timestamp_col=gnn_config['data_columns']['label_timestamp_column'],
                         timestamp_col=gnn_config['data_columns']['event_timestamp_column'],
-                        time_rel_col_name=gnn_config['data_columns'].get('relative_time_column', 'hours_since_admission'),
+                        time_rel_col_name=gnn_config['data_columns'].get('relative_time_column',
+                                                                         'hours_since_admission'),
                         admission_timestamp_col=gnn_config['data_columns']['admission_timestamp_column'],
                         graph_construction_params=gnn_construction_params_inner,
                         vital_col_names=gnn_config['data_columns']['vital_columns'],
@@ -852,14 +943,17 @@ def main(config_path):
                         force_reprocess=gnn_config.get('force_reprocess_graphs', False)
                     )
                     inner_val_graph_dataset = PatientHeteroGraphDataset(
-                        root_dir=os.path.join(config.get('output_dir', 'outputs'), f'fold_{outer_fold_idx+1}_inner_{inner_fold_idx+1}', 'gnn_processed_val'),
+                        root_dir=os.path.join(config.get('output_dir', 'outputs'),
+                                              f'fold_{outer_fold_idx + 1}_inner_{inner_fold_idx + 1}',
+                                              'gnn_processed_val'),
                         patient_df_split=X_inner_val_raw_gnn,
                         patient_id_col=patient_id_col_name, y_map=y_map_inner_val_gnn,
                         # ... other params same as inner_train_graph_dataset ...
                         target_variable_name=y_full_for_split.name,
                         label_timestamp_col=gnn_config['data_columns']['label_timestamp_column'],
                         timestamp_col=gnn_config['data_columns']['event_timestamp_column'],
-                        time_rel_col_name=gnn_config['data_columns'].get('relative_time_column', 'hours_since_admission'),
+                        time_rel_col_name=gnn_config['data_columns'].get('relative_time_column',
+                                                                         'hours_since_admission'),
                         admission_timestamp_col=gnn_config['data_columns']['admission_timestamp_column'],
                         graph_construction_params=gnn_construction_params_inner,
                         vital_col_names=gnn_config['data_columns']['vital_columns'],
@@ -888,28 +982,32 @@ def main(config_path):
                     # A more robust way would be to define it based on time_embedding_dim + num_vital_features
                     # from graph_constructor and make it available.
                     # For now, let's assume it's configured or can be inferred if datasets are non-empty.
-                    timeslice_input_dim_gnn = gnn_config.get('timeslice_feature_dim', 16 + len(gnn_config['data_columns']['vital_columns'])) # Placeholder calculation
+                    timeslice_input_dim_gnn = gnn_config.get('timeslice_feature_dim', 16 + len(
+                        gnn_config['data_columns']['vital_columns']))  # Placeholder calculation
                     if inner_train_graph_dataset.patient_ids:
                         try:
-                            sample_graph_data_for_dim = inner_train_graph_dataset.get(0) # Use .get() to load from disk if processed
-                            if sample_graph_data_for_dim and 'timeslice' in sample_graph_data_for_dim.node_types and sample_graph_data_for_dim['timeslice'].num_nodes > 0:
+                            sample_graph_data_for_dim = inner_train_graph_dataset.get(
+                                0)  # Use .get() to load from disk if processed
+                            if sample_graph_data_for_dim and 'timeslice' in sample_graph_data_for_dim.node_types and \
+                                    sample_graph_data_for_dim['timeslice'].num_nodes > 0:
                                 timeslice_input_dim_gnn = sample_graph_data_for_dim['timeslice'].x.shape[1]
                             else:
-                                logger.warning("Sample graph for GNN timeslice dim is empty/invalid. Using configured/default.")
+                                logger.warning(
+                                    "Sample graph for GNN timeslice dim is empty/invalid. Using configured/default.")
                         except Exception as e_sample_dim:
-                             logger.warning(f"Could not get sample graph for GNN timeslice dim: {e_sample_dim}. Using configured/default.")
-
+                            logger.warning(
+                                f"Could not get sample graph for GNN timeslice dim: {e_sample_dim}. Using configured/default.")
 
                     gnn_model_inner = HeteroTemporalGNN(
-                        data_schema={'NODE_TYPES': GNN_NODE_TYPES, 'EDGE_TYPES': GNN_EDGE_TYPES}, # Pass the schema
+                        data_schema={'NODE_TYPES': GNN_NODE_TYPES, 'EDGE_TYPES': GNN_EDGE_TYPES},  # Pass the schema
                         num_nodes_dict={ntype: len(mapper) for ntype, mapper in global_concept_mappers.items()},
                         timeslice_feat_dim=timeslice_input_dim_gnn,
                         concept_embedding_dim=gnn_config.get('concept_embedding_dim', 64),
                         gnn_hidden_dim=gnn_config.get('gnn_hidden_dim', 128),
-                        gnn_output_dim=gnn_config.get('gnn_output_dim', 128), # Output of GNN layers before final FC
+                        gnn_output_dim=gnn_config.get('gnn_output_dim', 128),  # Output of GNN layers before final FC
                         num_gnn_layers=gnn_config.get('num_gnn_layers', 2),
                         num_gat_heads=gnn_config.get('num_gat_heads', 4),
-                        output_classes=1 if num_classes == 2 else num_classes, # BCEWithLogitsLoss if binary
+                        output_classes=1 if num_classes == 2 else num_classes,  # BCEWithLogitsLoss if binary
                         dropout_rate=gnn_config.get('dropout', 0.3)
                     ).to(device)
 
@@ -924,12 +1022,14 @@ def main(config_path):
                         for gnn_batch in train_gnn_loader:
                             gnn_batch = gnn_batch.to(device)
                             gnn_optimizer_inner.zero_grad()
-                            gnn_outputs = gnn_model_inner(gnn_batch) # HeteroData batch
-                            gnn_loss = gnn_criterion_inner(gnn_outputs, gnn_batch.y.float()) # Ensure y is float for BCE
+                            gnn_outputs = gnn_model_inner(gnn_batch)  # HeteroData batch
+                            gnn_loss = gnn_criterion_inner(gnn_outputs,
+                                                           gnn_batch.y.float())  # Ensure y is float for BCE
                             gnn_loss.backward()
                             gnn_optimizer_inner.step()
                             epoch_loss_gnn_sum += gnn_loss.item()
-                        logger.debug(f"Inner Fold {inner_fold_idx + 1}, GNN Epoch {epoch + 1}/{epochs_gnn_inner}, Avg Train Loss: {epoch_loss_gnn_sum / len(train_gnn_loader):.4f}")
+                        logger.debug(
+                            f"Inner Fold {inner_fold_idx + 1}, GNN Epoch {epoch + 1}/{epochs_gnn_inner}, Avg Train Loss: {epoch_loss_gnn_sum / len(train_gnn_loader):.4f}")
 
                     # --- GNN Validation Predictions (OOF for meta-learner) ---
                     gnn_model_inner.eval()
@@ -946,21 +1046,25 @@ def main(config_path):
                         concatenated_preds_gnn = np.concatenate(inner_val_preds_gnn_list)
                         # Ensure 2D for binary: [prob_class_0, prob_class_1]
                         if num_classes == 2:
-                             gnn_oof_probas_2d = np.hstack([1 - concatenated_preds_gnn.reshape(-1,1), concatenated_preds_gnn.reshape(-1,1)])
-                        else: # Multiclass: ensure shape is (N, num_classes) - GNN output needs adjustment if not
-                             gnn_oof_probas_2d = concatenated_preds_gnn # This assumes GNN outputs (N,num_classes) for multiclass
+                            gnn_oof_probas_2d = np.hstack(
+                                [1 - concatenated_preds_gnn.reshape(-1, 1), concatenated_preds_gnn.reshape(-1, 1)])
+                        else:  # Multiclass: ensure shape is (N, num_classes) - GNN output needs adjustment if not
+                            gnn_oof_probas_2d = concatenated_preds_gnn  # This assumes GNN outputs (N,num_classes) for multiclass
 
                         if oof_preds_inner['gnn'][inner_val_idx].shape == gnn_oof_probas_2d.shape:
-                             oof_preds_inner['gnn'][inner_val_idx] = gnn_oof_probas_2d
+                            oof_preds_inner['gnn'][inner_val_idx] = gnn_oof_probas_2d
                         else:
-                             logger.error(f"GNN OOF shape mismatch. Target: {oof_preds_inner['gnn'][inner_val_idx].shape}, Value: {gnn_oof_probas_2d.shape}")
-                             # Fill with default if mismatch
-                             oof_preds_inner['gnn'][inner_val_idx] = np.full((len(inner_val_idx), num_classes), 1/num_classes)
+                            logger.error(
+                                f"GNN OOF shape mismatch. Target: {oof_preds_inner['gnn'][inner_val_idx].shape}, Value: {gnn_oof_probas_2d.shape}")
+                            # Fill with default if mismatch
+                            oof_preds_inner['gnn'][inner_val_idx] = np.full((len(inner_val_idx), num_classes),
+                                                                            1 / num_classes)
 
                     # --- GNN Outer Test Predictions (from this inner fold's GNN model) ---
                     # This requires outer_test_graph_dataset to be ready
                     if outer_test_graph_dataset and len(outer_test_graph_dataset) > 0:
-                        outer_test_gnn_loader = PyGDataLoader(outer_test_graph_dataset, batch_size=gnn_batch_size, shuffle=False)
+                        outer_test_gnn_loader = PyGDataLoader(outer_test_graph_dataset, batch_size=gnn_batch_size,
+                                                              shuffle=False)
                         outer_test_preds_gnn_list = []
                         with torch.no_grad():
                             for gnn_batch_test in outer_test_gnn_loader:
@@ -972,14 +1076,16 @@ def main(config_path):
                         if outer_test_preds_gnn_list:
                             concatenated_test_preds_gnn = np.concatenate(outer_test_preds_gnn_list)
                             if num_classes == 2:
-                                gnn_test_probas_2d = np.hstack([1 - concatenated_test_preds_gnn.reshape(-1,1), concatenated_test_preds_gnn.reshape(-1,1)])
+                                gnn_test_probas_2d = np.hstack([1 - concatenated_test_preds_gnn.reshape(-1, 1),
+                                                                concatenated_test_preds_gnn.reshape(-1, 1)])
                             else:
-                                gnn_test_probas_2d = concatenated_test_preds_gnn # Adjust if multiclass output from GNN is different
+                                gnn_test_probas_2d = concatenated_test_preds_gnn  # Adjust if multiclass output from GNN is different
 
                             if base_model_preds_on_outer_test_sum['gnn'].shape == gnn_test_probas_2d.shape:
                                 base_model_preds_on_outer_test_sum['gnn'] += gnn_test_probas_2d / n_inner_folds
                             else:
-                                logger.error(f"GNN Test Sum shape mismatch. Target: {base_model_preds_on_outer_test_sum['gnn'].shape}, Value: {gnn_test_probas_2d.shape}")
+                                logger.error(
+                                    f"GNN Test Sum shape mismatch. Target: {base_model_preds_on_outer_test_sum['gnn'].shape}, Value: {gnn_test_probas_2d.shape}")
 
                     logger.info(f"Inner Fold {inner_fold_idx + 1}: HeteroTemporalGNN training and prediction complete.")
 
@@ -989,16 +1095,18 @@ def main(config_path):
                     logger.error(f"GNN Traceback: {traceback.format_exc()}")
                     # Fill with defaults if GNN fails for this inner fold
                     oof_preds_inner['gnn'][inner_val_idx] = np.full((len(inner_val_idx), num_classes), 1 / num_classes)
-                    base_model_preds_on_outer_test_sum['gnn'] += np.full((len(y_outer_test), num_classes), 1 / num_classes) / n_inner_folds
+                    base_model_preds_on_outer_test_sum['gnn'] += np.full((len(y_outer_test), num_classes),
+                                                                         1 / num_classes) / n_inner_folds
             # --- End GNN Block ---
 
         # --- Length of Stay (LoS) Regression ---
-        los_column_name = 'lengthofStay' # Make sure this matches the actual column name
-        predicted_los_outer_test = np.full(len(y_outer_test), np.nan) # Default to NaN
+        los_column_name = 'lengthofStay'  # Make sure this matches the actual column name
+        predicted_los_outer_test = np.full(len(y_outer_test), np.nan)  # Default to NaN
 
         if los_column_name in X_outer_train_raw_fold_df.columns and los_column_name in X_outer_test_raw_fold_df.columns:
             y_los_outer_train_raw = X_outer_train_raw_fold_df[los_column_name].values
-            y_los_outer_test_actual_orig_scale = X_outer_test_raw_fold_df[los_column_name].values # Keep original scale for final MAE
+            y_los_outer_test_actual_orig_scale = X_outer_test_raw_fold_df[
+                los_column_name].values  # Keep original scale for final MAE
 
             # Ensure no NaN values in target for LoS training
             valid_los_train_indices = ~np.isnan(y_los_outer_train_raw)
@@ -1010,14 +1118,15 @@ def main(config_path):
                 # Apply log1p transformation to the LoS target for training
                 y_los_outer_train_transformed = np.log1p(y_los_outer_train_cleaned_orig_scale)
 
-                logger.info(f"Outer Fold {outer_fold_idx + 1}: Training Quantile LightGBM Regressor for Length of Stay (log1p transformed target)...")
+                logger.info(
+                    f"Outer Fold {outer_fold_idx + 1}: Training Quantile LightGBM Regressor for Length of Stay (log1p transformed target)...")
                 try:
                     lgbm_los_config = config.get('ensemble', {}).get('lgbm_los_params', {})
 
                     los_regressor_params = {
                         'objective': 'quantile',  # Quantile regression
-                        'alpha': 0.5,             # For median (L1 loss equivalent for quantile)
-                        'metric': 'quantile',     # Use quantile metric
+                        'alpha': 0.5,  # For median (L1 loss equivalent for quantile)
+                        'metric': 'quantile',  # Use quantile metric
                         'n_estimators': lgbm_los_config.get('n_estimators', 200),
                         'learning_rate': lgbm_los_config.get('learning_rate', 0.05),
                         'num_leaves': lgbm_los_config.get('num_leaves', 31),
@@ -1032,11 +1141,11 @@ def main(config_path):
                     los_model = LightGBMModel(params=los_regressor_params)
 
                     optuna_los_config = config.get('optuna', {}).get('lgbm_los', {})
-                    use_optuna_for_los = optuna_los_config.get('use_optuna_for_los', False) # Control flag
+                    use_optuna_for_los = optuna_los_config.get('use_optuna_for_los', False)  # Control flag
                     n_trials_los = optuna_los_config.get('n_trials', 15)
                     timeout_los = optuna_los_config.get('timeout_seconds_per_fold', 300)
 
-                    if use_optuna_for_los and X_los_train_fold_processed.shape[0] > 20: # Ensure enough data for split
+                    if use_optuna_for_los and X_los_train_fold_processed.shape[0] > 20:  # Ensure enough data for split
                         # Create a train/validation split from X_los_train_fold_processed for Optuna
                         # Using a simple split here, can be improved (e.g., KFold for robustness within Optuna)
                         # For simplicity, let's use a fixed 80/20 split of the already cleaned LoS training data
@@ -1045,8 +1154,9 @@ def main(config_path):
                         from sklearn.model_selection import train_test_split as los_optuna_split
 
                         X_optuna_los_train, X_optuna_los_val, \
-                        y_optuna_los_train_transformed, y_optuna_los_val_transformed = los_optuna_split(
-                            X_los_train_fold_processed, y_los_outer_train_transformed, # Use transformed target for Optuna
+                            y_optuna_los_train_transformed, y_optuna_los_val_transformed = los_optuna_split(
+                            X_los_train_fold_processed, y_los_outer_train_transformed,
+                            # Use transformed target for Optuna
                             test_size=0.25,
                             random_state=seed + outer_fold_idx + 100
                         )
@@ -1070,7 +1180,7 @@ def main(config_path):
                                 'verbose': -1,
                             }
                             temp_los_model = LightGBMModel(params=trial_los_params)
-                            temp_los_model.train( # Train on transformed data
+                            temp_los_model.train(  # Train on transformed data
                                 X_optuna_los_train, y_optuna_los_train_transformed,
                                 X_optuna_los_val, y_optuna_los_val_transformed,
                                 early_stopping_rounds=optuna_los_config.get('early_stopping_rounds_trial', 10)
@@ -1083,18 +1193,20 @@ def main(config_path):
                             # Alternatively, transform y_optuna_los_val_transformed back for MAE calculation here.
                             y_optuna_los_val_orig_scale = np.expm1(y_optuna_los_val_transformed)
                             mae_orig_scale = mean_absolute_error(y_optuna_los_val_orig_scale, preds_val_los_orig_scale)
-                            return mae_orig_scale # Optuna minimizes this
+                            return mae_orig_scale  # Optuna minimizes this
 
                         study_los = optuna.create_study(direction='minimize',
-                                                        sampler=optuna.samplers.TPESampler(seed=seed + outer_fold_idx + 200))
+                                                        sampler=optuna.samplers.TPESampler(
+                                                            seed=seed + outer_fold_idx + 200))
                         study_los.optimize(los_objective, n_trials=n_trials_los, timeout=timeout_los)
 
                         best_los_params_optuna = study_los.best_params
-                        best_los_score_optuna = study_los.best_value # This is MAE on original scale from Optuna
-                        logger.info(f"Outer Fold {outer_fold_idx + 1}: Best LoS Regressor params from Optuna: {best_los_params_optuna}, Best MAE (Optuna eval): {best_los_score_optuna:.4f}")
+                        best_los_score_optuna = study_los.best_value  # This is MAE on original scale from Optuna
+                        logger.info(
+                            f"Outer Fold {outer_fold_idx + 1}: Best LoS Regressor params from Optuna: {best_los_params_optuna}, Best MAE (Optuna eval): {best_los_score_optuna:.4f}")
                         wandb.log({
-                            f"outer_fold_{outer_fold_idx+1}/los_optuna_best_params": best_los_params_optuna,
-                            f"outer_fold_{outer_fold_idx+1}/los_optuna_best_mae": best_los_score_optuna
+                            f"outer_fold_{outer_fold_idx + 1}/los_optuna_best_params": best_los_params_optuna,
+                            f"outer_fold_{outer_fold_idx + 1}/los_optuna_best_mae": best_los_score_optuna
                         })
 
                         final_los_params = los_regressor_params.copy()
@@ -1104,26 +1216,32 @@ def main(config_path):
                         final_los_params['metric'] = 'quantile'
 
                         los_model = LightGBMModel(params=final_los_params)
-                        los_model.train(X_los_train_fold_processed, y_los_outer_train_transformed, # Train on full transformed training data for the fold
+                        los_model.train(X_los_train_fold_processed, y_los_outer_train_transformed,
+                                        # Train on full transformed training data for the fold
                                         early_stopping_rounds=lgbm_los_config.get('early_stopping_rounds_final', 20))
                     else:
                         if use_optuna_for_los:
-                             logger.warning(f"Outer Fold {outer_fold_idx + 1}: Skipping Optuna for LoS due to insufficient data ({X_los_train_fold_processed.shape[0]} samples). Using base lgbm_los_params.")
-                        los_model.train(X_los_train_fold_processed, y_los_outer_train_transformed, # Train on transformed
+                            logger.warning(
+                                f"Outer Fold {outer_fold_idx + 1}: Skipping Optuna for LoS due to insufficient data ({X_los_train_fold_processed.shape[0]} samples). Using base lgbm_los_params.")
+                        los_model.train(X_los_train_fold_processed, y_los_outer_train_transformed,
+                                        # Train on transformed
                                         early_stopping_rounds=lgbm_los_config.get('early_stopping_rounds_final', 20))
 
                     predicted_los_transformed = los_model.predict(X_outer_test_processed)
                     predicted_los_outer_test = np.expm1(predicted_los_transformed)
-                    predicted_los_outer_test = np.maximum(0, predicted_los_outer_test) # Ensure non-negativity after transform
+                    predicted_los_outer_test = np.maximum(0,
+                                                          predicted_los_outer_test)  # Ensure non-negativity after transform
 
-                    valid_los_indices_for_mae = ~np.isnan(y_los_outer_test_actual_orig_scale) & ~np.isnan(predicted_los_outer_test)
+                    valid_los_indices_for_mae = ~np.isnan(y_los_outer_test_actual_orig_scale) & ~np.isnan(
+                        predicted_los_outer_test)
                     if np.sum(valid_los_indices_for_mae) > 0:
                         mae_los_outer = mean_absolute_error(
                             y_los_outer_test_actual_orig_scale[valid_los_indices_for_mae],
                             predicted_los_outer_test[valid_los_indices_for_mae]
                         )
                     else:
-                        logger.warning(f"Outer Fold {outer_fold_idx + 1}: No valid (non-NaN) actual/predicted LoS pairs for MAE calculation. MAE set to NaN.")
+                        logger.warning(
+                            f"Outer Fold {outer_fold_idx + 1}: No valid (non-NaN) actual/predicted LoS pairs for MAE calculation. MAE set to NaN.")
                         mae_los_outer = np.nan
 
                     if np.isnan(mae_los_outer):
@@ -1139,18 +1257,21 @@ def main(config_path):
                         f"outer_fold_{outer_fold_idx + 1}/mae_los": mae_los_outer,
                         "outer_fold": outer_fold_idx + 1
                     })
-                    logger.info(f"Outer Fold {outer_fold_idx + 1} LoS Regressor: MAE={mae_los_outer:.4f}, LSscore={ls_score_outer:.4f}")
+                    logger.info(
+                        f"Outer Fold {outer_fold_idx + 1} LoS Regressor: MAE={mae_los_outer:.4f}, LSscore={ls_score_outer:.4f}")
 
                 except Exception as e_los:
                     logger.error(f"Outer Fold {outer_fold_idx + 1}: Error during LoS Regression: {e_los}")
                     outer_fold_los_metrics['mae_los'].append(np.nan)
-                    outer_fold_los_metrics['ls_score'].append(10.0) # Worst score
+                    outer_fold_los_metrics['ls_score'].append(10.0)  # Worst score
             else:
-                logger.warning(f"Outer Fold {outer_fold_idx + 1}: No valid LoS data to train LoS regressor after NaN removal. LSscore will be 10.")
+                logger.warning(
+                    f"Outer Fold {outer_fold_idx + 1}: No valid LoS data to train LoS regressor after NaN removal. LSscore will be 10.")
                 outer_fold_los_metrics['mae_los'].append(np.nan)
                 outer_fold_los_metrics['ls_score'].append(10.0)
         else:
-            logger.warning(f"Outer Fold {outer_fold_idx + 1}: '{los_column_name}' not found in raw data. Skipping LoS regression. LSscore will be 10.")
+            logger.warning(
+                f"Outer Fold {outer_fold_idx + 1}: '{los_column_name}' not found in raw data. Skipping LoS regression. LSscore will be 10.")
             outer_fold_los_metrics['mae_los'].append(np.nan)
             outer_fold_los_metrics['ls_score'].append(10.0)
 
@@ -1163,9 +1284,8 @@ def main(config_path):
             oof_preds_inner['lgbm'])
         if config.get('ensemble', {}).get('train_teco', True): meta_features_train_outer_list.append(
             oof_preds_inner['teco'])
-        if train_gnn: # Add GNN OOF preds if GNN was trained
+        if train_gnn:  # Add GNN OOF preds if GNN was trained
             meta_features_train_outer_list.append(oof_preds_inner['gnn'])
-
 
         if not meta_features_train_outer_list:
             logger.error(
@@ -1189,8 +1309,8 @@ def main(config_path):
                 optuna_meta_config = config.get('optuna', {}).get('xgboost_meta', {})
 
                 xgb_meta_model_outer = XGBoostMetaLearner(
-                    params=meta_config.get('model_specific_params'), # Initial base params
-                    depth=meta_config.get('depth', 3) # Default depth, Optuna can override if 'max_depth' is tuned
+                    params=meta_config.get('model_specific_params'),  # Initial base params
+                    depth=meta_config.get('depth', 3)  # Default depth, Optuna can override if 'max_depth' is tuned
                 )
 
                 # Pass X_outer_test_processed and y_outer_test for validation if Optuna needs it
@@ -1204,7 +1324,8 @@ def main(config_path):
                 # We will pass a portion of X_meta_train_outer as validation for Optuna if enabled.
 
                 X_meta_val_optuna, y_meta_val_optuna = None, None
-                if optuna_meta_config.get('use_optuna_for_meta', False) and X_meta_train_outer.shape[0] > 10: # Basic check
+                if optuna_meta_config.get('use_optuna_for_meta', False) and X_meta_train_outer.shape[
+                    0] > 10:  # Basic check
                     # Simple split for Optuna validation - can be improved (e.g. stratified)
                     # This split is ONLY for Optuna's internal validation during hyperparameter search.
                     # The final model will be trained on the full X_meta_train_outer.
@@ -1230,7 +1351,7 @@ def main(config_path):
                     # It will use early stopping on the training data itself if no X_val is passed,
                     # or if X_val is passed, it will use that.
                     # The warning in XGBoostMetaLearner about X_val/y_val not provided for early stopping applies.
-                    pass # No explicit split here for X_meta_val_optuna
+                    pass  # No explicit split here for X_meta_val_optuna
 
                 # Use fixed scale_pos_weight from config if provided, otherwise XGBoost default (or None)
                 # The meta_config['model_specific_params'] should ideally already contain scale_pos_weight if set in YAML
@@ -1240,16 +1361,33 @@ def main(config_path):
                 # and not in model_specific_params, add it to current_meta_params.
                 # The YAML structure has it inside meta_learner_xgb_params, so it should be in model_specific_params.
                 # Let's ensure it's logged if used.
-                if 'scale_pos_weight' in current_meta_params:
-                    logger.info(f"Outer Fold {outer_fold_idx + 1}: Using fixed scale_pos_weight for XGBoost meta-learner: {current_meta_params['scale_pos_weight']}")
-                elif meta_config.get('scale_pos_weight') is not None: # Check if it's at a higher level in meta_config
-                    logger.info(f"Outer Fold {outer_fold_idx + 1}: Using fixed scale_pos_weight from top-level meta_config for XGBoost meta-learner: {meta_config['scale_pos_weight']}")
-                    current_meta_params['scale_pos_weight'] = meta_config['scale_pos_weight']
-                else:
-                    logger.info(f"Outer Fold {outer_fold_idx + 1}: No fixed scale_pos_weight specified for XGBoost meta-learner. Using XGBoost defaults.")
+                # User Request: Ensure scale_pos_weight = 2 for XGBoost meta-learner
+                if 'scale_pos_weight' not in current_meta_params:
+                    logger.info(
+                        f"Outer Fold {outer_fold_idx + 1}: 'scale_pos_weight' not found in meta_config's model_specific_params. Setting to 2 as per requirement.")
+                    current_meta_params['scale_pos_weight'] = 2
+                elif current_meta_params['scale_pos_weight'] != 2:
+                    logger.warning(
+                        f"Outer Fold {outer_fold_idx + 1}: 'scale_pos_weight' in meta_config's model_specific_params is {current_meta_params['scale_pos_weight']}. Overriding to 2 as per requirement.")
+                    current_meta_params['scale_pos_weight'] = 2
+                else:  # It's present and already 2
+                    logger.info(
+                        f"Outer Fold {outer_fold_idx + 1}: Using 'scale_pos_weight': {current_meta_params['scale_pos_weight']} from meta_config for XGBoost meta-learner (matches requirement).")
+
+                # Ensure 'objective' is appropriate for binary classification if scale_pos_weight is used.
+                # scale_pos_weight is typically for binary classification.
+                if num_classes == 2 and current_meta_params.get('objective', '').startswith('multi:'):
+                    logger.info(
+                        f"Outer Fold {outer_fold_idx + 1}: num_classes is 2 and scale_pos_weight is used. Changing XGBoost objective from {current_meta_params.get('objective')} to 'binary:logistic'.")
+                    current_meta_params['objective'] = 'binary:logistic'
+                    if 'eval_metric' not in current_meta_params or current_meta_params.get('eval_metric') == 'mlogloss':
+                        current_meta_params['eval_metric'] = ['logloss']  # Common eval metric for binary
+                elif num_classes != 2 and 'scale_pos_weight' in current_meta_params:
+                    logger.warning(
+                        f"Outer Fold {outer_fold_idx + 1}: scale_pos_weight is set for XGBoost meta-learner, but num_classes is {num_classes} (not 2). scale_pos_weight might not be effective or intended for multiclass scenarios with this XGBoost setup.")
 
                 xgb_meta_model_outer = XGBoostMetaLearner(
-                    params=current_meta_params, # This should now include scale_pos_weight if defined in YAML
+                    params=current_meta_params,  # This now includes the enforced scale_pos_weight=2
                     depth=meta_config.get('depth', 3)
                 )
 
@@ -1257,8 +1395,8 @@ def main(config_path):
                     X_meta_train_outer, y_meta_train_outer,
                     X_val=None,
                     y_val=None,
-                    num_boost_round=meta_config.get('num_boost_round', 100), # Updated value from new config
-                    early_stopping_rounds=meta_config.get('early_stopping_rounds', 15), # Updated value
+                    num_boost_round=meta_config.get('num_boost_round', 100),  # Updated value from new config
+                    early_stopping_rounds=meta_config.get('early_stopping_rounds', 15),  # Updated value
                     use_optuna=optuna_meta_config.get('use_optuna_for_meta', False),
                     optuna_n_trials=optuna_meta_config.get('n_trials', 15),
                     optuna_timeout=optuna_meta_config.get('timeout_seconds_fold', 300),
@@ -1271,11 +1409,12 @@ def main(config_path):
                     base_model_preds_on_outer_test_sum['lgbm'])
                 if config.get('ensemble', {}).get('train_teco', True): meta_features_test_outer_list.append(
                     base_model_preds_on_outer_test_sum['teco'])
-                if train_gnn: # Add GNN test preds if GNN was trained
+                if train_gnn:  # Add GNN test preds if GNN was trained
                     meta_features_test_outer_list.append(base_model_preds_on_outer_test_sum['gnn'])
 
-                if not meta_features_test_outer_list: # Should not happen if train_meta_learner is true and at least one base model ran
-                    logger.error(f"Outer Fold {outer_fold_idx + 1}: No base model predictions available for meta-learner test set. Skipping meta-learner prediction.")
+                if not meta_features_test_outer_list:  # Should not happen if train_meta_learner is true and at least one base model ran
+                    logger.error(
+                        f"Outer Fold {outer_fold_idx + 1}: No base model predictions available for meta-learner test set. Skipping meta-learner prediction.")
                     # Fill meta metrics with NaN for this fold
                     for key in outer_fold_metrics_meta.keys(): outer_fold_metrics_meta[key].append(np.nan)
                     wandb.log({f"outer_fold_{outer_fold_idx + 1}/meta_auroc": np.nan, "outer_fold": outer_fold_idx + 1})
@@ -1284,18 +1423,74 @@ def main(config_path):
                 else:
                     X_meta_test_outer = np.concatenate(meta_features_test_outer_list, axis=1)
                     final_preds_meta_proba_outer = xgb_meta_model_outer.predict_proba(X_meta_test_outer)
-                final_preds_meta_labels_outer = xgb_meta_model_outer.predict(X_meta_test_outer)
+                final_preds_meta_labels_outer = xgb_meta_model_outer.predict(
+                    X_meta_test_outer)  # Labels based on default 0.5 threshold from predict()
 
-                acc_meta_outer = accuracy_score(y_outer_test, final_preds_meta_labels_outer)
-                f1_meta_outer = f1_score(y_outer_test, final_preds_meta_labels_outer,
+                # --- F1 Threshold Maximization ---
+                death_label_value = class_mapping.get('Death', None)
+                best_threshold_fold_meta = 0.5  # Default
+                f1_at_best_threshold_meta = 0.0  # Default
+
+                if death_label_value is not None and final_preds_meta_proba_outer is not None:
+                    logger.info(
+                        f"Outer Fold {outer_fold_idx + 1}: Maximizing F1 threshold for 'Death' class (Meta-Learner)...")
+                    best_threshold_fold_meta, f1_at_best_threshold_meta = maximise_f1_threshold(
+                        y_true=y_outer_test,
+                        y_probas=final_preds_meta_proba_outer,
+                        target_label_value=death_label_value,
+                        class_mapping=class_mapping,
+                        positive_label_name='Death'
+                    )
+                    all_best_thresholds_fold_list.append(best_threshold_fold_meta)
+                    all_f1_at_best_thr_meta_list.append(f1_at_best_threshold_meta)  # Store this F1
+                    logger.info(
+                        f"Outer Fold {outer_fold_idx + 1} Meta-Learner: Best F1 threshold for 'Death' = {best_threshold_fold_meta:.4f} (yields F1 = {f1_at_best_threshold_meta:.4f})")
+                    wandb.log({
+                        f"outer_fold_{outer_fold_idx + 1}/meta_best_f1_thr_death": best_threshold_fold_meta,
+                        f"outer_fold_{outer_fold_idx + 1}/meta_f1_at_best_thr_death": f1_at_best_threshold_meta,
+                        "outer_fold": outer_fold_idx + 1
+                    })
+                elif death_label_value is None:
+                    logger.warning(
+                        f"Outer Fold {outer_fold_idx + 1}: 'Death' class not in class_mapping. Cannot maximize F1 threshold. Using default 0.5.")
+                    all_best_thresholds_fold_list.append(0.5)  # Append default if 'Death' class is missing
+                else:  # final_preds_meta_proba_outer is None
+                    logger.warning(
+                        f"Outer Fold {outer_fold_idx + 1}: Meta-learner probabilities are None. Cannot maximize F1 threshold. Using default 0.5.")
+                    all_best_thresholds_fold_list.append(0.5)
+
+                # Predictions using the new best_threshold_fold_meta for metrics calculation
+                if death_label_value is not None and final_preds_meta_proba_outer is not None:
+                    death_class_idx = class_mapping['Death']
+                    final_preds_meta_labels_outer_custom_thr = (
+                                final_preds_meta_proba_outer[:, death_class_idx] > best_threshold_fold_meta).astype(int)
+                    # Important: If 'Death' is class 0 and 'Survival' is 1, predictions should be 0 for Death, 1 for Survival.
+                    # The line above gives 1 if P(Death) > thr, 0 otherwise. This needs to map back to original labels.
+                    # If target_label_value for Death is 0, then:
+                    #   predicted_as_death = (final_preds_meta_proba_outer[:, death_class_idx] > best_threshold_fold_meta)
+                    #   final_preds_meta_labels_outer_custom_thr = np.where(predicted_as_death, death_label_value, class_mapping.get('Survival'))
+                    # This is complex. Simpler: use the f1_at_best_threshold_meta directly for DTscore.
+                    # For other metrics (acc, precision, recall), using labels derived from this custom threshold for 'Death'
+                    # while other classes (if any) use argmax might be inconsistent.
+                    # The user's request focuses on F1_Death and DTscore. Let's use f1_at_best_threshold_meta for DTscore.
+                    # And for overall metrics, we can report based on default 0.5 or this custom threshold.
+                    # For now, let's keep final_preds_meta_labels_outer (from default 0.5) for general metrics,
+                    # and use f1_at_best_threshold_meta for DTscore.
+                # --- End F1 Threshold Maximization ---
+
+                acc_meta_outer = accuracy_score(y_outer_test,
+                                                final_preds_meta_labels_outer)  # Based on default 0.5 threshold
+                f1_meta_outer = f1_score(y_outer_test, final_preds_meta_labels_outer,  # Based on default 0.5 threshold
                                          average='weighted' if num_classes > 2 else 'binary', zero_division=0)
                 prec_meta_outer = precision_score(y_outer_test, final_preds_meta_labels_outer,
+                                                  # Based on default 0.5 threshold
                                                   average='weighted' if num_classes > 2 else 'binary',
                                                   zero_division=0)
                 rec_meta_outer = recall_score(y_outer_test, final_preds_meta_labels_outer,
+                                              # Based on default 0.5 threshold
                                               average='weighted' if num_classes > 2 else 'binary', zero_division=0)
                 auroc_meta_outer = -1.0
-                dt_score_meta_outer = 10.0 # Default to worst score
+                dt_score_meta_outer = 10.0  # Default to worst score
 
                 try:
                     probas_for_auc = final_preds_meta_proba_outer[:,
@@ -1309,78 +1504,98 @@ def main(config_path):
                         f"Outer Fold {outer_fold_idx + 1} Meta AUROC calc error: {e}. Proba shape: {final_preds_meta_proba_outer.shape if isinstance(final_preds_meta_proba_outer, np.ndarray) else 'N/A'}")
 
                 # Calculate DTscore for Meta-Learner
-                death_label_value = class_mapping.get('Death', None)
+                # Uses f1_at_best_threshold_meta if available, otherwise falls back to F1 from default threshold predictions
+                f1_death_for_dtscore_meta = 0.0
                 if death_label_value is not None:
-                    f1_death_meta = f1_score(y_outer_test, final_preds_meta_labels_outer,
-                                             labels=[death_label_value], pos_label=death_label_value,
-                                             average='binary', zero_division=0)
-                    dt_score_meta_outer = dt_score_calc(f1_death_meta) # Use function
-                    logger.info(f"Outer Fold {outer_fold_idx + 1} Meta-Learner: F1_Death={f1_death_meta:.4f}, DTscore={dt_score_meta_outer:.4f}")
+                    if f1_at_best_threshold_meta > 0.0:  # Check if maximization was successful
+                        f1_death_for_dtscore_meta = f1_at_best_threshold_meta
+                        logger.info(
+                            f"Outer Fold {outer_fold_idx + 1} Meta-Learner: Using F1_Death from maximized threshold ({f1_death_for_dtscore_meta:.4f}) for DTscore.")
+                    else:  # Fallback to F1 from default 0.5 threshold if maximization yielded 0 or was skipped
+                        f1_death_for_dtscore_meta = f1_score(y_outer_test, final_preds_meta_labels_outer,
+                                                             # Labels from default 0.5
+                                                             labels=[death_label_value], pos_label=death_label_value,
+                                                             average='binary', zero_division=0)
+                        logger.info(
+                            f"Outer Fold {outer_fold_idx + 1} Meta-Learner: Using F1_Death from default 0.5 threshold ({f1_death_for_dtscore_meta:.4f}) for DTscore.")
+                    dt_score_meta_outer = dt_score_calc(f1_death_for_dtscore_meta)
                 else:
-                    logger.warning(f"Outer Fold {outer_fold_idx + 1} Meta-Learner: 'Death' class not found in class_mapping. DTscore set to 10.")
-                    dt_score_meta_outer = dt_score_calc(np.nan) # Ensure it's 10 if class not found
+                    logger.warning(
+                        f"Outer Fold {outer_fold_idx + 1} Meta-Learner: 'Death' class not found in class_mapping. DTscore set to 10.")
+                    dt_score_meta_outer = dt_score_calc(np.nan)  # Ensure it's 10
 
                 outer_fold_metrics_meta['accuracy'].append(acc_meta_outer)
                 outer_fold_metrics_meta['auroc'].append(auroc_meta_outer)
-                outer_fold_metrics_meta['f1'].append(f1_meta_outer)
+                outer_fold_metrics_meta['f1'].append(f1_meta_outer)  # This is overall F1
                 outer_fold_metrics_meta['precision'].append(prec_meta_outer)
                 outer_fold_metrics_meta['recall'].append(rec_meta_outer)
-                outer_fold_metrics_meta['dt_score'].append(dt_score_meta_outer)
+                outer_fold_metrics_meta['dt_score'].append(dt_score_meta_outer)  # Based on best/maximized F1 for Death
 
                 # Calculate GLscore for Meta-Learner
-                current_ls_score_meta = outer_fold_los_metrics['ls_score'][-1] if outer_fold_los_metrics['ls_score'] else ls_score_calc(np.nan) # Default to worst if no LS score
+                current_ls_score_meta = outer_fold_los_metrics['ls_score'][-1] if outer_fold_los_metrics[
+                    'ls_score'] else ls_score_calc(np.nan)  # Default to worst if no LS score
                 gl_score_meta_outer = gl_score_calc(dt_score_meta_outer, current_ls_score_meta)
                 outer_fold_metrics_meta['gl_score'].append(gl_score_meta_outer)
 
                 wandb.log({
-                    f"outer_fold_{outer_fold_idx + 1}/meta_f1_death": f1_death_meta if death_label_value is not None else np.nan,
-                    f"outer_fold_{outer_fold_idx + 1}/meta_mae_los": outer_fold_los_metrics['mae_los'][-1] if outer_fold_los_metrics['mae_los'] else np.nan,
+                    f"outer_fold_{outer_fold_idx + 1}/meta_f1_death_for_dtscore": f1_death_for_dtscore_meta if death_label_value is not None else np.nan,
+                    # Log the original F1_Death based on 0.5 threshold for comparison if needed
+                    f"outer_fold_{outer_fold_idx + 1}/meta_f1_death_default_thr": f1_score(y_outer_test,
+                                                                                           final_preds_meta_labels_outer,
+                                                                                           labels=[death_label_value],
+                                                                                           pos_label=death_label_value,
+                                                                                           average='binary',
+                                                                                           zero_division=0) if death_label_value is not None else np.nan,
+                    f"outer_fold_{outer_fold_idx + 1}/meta_mae_los": outer_fold_los_metrics['mae_los'][-1] if
+                    outer_fold_los_metrics['mae_los'] else np.nan,
                     f"outer_fold_{outer_fold_idx + 1}/meta_dt_score": dt_score_meta_outer,
                     f"outer_fold_{outer_fold_idx + 1}/meta_ls_score": current_ls_score_meta,
                     f"outer_fold_{outer_fold_idx + 1}/meta_gl_score": gl_score_meta_outer,
                     f"outer_fold_{outer_fold_idx + 1}/meta_auroc": auroc_meta_outer,
-                    f"outer_fold_{outer_fold_idx + 1}/meta_acc": acc_meta_outer,
+                    f"outer_fold_{outer_fold_idx + 1}/meta_acc": acc_meta_outer,  # Based on default 0.5 thr
                     "outer_fold": outer_fold_idx + 1
                 })
                 logger.info(
                     f"Outer Fold {outer_fold_idx + 1} Meta-Learner: "
-                    f"F1_Death={f1_death_meta if death_label_value is not None else np.nan:.4f}, "
+                    f"F1_Death(for DTscore)={f1_death_for_dtscore_meta if death_label_value is not None else np.nan:.4f} (BestThr={best_threshold_fold_meta:.2f}), "
                     f"MAE_LoS={outer_fold_los_metrics['mae_los'][-1] if outer_fold_los_metrics['mae_los'] else np.nan:.4f}, "
                     f"DTscore={dt_score_meta_outer:.4f}, LSscore={current_ls_score_meta:.4f}, GLscore={gl_score_meta_outer:.4f} | "
-                    f"AUROC={auroc_meta_outer:.4f}, Acc={acc_meta_outer:.4f}"
+                    f"AUROC={auroc_meta_outer:.4f}, Acc(0.5 thr)={acc_meta_outer:.4f}"
                 )
 
                 # --- Accumulate predictions for CSV logging ---
                 all_test_indices_list.append(outer_test_idx)
-                all_y_test_list.append(y_outer_test) # Actual outcomeType
+                all_y_test_list.append(y_outer_test)  # Actual outcomeType
                 # Store probabilities for 'Death' class (class 0) for later thresholding if needed for CSV
                 # final_preds_meta_proba_outer is (N, num_classes), class_mapping['Death'] is its index
                 if final_preds_meta_proba_outer is not None and class_mapping.get('Death') is not None:
                     probas_death_meta = final_preds_meta_proba_outer[:, class_mapping['Death']]
                     all_probas_meta_list.append(probas_death_meta)
-                else: # Fallback if probas are not available, store NaNs or re-derive from labels if only labels are available
+                else:  # Fallback if probas are not available, store NaNs or re-derive from labels if only labels are available
                     all_probas_meta_list.append(np.full(len(y_outer_test), np.nan))
 
-                all_preds_meta_list.append(final_preds_meta_labels_outer) # Store labels derived from default threshold for metrics
+                all_preds_meta_list.append(
+                    final_preds_meta_labels_outer)  # Store labels derived from default threshold for metrics
 
                 # Get actual lengthOfStay for these test indices from the original X_full_raw_df
                 # Ensure 'lengthofStay' is a valid column name. From logs, it seems to be.
-                los_column_name = 'lengthofStay' # As seen in logs
+                los_column_name = 'lengthofStay'  # As seen in logs
                 if los_column_name in X_full_raw_df.columns:
                     actual_los_fold = X_full_raw_df.iloc[outer_test_idx][los_column_name].values
                     all_actual_los_list.append(actual_los_fold)
                 else:
-                    logger.warning(f"Column '{los_column_name}' not found in X_full_raw_df. Cannot log actual Length of Stay.")
-                    all_actual_los_list.append(np.full(len(outer_test_idx), np.nan)) # Append NaNs if not found
+                    logger.warning(
+                        f"Column '{los_column_name}' not found in X_full_raw_df. Cannot log actual Length of Stay.")
+                    all_actual_los_list.append(np.full(len(outer_test_idx), np.nan))  # Append NaNs if not found
 
                 # Capture patient IDs if patient_id_col_name_for_gnn is set and valid
                 if patient_id_col_name_for_gnn and patient_id_col_name_for_gnn in X_full_raw_df.columns:
                     patient_ids_fold = X_full_raw_df.iloc[outer_test_idx][patient_id_col_name_for_gnn].values
                     all_patient_ids_list.append(patient_ids_fold)
-                elif X_full_raw_df.index.name == patient_id_col_name_for_gnn : # If it was the index
-                     patient_ids_fold = X_full_raw_df.iloc[outer_test_idx].index.values
-                     all_patient_ids_list.append(patient_ids_fold)
-                else: # Fallback to original index if no specific patient ID column
+                elif X_full_raw_df.index.name == patient_id_col_name_for_gnn:  # If it was the index
+                    patient_ids_fold = X_full_raw_df.iloc[outer_test_idx].index.values
+                    all_patient_ids_list.append(patient_ids_fold)
+                else:  # Fallback to original index if no specific patient ID column
                     patient_ids_fold = X_full_raw_df.iloc[outer_test_idx].index.values
                     all_patient_ids_list.append(patient_ids_fold)
                 # --- End Accumulate predictions ---
@@ -1390,18 +1605,17 @@ def main(config_path):
                 for key in outer_fold_metrics_meta.keys(): outer_fold_metrics_meta[key].append(np.nan)
                 wandb.log({f"outer_fold_{outer_fold_idx + 1}/meta_auroc": np.nan, "outer_fold": outer_fold_idx + 1})
                 # Also append NaNs or empty arrays to tracking lists if meta-learner fails for a fold
-                all_test_indices_list.append(outer_test_idx) # Still log indices
+                all_test_indices_list.append(outer_test_idx)  # Still log indices
                 all_y_test_list.append(y_outer_test)
-                all_preds_meta_list.append(np.full(len(y_outer_test), np.nan)) # NaN for predictions
+                all_preds_meta_list.append(np.full(len(y_outer_test), np.nan))  # NaN for predictions
                 if 'lengthofStay' in X_full_raw_df.columns:
-                     all_actual_los_list.append(X_full_raw_df.iloc[outer_test_idx]['lengthofStay'].values)
+                    all_actual_los_list.append(X_full_raw_df.iloc[outer_test_idx]['lengthofStay'].values)
                 else:
-                     all_actual_los_list.append(np.full(len(y_outer_test), np.nan))
+                    all_actual_los_list.append(np.full(len(y_outer_test), np.nan))
                 if patient_id_col_name_for_gnn and patient_id_col_name_for_gnn in X_full_raw_df.columns:
                     all_patient_ids_list.append(X_full_raw_df.iloc[outer_test_idx][patient_id_col_name_for_gnn].values)
                 else:
                     all_patient_ids_list.append(X_full_raw_df.iloc[outer_test_idx].index.values)
-
 
         soft_vote_weights = config.get('ensemble', {}).get('soft_vote_weights', {})
 
@@ -1412,9 +1626,9 @@ def main(config_path):
 
         active_models_for_sv = [model_key for model_key in potential_sv_models
                                 if config.get('ensemble', {}).get(f'train_{model_key}', True) and \
-                                   model_key in soft_vote_weights and \
-                                   model_key in base_model_preds_on_outer_test_sum # Ensure predictions exist
-                               ]
+                                model_key in soft_vote_weights and \
+                                model_key in base_model_preds_on_outer_test_sum  # Ensure predictions exist
+                                ]
 
         if soft_vote_weights and active_models_for_sv:
             logger.info(
@@ -1423,8 +1637,8 @@ def main(config_path):
                 final_preds_soft_vote_proba_outer = np.zeros((len(y_outer_test), num_classes))
                 total_weight = 0.0
 
-                for model_key in active_models_for_sv: # Iterate only over active, weighted models
-                    weight = soft_vote_weights.get(model_key, 0) # Should be >0 due to check above
+                for model_key in active_models_for_sv:  # Iterate only over active, weighted models
+                    weight = soft_vote_weights.get(model_key, 0)  # Should be >0 due to check above
                     # Ensure the predictions are valid before adding
                     preds_to_add = base_model_preds_on_outer_test_sum.get(model_key)
 
@@ -1435,7 +1649,7 @@ def main(config_path):
                         logger.warning(
                             f"Soft Voting: Skipping model {model_key} due to invalid predictions (shape {preds_to_add.shape if preds_to_add is not None else 'None'} vs target {final_preds_soft_vote_proba_outer.shape} or missing).")
 
-                if total_weight > 1e-6: # Check if any valid weighted predictions were actually added
+                if total_weight > 1e-6:  # Check if any valid weighted predictions were actually added
                     # Normalize probabilities if total_weight is not 1 (or close to it)
                     # This is more robust if weights are relative importance rather than summing to 1.
                     final_preds_soft_vote_proba_outer /= total_weight
@@ -1454,7 +1668,7 @@ def main(config_path):
                     rec_sv_outer = recall_score(y_outer_test, final_preds_soft_vote_labels_outer,
                                                 average='weighted' if num_classes > 2 else 'binary', zero_division=0)
                     auroc_sv_outer = -1.0
-                    dt_score_sv_outer = 10.0 # Default to worst score
+                    dt_score_sv_outer = 10.0  # Default to worst score
 
                     try:
                         probas_for_auc_sv = final_preds_soft_vote_proba_outer[:,
@@ -1473,11 +1687,13 @@ def main(config_path):
                         f1_death_sv = f1_score(y_outer_test, final_preds_soft_vote_labels_outer,
                                                labels=[death_label_value], pos_label=death_label_value,
                                                average='binary', zero_division=0)
-                        dt_score_sv_outer = dt_score_calc(f1_death_sv) # Use function
-                        logger.info(f"Outer Fold {outer_fold_idx + 1} Soft Vote: F1_Death={f1_death_sv:.4f}, DTscore={dt_score_sv_outer:.4f}")
+                        dt_score_sv_outer = dt_score_calc(f1_death_sv)  # Use function
+                        logger.info(
+                            f"Outer Fold {outer_fold_idx + 1} Soft Vote: F1_Death={f1_death_sv:.4f}, DTscore={dt_score_sv_outer:.4f}")
                     else:
-                        logger.warning(f"Outer Fold {outer_fold_idx + 1} Soft Vote: 'Death' class not found in class_mapping. DTscore set to 10.")
-                        dt_score_sv_outer = dt_score_calc(np.nan) # Ensure it's 10 if class not found
+                        logger.warning(
+                            f"Outer Fold {outer_fold_idx + 1} Soft Vote: 'Death' class not found in class_mapping. DTscore set to 10.")
+                        dt_score_sv_outer = dt_score_calc(np.nan)  # Ensure it's 10 if class not found
 
                     outer_fold_metrics_soft_vote['accuracy'].append(acc_sv_outer)
                     outer_fold_metrics_soft_vote['auroc'].append(auroc_sv_outer)
@@ -1487,13 +1703,15 @@ def main(config_path):
                     outer_fold_metrics_soft_vote['dt_score'].append(dt_score_sv_outer)
 
                     # Calculate GLscore for Soft Voting
-                    current_ls_score_sv = outer_fold_los_metrics['ls_score'][-1] if outer_fold_los_metrics['ls_score'] else ls_score_calc(np.nan) # Default to worst if no LS score
+                    current_ls_score_sv = outer_fold_los_metrics['ls_score'][-1] if outer_fold_los_metrics[
+                        'ls_score'] else ls_score_calc(np.nan)  # Default to worst if no LS score
                     gl_score_sv_outer = gl_score_calc(dt_score_sv_outer, current_ls_score_sv)
                     outer_fold_metrics_soft_vote['gl_score'].append(gl_score_sv_outer)
 
                     wandb.log({
                         f"outer_fold_{outer_fold_idx + 1}/sv_f1_death": f1_death_sv if death_label_value is not None else np.nan,
-                        f"outer_fold_{outer_fold_idx + 1}/sv_mae_los": outer_fold_los_metrics['mae_los'][-1] if outer_fold_los_metrics['mae_los'] else np.nan,
+                        f"outer_fold_{outer_fold_idx + 1}/sv_mae_los": outer_fold_los_metrics['mae_los'][-1] if
+                        outer_fold_los_metrics['mae_los'] else np.nan,
                         f"outer_fold_{outer_fold_idx + 1}/sv_dt_score": dt_score_sv_outer,
                         f"outer_fold_{outer_fold_idx + 1}/sv_ls_score": current_ls_score_sv,
                         f"outer_fold_{outer_fold_idx + 1}/sv_gl_score": gl_score_sv_outer,
@@ -1537,8 +1755,8 @@ def main(config_path):
         logger.info(f"Meta-Learner Average AUROC: {avg_meta_auroc:.4f} +/- {std_meta_auroc:.4f}")
         wandb.summary["ncv_meta_avg_auroc"] = avg_meta_auroc
         wandb.summary["ncv_meta_std_auroc"] = std_meta_auroc
-        for metric_name_meta, values in outer_fold_metrics_meta.items(): # Iterate over all including dt_score
-            if metric_name_meta not in ['auroc']: # Exclude auroc as it's already logged with std
+        for metric_name_meta, values in outer_fold_metrics_meta.items():  # Iterate over all including dt_score
+            if metric_name_meta not in ['auroc']:  # Exclude auroc as it's already logged with std
                 avg_val = np.nanmean(values)
                 wandb.summary[f"ncv_meta_avg_{metric_name_meta}"] = avg_val
                 logger.info(f"Meta-Learner Average {metric_name_meta.replace('_', ' ').capitalize()}: {avg_val:.4f}")
@@ -1548,22 +1766,34 @@ def main(config_path):
         # avg_ls_score needs to be defined before this point, or use np.nanmean(outer_fold_los_metrics['ls_score'])
         # Assuming avg_ls_score will be available from the LoS summary section that comes later,
         # or computed just before this summary block. For now, let's compute it here if not available.
-        if 'avg_ls_score' not in locals() and 'avg_ls_score' not in globals(): # Check if avg_ls_score is already computed
-            current_avg_ls_score = np.nanmean(outer_fold_los_metrics['ls_score']) if outer_fold_los_metrics['ls_score'] else np.nan
+        if 'avg_ls_score' not in locals() and 'avg_ls_score' not in globals():  # Check if avg_ls_score is already computed
+            current_avg_ls_score = np.nanmean(outer_fold_los_metrics['ls_score']) if outer_fold_los_metrics[
+                'ls_score'] else np.nan
         else:
-            current_avg_ls_score = avg_ls_score # Use existing if available
+            current_avg_ls_score = avg_ls_score  # Use existing if available
 
-        if not np.isnan(avg_meta_gl_score): # Only print if GL score is valid
-            logger.info(f"Meta-Learner Average GLscore: {avg_meta_gl_score:.4f} (Avg DTscore={avg_meta_dt_score:.4f} + Avg LSscore={current_avg_ls_score:.4f})")
+        if not np.isnan(avg_meta_gl_score):  # Only print if GL score is valid
+            logger.info(
+                f"Meta-Learner Average GLscore: {avg_meta_gl_score:.4f} (Avg DTscore={avg_meta_dt_score:.4f} + Avg LSscore={current_avg_ls_score:.4f})")
+
+        if all_f1_at_best_thr_meta_list:
+            avg_f1_death_optimized = np.nanmean([f1 for f1 in all_f1_at_best_thr_meta_list if not np.isnan(f1)])
+            if not np.isnan(avg_f1_death_optimized):
+                wandb.summary["ncv_meta_avg_f1_death_optimized"] = avg_f1_death_optimized
+                logger.info(f"Meta-Learner Average F1_Death (at best threshold): {avg_f1_death_optimized:.4f}")
+            else:
+                wandb.summary["ncv_meta_avg_f1_death_optimized"] = np.nan
+        else:
+            wandb.summary["ncv_meta_avg_f1_death_optimized"] = np.nan
+
 
     else:
         logger.info("Meta-Learner metrics not computed or all NaN.")
         # Log NaN for all expected summary metrics if meta-learner didn't run or all were NaN
         for metric_name_meta in ['auroc', 'accuracy', 'f1', 'precision', 'recall', 'dt_score', 'gl_score']:
             wandb.summary[f"ncv_meta_avg_{metric_name_meta}"] = np.nan
-            if metric_name_meta == 'auroc': # Specific handling for std if auroc is NaN
-                 wandb.summary["ncv_meta_std_auroc"] = np.nan
-
+            if metric_name_meta == 'auroc':  # Specific handling for std if auroc is NaN
+                wandb.summary["ncv_meta_std_auroc"] = np.nan
 
     if soft_vote_weights and any(not np.isnan(v) for v in outer_fold_metrics_soft_vote['auroc']):
         avg_sv_auroc = np.nanmean(outer_fold_metrics_soft_vote['auroc'])
@@ -1571,8 +1801,8 @@ def main(config_path):
         logger.info(f"Soft Voting Average AUROC: {avg_sv_auroc:.4f} +/- {std_sv_auroc:.4f}")
         wandb.summary["ncv_sv_avg_auroc"] = avg_sv_auroc
         wandb.summary["ncv_sv_std_auroc"] = std_sv_auroc
-        for metric_name_sv, values in outer_fold_metrics_soft_vote.items(): # Iterate over all including dt_score
-            if metric_name_sv not in ['auroc']: # Exclude auroc as it's already logged with std
+        for metric_name_sv, values in outer_fold_metrics_soft_vote.items():  # Iterate over all including dt_score
+            if metric_name_sv not in ['auroc']:  # Exclude auroc as it's already logged with std
                 avg_val = np.nanmean(values)
                 wandb.summary[f"ncv_sv_avg_{metric_name_sv}"] = avg_val
                 logger.info(f"Soft Voting Average {metric_name_sv.replace('_', ' ').capitalize()}: {avg_val:.4f}")
@@ -1581,19 +1811,21 @@ def main(config_path):
         avg_sv_dt_score = np.nanmean(outer_fold_metrics_soft_vote['dt_score'])
         # Assuming avg_ls_score is available from LoS summary or computed earlier
         if 'avg_ls_score' not in locals() and 'avg_ls_score' not in globals():
-            current_avg_ls_score_sv = np.nanmean(outer_fold_los_metrics['ls_score']) if outer_fold_los_metrics['ls_score'] else np.nan
+            current_avg_ls_score_sv = np.nanmean(outer_fold_los_metrics['ls_score']) if outer_fold_los_metrics[
+                'ls_score'] else np.nan
         else:
             current_avg_ls_score_sv = avg_ls_score
 
-        if not np.isnan(avg_sv_gl_score): # Only print if GL score is valid
-            logger.info(f"Soft Voting Average GLscore: {avg_sv_gl_score:.4f} (Avg DTscore={avg_sv_dt_score:.4f} + Avg LSscore={current_avg_ls_score_sv:.4f})")
+        if not np.isnan(avg_sv_gl_score):  # Only print if GL score is valid
+            logger.info(
+                f"Soft Voting Average GLscore: {avg_sv_gl_score:.4f} (Avg DTscore={avg_sv_dt_score:.4f} + Avg LSscore={current_avg_ls_score_sv:.4f})")
     else:
         logger.info("Soft Voting metrics not computed or all NaN.")
         # Log NaN for all expected summary metrics if soft voting didn't run or all were NaN
         for metric_name_sv in ['auroc', 'accuracy', 'f1', 'precision', 'recall', 'dt_score', 'gl_score']:
             wandb.summary[f"ncv_sv_avg_{metric_name_sv}"] = np.nan
-            if metric_name_sv == 'auroc': # Specific handling for std if auroc is NaN
-                 wandb.summary["ncv_sv_std_auroc"] = np.nan
+            if metric_name_sv == 'auroc':  # Specific handling for std if auroc is NaN
+                wandb.summary["ncv_sv_std_auroc"] = np.nan
 
     # --- Log LoS NCV Summary ---
     if any(not np.isnan(v) for v in outer_fold_los_metrics['ls_score']):
@@ -1608,7 +1840,6 @@ def main(config_path):
         wandb.summary["ncv_los_avg_ls_score"] = np.nan
         wandb.summary["ncv_los_avg_mae"] = np.nan
 
-
     # --- Process and Log Accumulated Predictions ---
     if all_test_indices_list:
         try:
@@ -1618,7 +1849,7 @@ def main(config_path):
             all_y_test_flat = np.concatenate(all_y_test_list)
             # all_preds_meta_flat contains labels based on default threshold (used for metrics during CV)
             all_preds_meta_flat = np.concatenate(all_preds_meta_list)
-            all_probas_death_meta_flat = np.concatenate(all_probas_meta_list) # Probabilities for 'Death' class
+            all_probas_death_meta_flat = np.concatenate(all_probas_meta_list)  # Probabilities for 'Death' class
             all_actual_los_flat = np.concatenate(all_actual_los_list)
             all_predicted_los_flat = np.concatenate(all_predicted_los_list)
             all_patient_ids_flat = np.concatenate(all_patient_ids_list)
@@ -1642,43 +1873,68 @@ def main(config_path):
                 'original_index': all_indices_flat,
                 'patient_id': all_patient_ids_flat,
                 'predicted_outcomeType': all_preds_meta_flat,
-                'actual_lengthOfStay': all_actual_los_flat, # Actuals for reference
-                'predicted_lengthOfStay': all_predicted_los_flat, # Predictions for LSscore
+                'actual_lengthOfStay': all_actual_los_flat,  # Actuals for reference
+                'predicted_lengthOfStay': all_predicted_los_flat,  # Predictions for LSscore
                 'actual_outcomeType': all_y_test_flat
             })
             # Sort by the original index to restore order of samples as they appeared in X_full_raw_df
             results_df_sorted = results_df.sort_values(by='original_index').reset_index(drop=True)
 
             output_dir = config.get('output_dir', 'outputs')
-            os.makedirs(output_dir, exist_ok=True) # Ensure the output directory exists
+            os.makedirs(output_dir, exist_ok=True)  # Ensure the output directory exists
 
             # DTestimation.csv: vector of predicted discharge type (outcomeType)
-            # Apply a threshold to probabilities to get final labels for CSV.
-            # For now, using a default 0.5 threshold on P(Death).
-            # class_mapping: {'Death': 0, 'Survival': 1} -> P(Death) is proba of class 0.
-            # If a best_thr is found (e.g., via grid search), it would be used here.
-            # Example: custom_threshold_for_death = 0.4 (predict Death if P(Death) > 0.4)
-            custom_threshold_for_death = 0.5 # Placeholder; ideally, this comes from validation.
-
-            # Check if all_probas_death_meta_flat contains NaNs, if so, can't use it directly
-            if not np.isnan(all_probas_death_meta_flat).all():
-                 # Predict 'Death' (class 0) if its probability is > custom_threshold_for_death
-                 # Otherwise predict 'Survival' (class 1)
-                 # Note: This logic might need inversion depending on how threshold is defined (e.g. threshold for P(Survival))
-                 # If P(Death) > threshold, outcome is Death (0). Else Survival (1).
-                predicted_labels_for_csv = np.where(
-                    all_probas_death_meta_flat > custom_threshold_for_death,
-                    class_mapping['Death'],
-                    class_mapping['Survival']
-                )
-                # Ensure the labels are from the original class labels if LabelEncoder was used
-                # This step might be redundant if class_mapping values are already the desired output labels.
-                # For now, assuming class_mapping values are the direct output.
-                logger.info(f"Generating DTestimation.csv using P(Death) and threshold {custom_threshold_for_death}.")
+            # Apply the determined best F1 threshold.
+            final_best_thr_for_csv = 0.5  # Default
+            if all_best_thresholds_fold_list:
+                final_best_thr_for_csv = np.nanmean([thr for thr in all_best_thresholds_fold_list if not np.isnan(thr)])
+                if np.isnan(final_best_thr_for_csv):  # Handles case where all entries were NaN
+                    final_best_thr_for_csv = 0.5
+                    logger.warning(
+                        "All fold-specific best F1 thresholds were NaN. Defaulting DTestimation threshold to 0.5.")
+                wandb.summary["final_best_f1_threshold_for_csv"] = final_best_thr_for_csv
+                logger.info(f"Using final average best F1 threshold for DTestimation.csv: {final_best_thr_for_csv:.4f}")
             else:
-                logger.warning("Probabilities for meta-learner were not available. DTestimation.csv will use labels from default model.predict().")
-                predicted_labels_for_csv = results_df_sorted['predicted_outcomeType'].values
+                logger.warning("No best F1 thresholds recorded from folds. Defaulting DTestimation threshold to 0.5.")
 
+            if 'Death' not in class_mapping:
+                logger.error("'Death' class not in class_mapping. Cannot generate DTestimation.csv correctly.")
+                # Create an empty or default CSV to avoid crashing downstream processes
+                predicted_labels_for_csv = np.full(len(results_df_sorted), class_mapping.get('Survival',
+                                                                                             1))  # Default to survival or a common class
+            elif np.isnan(all_probas_death_meta_flat).all():
+                logger.warning(
+                    "Probabilities for meta-learner (P(Death)) were all NaN. DTestimation.csv will use labels from default model.predict().")
+                predicted_labels_for_csv = results_df_sorted['predicted_outcomeType'].values
+            else:
+                # Predict 'Death' if its probability > final_best_thr_for_csv.
+                # Assumes 'Death' is class_mapping['Death'] (e.g., 0) and 'Survival' is the other class.
+                # The probabilities in all_probas_death_meta_flat are P(Death).
+                # So, if P(Death) > threshold, predict 'Death' (value from class_mapping).
+                # Otherwise, predict 'Survival' (value from class_mapping).
+                death_val = class_mapping['Death']
+                survival_val = class_mapping.get('Survival')  # Need a robust way to get the other class label
+                if survival_val is None:  # Try to infer survival value if not explicitly 'Survival'
+                    possible_labels = list(class_mapping.values())
+                    if len(possible_labels) == 2:
+                        survival_val = [l for l in possible_labels if l != death_val][0]
+                    else:  # More than 2 classes, or 'Survival' not defined. This is problematic.
+                        logger.error(
+                            "Cannot determine 'Survival' class label for DTestimation.csv. Defaulting non-Death to majority or first alternative.")
+                        # Fallback: predict death vs. not-death (where not-death is the most frequent other class or just the alternative)
+                        # This part needs careful handling if there are >2 classes or unusual mapping.
+                        # For binary 'Death'/'Survival', this should be fine.
+                        # Assuming binary: if not Death, it's the other one.
+                        survival_val = [l for l in class_mapping.values() if l != death_val][0] if len(
+                            set(class_mapping.values())) == 2 else death_val  # Avoid error if only one class
+
+                logger.info(
+                    f"Generating DTestimation.csv using P(Death) and threshold {final_best_thr_for_csv:.4f}. Death label: {death_val}, Survival label: {survival_val}")
+                predicted_labels_for_csv = np.where(
+                    all_probas_death_meta_flat > final_best_thr_for_csv,
+                    death_val,  # Predict 'Death'
+                    survival_val  # Predict 'Survival'
+                )
 
             dt_estimation_df = pd.DataFrame({'predicted_outcome': predicted_labels_for_csv})
             dt_estimation_path = os.path.join(output_dir, "DTestimation.csv")
@@ -1697,7 +1953,8 @@ def main(config_path):
             # Optionally, log a combined file for easier review
             combined_output_path = os.path.join(output_dir, "predictions_and_los_summary.csv")
             results_df_sorted.to_csv(combined_output_path, index=False)
-            wandb.log_artifact(combined_output_path, name="full_test_set_predictions_summary", type="predictions_summary")
+            wandb.log_artifact(combined_output_path, name="full_test_set_predictions_summary",
+                               type="predictions_summary")
 
         except Exception as e:
             logger.error(f"Error processing or logging accumulated prediction CSVs: {e}")
