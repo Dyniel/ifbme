@@ -1,6 +1,7 @@
 import pandas as pd
 import os
 import logging
+import time # Added for timing
 
 logger = logging.getLogger(__name__)
 
@@ -24,50 +25,46 @@ def load_raw_data(config, base_data_path="data/"):
                This conceptual version will try to load train and val and combine them.
     """
     logger.info("Attempting to load raw data...")
+    overall_start_time = time.time()
 
     train_file = config.get('data_paths', {}).get('train', 'trainData.csv')
     val_file = config.get('data_paths', {}).get('val', 'valData.csv')
-    # test_file = config.get('data_paths', {}).get('test', 'testData.csv') # For final evaluation
 
     train_path = os.path.join(base_data_path, train_file)
     val_path = os.path.join(base_data_path, val_file)
 
+    t0 = time.time()
     try:
         df_train = pd.read_csv(train_path)
-        logger.info(f"Loaded training data from {train_path}, shape: {df_train.shape}")
+        logger.info(f"Loaded training data from {train_path}, shape: {df_train.shape}. Time: {time.time() - t0:.2f}s")
     except FileNotFoundError:
         logger.error(f"Training data file not found at {train_path}. Please check config and data directory.")
-        # Depending on requirements, could raise error or return None/empty DataFrame
         raise
     except Exception as e:
         logger.error(f"Error loading training data from {train_path}: {e}")
         raise
 
+    t0 = time.time()
     try:
         df_val = pd.read_csv(val_path)
-        logger.info(f"Loaded validation data from {val_path}, shape: {df_val.shape}")
+        logger.info(f"Loaded validation data from {val_path}, shape: {df_val.shape}. Time: {time.time() - t0:.2f}s")
     except FileNotFoundError:
         logger.warning(f"Validation data file not found at {val_path}. Proceeding with training data only for 'full_data' if applicable.")
-        # If val is not found, full_data will just be train_data.
-        # This might be acceptable for some use cases, or an error could be raised.
-        df_val = pd.DataFrame() # Empty dataframe
+        df_val = pd.DataFrame()
     except Exception as e:
         logger.error(f"Error loading validation data from {val_path}: {e}")
         df_val = pd.DataFrame()
 
-
-    # Combine train and val for NCV's "full" dataset
-    # Assuming target column is named 'target' - this should be configurable
+    t0 = time.time()
     target_column = config.get('data_paths', {}).get('target_column', 'target')
 
     if not df_val.empty:
         df_full = pd.concat([df_train, df_val], ignore_index=True)
-        logger.info(f"Combined training and validation data. Full data shape: {df_full.shape}")
+        logger.info(f"Combined training and validation data. Full data shape: {df_full.shape}. Time: {time.time() - t0:.2f}s")
     else:
         df_full = df_train
-        logger.info("Using only training data as full data (validation data not loaded/found).")
+        logger.info(f"Using only training data as full data (validation data not loaded/found). Time: {time.time() - t0:.2f}s")
 
-    # ---- DEBUG PRINT ----
     logger.info(f"Available columns in the loaded DataFrame (df_full): {df_full.columns.tolist()}")
     # ---- END DEBUG PRINT ----
 
@@ -81,27 +78,31 @@ def load_raw_data(config, base_data_path="data/"):
 
     # --- Date Column Conversion ---
     # Identify potential date columns and convert them to numerical (e.g., Unix timestamp)
-    # Add more columns if other date-like columns exist
     date_columns_to_convert = ['requestDate', 'admissionDate']
+    date_conversion_start_time = time.time()
+    logger.info("Starting date column conversions...")
     for col_name in date_columns_to_convert:
         if col_name in X_full.columns:
+            t_col_start = time.time()
             try:
-                # Convert to datetime, then to Unix timestamp (seconds since epoch)
-                # Errors='coerce' will turn unparseable dates into NaT (Not a Time), which then become NaN
+                logger.info(f"Attempting conversion of column '{col_name}'...")
+                # Try to infer format for potentially faster parsing if consistent
+                # Otherwise, pandas will try to infer, which can be slow.
+                # Example: X_full[col_name] = pd.to_datetime(X_full[col_name], format='%d/%m/%Y', errors='coerce')
+                # For this dataset, dates seem to be in multiple formats (e.g. YYYY-MM-DD and DD/MM/YYYY)
+                # So, direct format specification might lead to more NaTs if not careful.
+                # Letting pandas infer, but logging time.
                 X_full[col_name] = pd.to_datetime(X_full[col_name], errors='coerce')
-                # Fill NaT/NaN with a specific value if desired, or let imputation handle it later.
-                # For timestamp, a common fill might be 0 or median/mean of other timestamps.
-                # Here, we convert to Unix timestamp (float). NaT will become NaN.
                 X_full[col_name] = (X_full[col_name] - pd.Timestamp("1970-01-01")) // pd.Timedelta('1s')
-                # Alternative: X_full[col_name] = X_full[col_name].astype(np.int64) // 10**9 # if using .values.astype(np.int64)
-                logger.info(f"Converted column '{col_name}' to Unix timestamp.")
+                logger.info(f"Converted column '{col_name}' to Unix timestamp. Time: {time.time() - t_col_start:.2f}s")
             except Exception as e:
-                logger.warning(f"Could not convert date column '{col_name}' to numeric: {e}. It might remain as object type or cause errors downstream if not handled.")
+                logger.warning(f"Could not convert date column '{col_name}' to numeric: {e}. Time: {time.time() - t_col_start:.2f}s. It might remain as object type.")
         else:
             logger.warning(f"Date column '{col_name}' specified for conversion not found in X_full.")
+    logger.info(f"Finished date column conversions. Total time: {time.time() - date_conversion_start_time:.2f}s")
     # --- End Date Column Conversion ---
 
-    logger.info(f"Data loading complete. X_full shape: {X_full.shape}, y_full shape: {y_full.shape}")
+    logger.info(f"Data loading and initial date conversion complete. X_full shape: {X_full.shape}, y_full shape: {y_full.shape}. Total time: {time.time() - overall_start_time:.2f}s")
     return X_full, y_full # Return DataFrames
 
 # Example usage (conceptual, would be in train.py)

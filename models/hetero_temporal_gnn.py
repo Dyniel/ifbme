@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import HeteroConv, GATConv, Linear
+from torch_geometric.data import HeteroData # <<< ADDED IMPORT
 # For TGN-like components, if we go that route:
 # from torch_geometric.nn.models.tgn import TGNMemory, LastNeighborLoader # Or similar temporal components
 
