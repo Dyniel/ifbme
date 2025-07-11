@@ -185,7 +185,13 @@ def main(config_path):
     if not train_gnn:
         logger.info("GNN training is disabled for this run.")
 
-    # --- Preprocessing Setup (for tabular models like LGBM, TECO) ---
+import time # Added for timing (should be at the top, but ensuring it's present)
+
+# ... (other imports)
+
+# --- Preprocessing Setup (for tabular models like LGBM, TECO) ---
+    logger.info("Starting preprocessing setup...")
+    preproc_setup_start_time = time.time()
 
     preproc_cfg = config.get('preprocessing', {})
     numerical_cols_from_config = preproc_cfg.get('numerical_cols', [])

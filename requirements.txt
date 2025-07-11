@@ -2,7 +2,7 @@
 pandas
 numpy
 scikit-learn
-torch
+torch --index-url https://download.pytorch.org/whl/cpu
 transformers
 xgboost
 lightgbm
