@@ -149,5 +149,38 @@ wandb:
   run_notes: 'NCV run with GNN enabled, LightGBM params tuned, meta-learner rounds increased, TECO params adjusted.'
   tags: ['accuracy_push', 'gnn_enabled', 'lgbm_tuned', 'ncv']
 
+# --- Text Embedding Generation (Optional) ---
+text_embedding_params:
+  enabled: false # Set to true to enable this feature
+  text_column: "text_notes" # Name of the column containing clinical notes
+  model_name: "emilyalsentzer/Bio_ClinicalBERT" # Or other Hugging Face model
+  pooling_strategy: "cls" # "cls" or "mean"
+  max_length: 512 # Max token length for BERT
+  batch_size: 16 # Batch size for embedding generation (adjust based on VRAM)
+
+# --- Ontology Embedding Generation (Optional) ---
+ontology_embedding_params:
+  enabled: false # Set to true to enable this feature
+  # Path to pre-trained embeddings. If null, will train from scratch.
+  pretrained_path: null # "path/to/your/ontology_embeddings.npz"
+  # Path to save newly trained embeddings.
+  save_path: "outputs/trained_ontology_embeddings.npz"
+  # List of columns in the dataframe that contain codes to be embedded.
+  # For each column, an embedding will be generated.
+  code_columns: ["icdCode"] # Example: ["icdCode", "rxNormCode"]
+  # Node2Vec training parameters (used if pretrained_path is null)
+  node2vec_params:
+    dimensions: 64
+    walk_length: 30
+    num_walks: 200
+    p: 1
+    q: 1
+    window: 10
+    min_count: 1
+    batch_words: 4
+  # Ontology data (currently uses dummy data in the script if this is null)
+  ontology_data: null
+
+
 # --- Output Directory ---
 output_dir: "outputs"

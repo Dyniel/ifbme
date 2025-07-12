@@ -109,6 +109,21 @@ def main(config_path):
         X_full_raw_df = pd.DataFrame(np.random.rand(num_total_samples, num_features),
                                      columns=[f'feature_{i}' for i in range(num_features)])
         y_full_raw_series = pd.Series(np.random.choice(num_classes_config, num_total_samples, p=p_combined))
+
+        # Add dummy text column if text embeddings are enabled in config
+        text_embed_cfg_dummy = config.get('text_embedding_params', {})
+        if text_embed_cfg_dummy.get('enabled', False):
+            dummy_text_col_name = text_embed_cfg_dummy.get('text_column', 'text_notes')
+            dummy_texts = [
+                "Patient presents with fever and cough.",
+                "History of hypertension and diabetes.",
+                "No acute distress, vitals stable.",
+                "Chest x-ray shows bilateral infiltrates, consider pneumonia.",
+                "Plan for discharge tomorrow morning."
+            ]
+            X_full_raw_df[dummy_text_col_name] = np.random.choice(dummy_texts, num_total_samples)
+            logger.info(f"Added dummy text column '{dummy_text_col_name}' to dummy data.")
+
         logger.info(
             f"Dummy raw data generated: X_df shape {X_full_raw_df.shape}, y_series shape {y_full_raw_series.shape}")
     else:
@@ -193,6 +208,116 @@ def main(config_path):
         logger.info("GNN training is disabled for this run.")
 
     # ... (other imports)
+
+    # --- Text Embedding Generation (Optional) ---
+    text_embed_config = config.get('text_embedding_params', {})
+    if text_embed_config.get('enabled', False):
+        logger.info("Text embedding generation is ENABLED.")
+        try:
+            from features.text_embeddings import get_clinical_bert_model_and_tokenizer, get_text_embeddings
+            text_col_name = text_embed_config.get('text_column')
+            if text_col_name and text_col_name in X_full_raw_df.columns:
+                logger.info(f"Processing text embeddings for column: '{text_col_name}'")
+
+                text_data = X_full_raw_df[text_col_name].fillna("").tolist() # Ensure no NaNs
+
+                model_name = text_embed_config.get('model_name', 'emilyalsentzer/Bio_ClinicalBERT')
+                tokenizer, model = get_clinical_bert_model_and_tokenizer(model_name, device=device)
+
+                embeddings = get_text_embeddings(
+                    texts=text_data,
+                    tokenizer=tokenizer,
+                    model=model,
+                    strategy=text_embed_config.get('pooling_strategy', 'cls'),
+                    max_length=text_embed_config.get('max_length', 512),
+                    batch_size=text_embed_config.get('batch_size', 32),
+                    device=device
+                )
+
+                if embeddings is not None and embeddings.shape[0] == len(X_full_raw_df):
+                    embedding_feature_names = [f'text_emb_{i}' for i in range(embeddings.shape[1])]
+                    embeddings_df = pd.DataFrame(embeddings, columns=embedding_feature_names, index=X_full_raw_df.index)
+
+                    X_full_raw_df = pd.concat([X_full_raw_df.drop(columns=[text_col_name]), embeddings_df], axis=1)
+                    logger.info(f"Successfully added {len(embedding_feature_names)} text embedding features.")
+
+                    # Automatically add new embedding features to numerical_cols in config if not already there
+                    if 'preprocessing' not in config: config['preprocessing'] = {}
+                    if 'numerical_cols' not in config['preprocessing']: config['preprocessing']['numerical_cols'] = []
+
+                    existing_num_cols = set(config['preprocessing']['numerical_cols'])
+                    for emb_col in embedding_feature_names:
+                        if emb_col not in existing_num_cols:
+                            config['preprocessing']['numerical_cols'].append(emb_col)
+                    logger.info("Updated config's numerical_cols with new text embedding features.")
+
+                else:
+                    logger.error("Text embedding generation failed or returned incorrect shape. Skipping feature addition.")
+
+            else:
+                logger.warning(f"Text embedding column '{text_col_name}' not found in data or not configured. Skipping.")
+
+        except ImportError as e:
+            logger.error(f"Failed to import text embedding modules. Make sure transformers are installed. Error: {e}")
+        except Exception as e:
+            logger.error(f"An error occurred during text embedding generation: {e}")
+    else:
+        logger.info("Text embedding generation is DISABLED.")
+
+    # --- Ontology Embedding Generation (Optional) ---
+    ontology_embed_config = config.get('ontology_embedding_params', {})
+    if ontology_embed_config.get('enabled', False):
+        logger.info("Ontology embedding generation is ENABLED.")
+        try:
+            from features.ontology_embeddings import OntologyEmbedder
+
+            code_columns_to_embed = ontology_embed_config.get('code_columns', [])
+            if not code_columns_to_embed:
+                logger.warning("Ontology embedding enabled, but no 'code_columns' specified in config. Skipping.")
+            else:
+                embedder = OntologyEmbedder(
+                    ontology_data=ontology_embed_config.get('ontology_data'),
+                    node2vec_params=ontology_embed_config.get('node2vec_params', {}),
+                    pretrained_embeddings_path=ontology_embed_config.get('pretrained_path')
+                )
+
+                if ontology_embed_config.get('save_path') and not ontology_embed_config.get('pretrained_path'):
+                    embedder.save_embeddings(ontology_embed_config['save_path'])
+
+                for col_name in code_columns_to_embed:
+                    if col_name in X_full_raw_df.columns:
+                        logger.info(f"Generating ontology embeddings for column: '{col_name}'")
+                        codes = X_full_raw_df[col_name].astype(str).tolist()
+                        embeddings = embedder.get_embeddings_for_codes(codes)
+
+                        if embeddings is not None and embeddings.shape[0] == len(X_full_raw_df):
+                            emb_feature_names = [f'ont_emb_{col_name}_{i}' for i in range(embeddings.shape[1])]
+                            embeddings_df = pd.DataFrame(embeddings, columns=emb_feature_names, index=X_full_raw_df.index)
+
+                            X_full_raw_df = pd.concat([X_full_raw_df.drop(columns=[col_name]), embeddings_df], axis=1)
+                            logger.info(f"Successfully added {len(emb_feature_names)} ontology embedding features for '{col_name}'.")
+
+                            # Add new features to numerical_cols in config
+                            if 'preprocessing' not in config: config['preprocessing'] = {}
+                            if 'numerical_cols' not in config['preprocessing']: config['preprocessing']['numerical_cols'] = []
+
+                            existing_num_cols = set(config['preprocessing']['numerical_cols'])
+                            for emb_col in emb_feature_names:
+                                if emb_col not in existing_num_cols:
+                                    config['preprocessing']['numerical_cols'].append(emb_col)
+                            logger.info(f"Updated config's numerical_cols for '{col_name}' embeddings.")
+                        else:
+                            logger.error(f"Ontology embedding generation for '{col_name}' failed. Skipping.")
+                    else:
+                        logger.warning(f"Ontology code column '{col_name}' not found in data. Skipping.")
+
+        except ImportError as e:
+            logger.error(f"Failed to import ontology embedding modules. Make sure node2vec and networkx are installed. Error: {e}")
+        except Exception as e:
+            logger.error(f"An error occurred during ontology embedding generation: {e}")
+    else:
+        logger.info("Ontology embedding generation is DISABLED.")
+
 
     # --- Preprocessing Setup (for tabular models like LGBM, TECO) ---
     logger.info("Starting preprocessing setup...")  # This line was indented
