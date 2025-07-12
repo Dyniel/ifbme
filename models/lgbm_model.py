@@ -110,8 +110,12 @@ class LightGBMModel:
             # If no metric is specified, it might default to 'l2', which could be problematic for classification.
             # Let's ensure a reasonable default if 'metric' is not in params.
             if 'metric' not in current_params and not is_regression_task:
-                # If custom objective is provided, assume binary classification for now
-                current_params['metric'] = 'binary_logloss'
+                num_unique_labels = len(np.unique(y_train))
+                if num_unique_labels > 2:
+                    current_params['metric'] = 'multi_logloss'
+                else:
+                    # If custom objective is provided, assume binary classification for now
+                    current_params['metric'] = 'binary_logloss'
             elif 'metric' not in current_params and is_regression_task:
                 current_params['metric'] = 'l2' # Default for regression
 
