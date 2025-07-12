@@ -40,7 +40,7 @@ class LightGBMModel:
         self.model = None
 
     def train(self, X_train, y_train, X_val=None, y_val=None,
-              num_boost_round=1000, early_stopping_rounds=50, categorical_feature='auto'):
+              num_boost_round=1000, early_stopping_rounds=50, categorical_feature='auto', fobj=None):
         """
         Trains the LightGBM model.
 
@@ -54,8 +54,7 @@ class LightGBMModel:
                                          Stops training if validation metric doesn't improve.
             categorical_feature (str or list): Categorical features for LightGBM.
                                                'auto' or list of column names/indices.
-            categorical_feature (str or list): Categorical features for LightGBM.
-                                               'auto' or list of column names/indices.
+            fobj: Custom objective function.
         """
         # Use a local copy of params for modification within this method call
         current_params = self.params.copy()
@@ -68,39 +67,44 @@ class LightGBMModel:
         is_regression_task = any(reg_obj in original_objective_from_init for reg_obj in
                                  ['regression', 'regression_l1', 'regression_l2', 'mae', 'mse', 'huber', 'quantile', 'poisson', 'gamma', 'tweedie'])
 
-        if is_regression_task:
-            current_params['objective'] = original_objective_from_init # Explicitly set regression objective
-            # Ensure metric is regression-appropriate
-            if not original_metric_from_init or not any(reg_metric in original_metric_from_init for reg_metric in ['mae', 'mse', 'rmse', 'huber', 'quantile', 'poisson', 'gamma', 'tweedie', 'l1', 'l2']): # l1/l2 can be metrics too
-                current_params['metric'] = 'mae' # Default regression metric
-            else:
-                current_params['metric'] = original_metric_from_init # Keep user-defined regression metric
-
-            if 'num_class' in current_params:
-                del current_params['num_class']
-        else:
-            # Auto-detect for classification (binary/multiclass)
-            num_unique_labels = len(np.unique(y_train))
-            if num_unique_labels == 2:
-                current_params['objective'] = 'binary'
-                # Keep original metric if suitable (e.g. 'auc'), else default to 'binary_logloss'
-                if not original_metric_from_init or \
-                   any(cls_metric in original_metric_from_init for cls_metric in ['multi_logloss', 'multi_error', 'regression', 'mae', 'mse']): # if metric seems non-binary classification
-                    current_params['metric'] = 'binary_logloss'
+        if fobj is None:
+            if is_regression_task:
+                current_params['objective'] = original_objective_from_init # Explicitly set regression objective
+                # Ensure metric is regression-appropriate
+                if not original_metric_from_init or not any(reg_metric in original_metric_from_init for reg_metric in ['mae', 'mse', 'rmse', 'huber', 'quantile', 'poisson', 'gamma', 'tweedie', 'l1', 'l2']): # l1/l2 can be metrics too
+                    current_params['metric'] = 'mae' # Default regression metric
                 else:
-                    current_params['metric'] = original_metric_from_init
+                    current_params['metric'] = original_metric_from_init # Keep user-defined regression metric
 
-                if 'num_class' in current_params: # Not needed for binary
+                if 'num_class' in current_params:
                     del current_params['num_class']
             else:
-                current_params['objective'] = 'multiclass'
-                current_params['num_class'] = num_unique_labels
-                # Keep original metric if suitable, else default to 'multi_logloss'
-                if not original_metric_from_init or \
-                   any(cls_metric in original_metric_from_init for cls_metric in ['binary_logloss', 'auc', 'binary_error', 'regression', 'mae', 'mse']): # if metric seems non-multiclass classification
-                     current_params['metric'] = 'multi_logloss'
+                # Auto-detect for classification (binary/multiclass)
+                num_unique_labels = len(np.unique(y_train))
+                if num_unique_labels == 2:
+                    current_params['objective'] = 'binary'
+                    # Keep original metric if suitable (e.g. 'auc'), else default to 'binary_logloss'
+                    if not original_metric_from_init or \
+                       any(cls_metric in original_metric_from_init for cls_metric in ['multi_logloss', 'multi_error', 'regression', 'mae', 'mse']): # if metric seems non-binary classification
+                        current_params['metric'] = 'binary_logloss'
+                    else:
+                        current_params['metric'] = original_metric_from_init
+
+                    if 'num_class' in current_params: # Not needed for binary
+                        del current_params['num_class']
                 else:
-                    current_params['metric'] = original_metric_from_init
+                    current_params['objective'] = 'multiclass'
+                    current_params['num_class'] = num_unique_labels
+                    # Keep original metric if suitable, else default to 'multi_logloss'
+                    if not original_metric_from_init or \
+                       any(cls_metric in original_metric_from_init for cls_metric in ['binary_logloss', 'auc', 'binary_error', 'regression', 'mae', 'mse']): # if metric seems non-multiclass classification
+                         current_params['metric'] = 'multi_logloss'
+                    else:
+                        current_params['metric'] = original_metric_from_init
+        else:
+            current_params.pop('objective', None)
+            current_params.pop('metric', None)
+
 
         print(f"LightGBM using effective objective: {current_params.get('objective')} and effective metric: {current_params.get('metric')}")
 
@@ -128,6 +132,7 @@ class LightGBMModel:
             valid_sets=valid_sets,
             valid_names=valid_names,
             callbacks=callbacks,
+            fobj=fobj
             # evals_result=evals_result # This requires lgb.record_evaluation(evals_result) in callbacks
         )
 

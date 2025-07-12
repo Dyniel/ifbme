@@ -24,6 +24,7 @@ import joblib
 # Project-specific imports
 from data_utils.balancing import RSMOTE
 from data_utils.data_loader import load_raw_data
+from data_utils.losses import FocalLossLGB
 from data_utils.preprocess import get_preprocessor
 from models import LightGBMModel, XGBoostMetaLearner
 from models.teco_transformer import TECOTransformerModel
@@ -671,10 +672,6 @@ def main(config_path):
                         # Define hyperparameter search space for Optuna
                         # Parameters for Focal Loss (CB-Focal)
                         lgbm_params = {
-                            'objective': 'binary:focal',  # For Focal Loss, typically binary
-                            'metric': 'binary_logloss',  # Or custom F1 for tuning if Focal Loss aims for F1
-                            'alpha': 0.25,  # Focal loss alpha parameter
-                            'gamma': 2.0,  # Focal loss gamma parameter
                             'n_estimators': trial.suggest_int('n_estimators',
                                                               lgbm_config.get('num_boost_round', 1000) // 5,
                                                               lgbm_config.get('num_boost_round', 1000) * 2),
@@ -688,7 +685,6 @@ def main(config_path):
                             'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
                             'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
                             # 'class_weight': lgbm_config.get('class_weight', 'balanced'), # Focal loss handles imbalance
-                            'class_weight': None,  # Explicitly set to None if using Focal Loss alpha
                             'random_state': seed + outer_fold_idx + inner_fold_idx,
                             'n_jobs': -1,
                             'verbose': -1,
@@ -713,17 +709,18 @@ def main(config_path):
                             # and the custom focal loss function should handle multiclass.
                             # For now, sticking to 'binary' as per user note "binary:focal".
 
-                        model = LightGBMModel(params=lgbm_params)  # Use the class wrapper
+                        fobj = FocalLossLGB(alpha=0.25, gamma=2.0)
                         # Train with early stopping on validation set
                         # The train method of LightGBMModel needs to return the score for Optuna
                         # For now, we assume it trains and we get score from predict_proba
                         # This might need adjustment in LightGBMModel or here to directly get best score
 
                         # We need a temporary model instance for each trial
-                        temp_lgbm_model = LightGBMModel(params=lgbm_params)
+                        temp_lgbm_model = LightGBMModel()
                         temp_lgbm_model.train(
                             X_inner_fold_train_balanced, y_inner_fold_train_balanced,
                             X_inner_fold_val, y_inner_fold_val,
+                            fobj=fobj,
                             # num_boost_round passed via n_estimators in lgbm_params
                             early_stopping_rounds=lgbm_config.get('early_stopping_rounds', 20)
                             # Shorter for Optuna trials
@@ -774,11 +771,6 @@ def main(config_path):
                     # Train final LGBM model for this inner fold using best params
                     # Ensure Focal Loss parameters are included if not already optimized by Optuna (or if Optuna is off)
                     final_lgbm_params = {
-                        'objective': 'binary:focal',  # Consistent with Focal Loss
-                        'metric': 'binary_logloss',  # Or the metric Optuna optimized for
-                        'alpha': 0.25,  # Ensure Focal Loss alpha
-                        'gamma': 2.0,  # Ensure Focal Loss gamma
-                        'class_weight': None,  # Consistent with Focal Loss
                         'random_state': seed + outer_fold_idx + inner_fold_idx,
                         'n_jobs': -1,
                         'verbose': -1,
@@ -795,15 +787,13 @@ def main(config_path):
 
                     # Re-assert Focal Loss specific params if Optuna didn't tune them or if we want to enforce them
                     # This is crucial if Optuna was optimizing e.g. 'reg_alpha' and we need our specific 'alpha' for Focal Loss.
-                    final_lgbm_params['objective'] = 'binary:focal'
-                    final_lgbm_params['alpha'] = 0.25
-                    final_lgbm_params['gamma'] = 2.0
-                    final_lgbm_params['class_weight'] = None
+                    fobj = FocalLossLGB(alpha=0.25, gamma=2.0)
 
                     lgbm_inner_fold_model = LightGBMModel(params=final_lgbm_params)
                     lgbm_inner_fold_model.train(
                         X_inner_fold_train_balanced, y_inner_fold_train_balanced,
                         X_inner_fold_val, y_inner_fold_val,
+                        fobj=fobj,
                         # num_boost_round is now part of best_params_lgbm as n_estimators
                         early_stopping_rounds=lgbm_config.get('early_stopping_rounds', 50)
                         # Use original early stopping for final model
@@ -1350,10 +1340,12 @@ def main(config_path):
                                 f"Outer Fold {outer_fold_idx + 1}: Skipping Optuna for LoS due to insufficient data ({X_los_train_fold_processed.shape[0]} samples). Using base lgbm_los_params.")
                         los_model.train(X_los_train_fold_processed, y_los_outer_train_transformed,
                                         # Train on transformed
-                                        early_stopping_rounds=lgbm_los_config.get('early_stopping_rounds_final', 20))
-
+                                        early_stopping_rounds=lgbm_los_config.get('early_stopping_rounds_final', 20),
+                                        )
                     predicted_los_transformed = los_model.predict(X_outer_test_processed)
+                    logger.info(f"LoS predictions before np.expm1: {predicted_los_transformed[:5]}")
                     predicted_los_outer_test = np.expm1(predicted_los_transformed)
+                    logger.info(f"LoS predictions after np.expm1: {predicted_los_outer_test[:5]}")
                     predicted_los_outer_test = np.maximum(0,
                                                           predicted_los_outer_test)  # Ensure non-negativity after transform
 
@@ -1478,10 +1470,15 @@ def main(config_path):
                     # The warning in XGBoostMetaLearner about X_val/y_val not provided for early stopping applies.
                     pass  # No explicit split here for X_meta_val_optuna
 
+                from sklearn.model_selection import train_test_split
+
+                X_meta_train, X_meta_val, y_meta_train, y_meta_val = train_test_split(
+                    X_meta_train_outer, y_meta_train_outer, test_size=0.2, random_state=42
+                )
                 xgb_meta_model_outer.train(
-                    X_meta_train_outer, y_meta_train_outer,
-                    X_val=None,
-                    y_val=None,
+                    X_meta_train, y_meta_train,
+                    X_val=X_meta_val,
+                    y_val=y_meta_val,
                     num_boost_round=meta_config.get('num_boost_round', 100),  # Updated value from new config
                     early_stopping_rounds=meta_config.get('early_stopping_rounds', 15),  # Updated value
                     use_optuna=optuna_meta_config.get('use_optuna_for_meta', False),
@@ -1509,160 +1506,160 @@ def main(config_path):
                     # This requires careful restructuring of the following soft-voting block or a continue
                 else:
                     X_meta_test_outer = np.concatenate(meta_features_test_outer_list, axis=1)
-                    final_preds_meta_proba_outer = xgb_meta_model_outer.predict_proba(X_meta_test_outer)
-                final_preds_meta_labels_outer = xgb_meta_model_outer.predict(
+                    final_preds_meta_proba = xgb_meta_model_outer.predict_proba(X_meta_test_outer)
+                final_preds_meta_labels = xgb_meta_model_outer.predict(
                     X_meta_test_outer)  # Labels based on default 0.5 threshold from predict()
 
                 # --- F1 Threshold Maximization ---
                 death_label_value = class_mapping.get('Death', None)
-                best_threshold_fold_meta = 0.5  # Default
-                f1_at_best_threshold_meta = 0.0  # Default
+                best_threshold_fold = 0.5  # Default
+                f1_at_best_threshold = 0.0  # Default
 
-                if death_label_value is not None and final_preds_meta_proba_outer is not None:
+                if death_label_value is not None and final_preds_meta_proba is not None:
                     logger.info(
                         f"Outer Fold {outer_fold_idx + 1}: Maximizing F1 threshold for 'Death' class (Meta-Learner)...")
-                    best_threshold_fold_meta, f1_at_best_threshold_meta = maximise_f1_threshold(
+                    best_threshold_fold, f1_at_best_threshold = maximise_f1_threshold(
                         y_true=y_outer_test,
-                        y_probas=final_preds_meta_proba_outer,
+                        y_probas=final_preds_meta_proba,
                         target_label_value=death_label_value,
                         class_mapping=class_mapping,
                         positive_label_name='Death'
                     )
-                    thr_dict[f"meta_{outer_fold_idx}"] = best_threshold_fold_meta
-                    all_f1_at_best_thr_meta_list.append(f1_at_best_threshold_meta)  # Store this F1
+                    thr_dict[f"meta_{outer_fold_idx}"] = best_threshold_fold
+                    all_f1_at_best_thr_meta_list.append(f1_at_best_threshold)  # Store this F1
                     logger.info(
-                        f"Outer Fold {outer_fold_idx + 1} Meta-Learner: Best F1 threshold for 'Death' = {best_threshold_fold_meta:.4f} (yields F1 = {f1_at_best_threshold_meta:.4f})")
+                        f"Outer Fold {outer_fold_idx + 1} Meta-Learner: Best F1 threshold for 'Death' = {best_threshold_fold:.4f} (yields F1 = {f1_at_best_threshold:.4f})")
                     wandb.log({
-                        f"outer_fold_{outer_fold_idx + 1}/meta_best_f1_thr_death": best_threshold_fold_meta,
-                        f"outer_fold_{outer_fold_idx + 1}/meta_f1_at_best_thr_death": f1_at_best_threshold_meta,
+                        f"outer_fold_{outer_fold_idx + 1}/meta_best_f1_thr_death": best_threshold_fold,
+                        f"outer_fold_{outer_fold_idx + 1}/meta_f1_at_best_thr_death": f1_at_best_threshold,
                         "outer_fold": outer_fold_idx + 1
                     })
                 elif death_label_value is None:
                     logger.warning(
                         f"Outer Fold {outer_fold_idx + 1}: 'Death' class not in class_mapping. Cannot maximize F1 threshold. Using default 0.5.")
                     all_best_thresholds_fold_list.append(0.5)  # Append default if 'Death' class is missing
-                else:  # final_preds_meta_proba_outer is None
+                else:  # final_preds_meta_proba is None
                     logger.warning(
                         f"Outer Fold {outer_fold_idx + 1}: Meta-learner probabilities are None. Cannot maximize F1 threshold. Using default 0.5.")
                     all_best_thresholds_fold_list.append(0.5)
 
-                # Predictions using the new best_threshold_fold_meta for metrics calculation
-                if death_label_value is not None and final_preds_meta_proba_outer is not None:
+                # Predictions using the new best_threshold_fold for metrics calculation
+                if death_label_value is not None and final_preds_meta_proba is not None:
                     death_class_idx = class_mapping['Death']
-                    final_preds_meta_labels_outer_custom_thr = (
-                                final_preds_meta_proba_outer[:, death_class_idx] > best_threshold_fold_meta).astype(int)
+                    final_preds_meta_labels_custom_thr = (
+                                final_preds_meta_proba[:, death_class_idx] > best_threshold_fold).astype(int)
                     # Important: If 'Death' is class 0 and 'Survival' is 1, predictions should be 0 for Death, 1 for Survival.
                     # The line above gives 1 if P(Death) > thr, 0 otherwise. This needs to map back to original labels.
                     # If target_label_value for Death is 0, then:
-                    #   predicted_as_death = (final_preds_meta_proba_outer[:, death_class_idx] > best_threshold_fold_meta)
-                    #   final_preds_meta_labels_outer_custom_thr = np.where(predicted_as_death, death_label_value, class_mapping.get('Survival'))
-                    # This is complex. Simpler: use the f1_at_best_threshold_meta directly for DTscore.
+                    #   predicted_as_death = (final_preds_meta_proba[:, death_class_idx] > best_threshold_fold)
+                    #   final_preds_meta_labels_custom_thr = np.where(predicted_as_death, death_label_value, class_mapping.get('Survival'))
+                    # This is complex. Simpler: use the f1_at_best_threshold directly for DTscore.
                     # For other metrics (acc, precision, recall), using labels derived from this custom threshold for 'Death'
                     # while other classes (if any) use argmax might be inconsistent.
-                    # The user's request focuses on F1_Death and DTscore. Let's use f1_at_best_threshold_meta for DTscore.
+                    # The user's request focuses on F1_Death and DTscore. Let's use f1_at_best_threshold for DTscore.
                     # And for overall metrics, we can report based on default 0.5 or this custom threshold.
-                    # For now, let's keep final_preds_meta_labels_outer (from default 0.5) for general metrics,
-                    # and use f1_at_best_threshold_meta for DTscore.
+                    # For now, let's keep final_preds_meta_labels (from default 0.5) for general metrics,
+                    # and use f1_at_best_threshold for DTscore.
                 # --- End F1 Threshold Maximization ---
 
-                acc_meta_outer = accuracy_score(y_outer_test,
-                                                final_preds_meta_labels_outer)  # Based on default 0.5 threshold
-                f1_meta_outer = f1_score(y_outer_test, final_preds_meta_labels_outer,  # Based on default 0.5 threshold
+                acc = accuracy_score(y_outer_test,
+                                                final_preds_meta_labels)  # Based on default 0.5 threshold
+                f1 = f1_score(y_outer_test, final_preds_meta_labels,  # Based on default 0.5 threshold
                                          average='weighted' if num_classes > 2 else 'binary', zero_division=0)
-                prec_meta_outer = precision_score(y_outer_test, final_preds_meta_labels_outer,
+                prec = precision_score(y_outer_test, final_preds_meta_labels,
                                                   # Based on default 0.5 threshold
                                                   average='weighted' if num_classes > 2 else 'binary',
                                                   zero_division=0)
-                rec_meta_outer = recall_score(y_outer_test, final_preds_meta_labels_outer,
+                rec = recall_score(y_outer_test, final_preds_meta_labels,
                                               # Based on default 0.5 threshold
                                               average='weighted' if num_classes > 2 else 'binary', zero_division=0)
-                auroc_meta_outer = -1.0
-                dt_score_meta_outer = 10.0  # Default to worst score
+                auroc = -1.0
+                dt_score = 10.0  # Default to worst score
 
                 try:
-                    probas_for_auc = final_preds_meta_proba_outer[:,
-                                     1] if num_classes == 2 and final_preds_meta_proba_outer.ndim == 2 and \
-                                           final_preds_meta_proba_outer.shape[
-                                               1] >= 2 else final_preds_meta_proba_outer
-                    auroc_meta_outer = roc_auc_score(y_outer_test, probas_for_auc, multi_class='ovr',
+                    probas_for_auc = final_preds_meta_proba[:,
+                                     1] if num_classes == 2 and final_preds_meta_proba.ndim == 2 and \
+                                           final_preds_meta_proba.shape[
+                                               1] >= 2 else final_preds_meta_proba
+                    auroc = roc_auc_score(y_outer_test, probas_for_auc, multi_class='ovr',
                                                      average='weighted')
                 except ValueError as e:
                     logger.warning(
-                        f"Outer Fold {outer_fold_idx + 1} Meta AUROC calc error: {e}. Proba shape: {final_preds_meta_proba_outer.shape if isinstance(final_preds_meta_proba_outer, np.ndarray) else 'N/A'}")
+                        f"Outer Fold {outer_fold_idx + 1} Meta AUROC calc error: {e}. Proba shape: {final_preds_meta_proba.shape if isinstance(final_preds_meta_proba, np.ndarray) else 'N/A'}")
 
                 # Calculate DTscore for Meta-Learner
-                # Uses f1_at_best_threshold_meta if available, otherwise falls back to F1 from default threshold predictions
-                f1_death_for_dtscore_meta = 0.0
+                # Uses f1_at_best_threshold if available, otherwise falls back to F1 from default threshold predictions
+                f1_death_for_dtscore = 0.0
                 if death_label_value is not None:
-                    if f1_at_best_threshold_meta > 0.0:  # Check if maximization was successful
-                        f1_death_for_dtscore_meta = f1_at_best_threshold_meta
+                    if f1_at_best_threshold > 0.0:  # Check if maximization was successful
+                        f1_death_for_dtscore = f1_at_best_threshold
                         logger.info(
-                            f"Outer Fold {outer_fold_idx + 1} Meta-Learner: Using F1_Death from maximized threshold ({f1_death_for_dtscore_meta:.4f}) for DTscore.")
+                            f"Outer Fold {outer_fold_idx + 1} Meta-Learner: Using F1_Death from maximized threshold ({f1_death_for_dtscore:.4f}) for DTscore.")
                     else:  # Fallback to F1 from default 0.5 threshold if maximization yielded 0 or was skipped
-                        f1_death_for_dtscore_meta = f1_score(y_outer_test, final_preds_meta_labels_outer,
+                        f1_death_for_dtscore = f1_score(y_outer_test, final_preds_meta_labels,
                                                              # Labels from default 0.5
                                                              labels=[death_label_value], pos_label=death_label_value,
                                                              average='binary', zero_division=0)
                         logger.info(
-                            f"Outer Fold {outer_fold_idx + 1} Meta-Learner: Using F1_Death from default 0.5 threshold ({f1_death_for_dtscore_meta:.4f}) for DTscore.")
-                    dt_score_meta_outer = dt_score_calc(f1_death_for_dtscore_meta)
+                            f"Outer Fold {outer_fold_idx + 1} Meta-Learner: Using F1_Death from default 0.5 threshold ({f1_death_for_dtscore:.4f}) for DTscore.")
+                    dt_score = dt_score_calc(f1_death_for_dtscore)
                 else:
                     logger.warning(
                         f"Outer Fold {outer_fold_idx + 1} Meta-Learner: 'Death' class not found in class_mapping. DTscore set to 10.")
-                    dt_score_meta_outer = dt_score_calc(np.nan)  # Ensure it's 10
+                    dt_score = dt_score_calc(np.nan)  # Ensure it's 10
 
-                outer_fold_metrics_meta['accuracy'].append(acc_meta_outer)
-                outer_fold_metrics_meta['auroc'].append(auroc_meta_outer)
-                outer_fold_metrics_meta['f1'].append(f1_meta_outer)  # This is overall F1
-                outer_fold_metrics_meta['precision'].append(prec_meta_outer)
-                outer_fold_metrics_meta['recall'].append(rec_meta_outer)
-                outer_fold_metrics_meta['dt_score'].append(dt_score_meta_outer)  # Based on best/maximized F1 for Death
+                outer_fold_metrics_meta['accuracy'].append(acc)
+                outer_fold_metrics_meta['auroc'].append(auroc)
+                outer_fold_metrics_meta['f1'].append(f1)  # This is overall F1
+                outer_fold_metrics_meta['precision'].append(prec)
+                outer_fold_metrics_meta['recall'].append(rec)
+                outer_fold_metrics_meta['dt_score'].append(dt_score)  # Based on best/maximized F1 for Death
 
                 # Calculate GLscore for Meta-Learner
-                current_ls_score_meta = outer_fold_los_metrics['ls_score'][-1] if outer_fold_los_metrics[
+                current_ls_score = outer_fold_los_metrics['ls_score'][-1] if outer_fold_los_metrics[
                     'ls_score'] else ls_score_calc(np.nan)  # Default to worst if no LS score
-                gl_score_meta_outer = gl_score_calc(dt_score_meta_outer, current_ls_score_meta)
-                outer_fold_metrics_meta['gl_score'].append(gl_score_meta_outer)
+                gl_score = gl_score_calc(dt_score, current_ls_score)
+                outer_fold_metrics_meta['gl_score'].append(gl_score)
 
                 wandb.log({
-                    f"outer_fold_{outer_fold_idx + 1}/meta_f1_death_for_dtscore": f1_death_for_dtscore_meta if death_label_value is not None else np.nan,
+                    f"outer_fold_{outer_fold_idx + 1}/meta_f1_death_for_dtscore": f1_death_for_dtscore if death_label_value is not None else np.nan,
                     # Log the original F1_Death based on 0.5 threshold for comparison if needed
                     f"outer_fold_{outer_fold_idx + 1}/meta_f1_death_default_thr": f1_score(y_outer_test,
-                                                                                           final_preds_meta_labels_outer,
+                                                                                           final_preds_meta_labels,
                                                                                            labels=[death_label_value],
                                                                                            pos_label=death_label_value,
                                                                                            average='binary',
                                                                                            zero_division=0) if death_label_value is not None else np.nan,
                     f"outer_fold_{outer_fold_idx + 1}/meta_mae_los": outer_fold_los_metrics['mae_los'][-1] if
                     outer_fold_los_metrics['mae_los'] else np.nan,
-                    f"outer_fold_{outer_fold_idx + 1}/meta_dt_score": dt_score_meta_outer,
-                    f"outer_fold_{outer_fold_idx + 1}/meta_ls_score": current_ls_score_meta,
-                    f"outer_fold_{outer_fold_idx + 1}/meta_gl_score": gl_score_meta_outer,
-                    f"outer_fold_{outer_fold_idx + 1}/meta_auroc": auroc_meta_outer,
-                    f"outer_fold_{outer_fold_idx + 1}/meta_acc": acc_meta_outer,  # Based on default 0.5 thr
+                    f"outer_fold_{outer_fold_idx + 1}/meta_dt_score": dt_score,
+                    f"outer_fold_{outer_fold_idx + 1}/meta_ls_score": current_ls_score,
+                    f"outer_fold_{outer_fold_idx + 1}/meta_gl_score": gl_score,
+                    f"outer_fold_{outer_fold_idx + 1}/meta_auroc": auroc,
+                    f"outer_fold_{outer_fold_idx + 1}/meta_acc": acc,  # Based on default 0.5 thr
                     "outer_fold": outer_fold_idx + 1
                 })
                 logger.info(
                     f"Outer Fold {outer_fold_idx + 1} Meta-Learner: "
-                    f"F1_Death(for DTscore)={f1_death_for_dtscore_meta if death_label_value is not None else np.nan:.4f} (BestThr={best_threshold_fold_meta:.2f}), "
+                    f"F1_Death(for DTscore)={f1_death_for_dtscore if death_label_value is not None else np.nan:.4f} (BestThr={best_threshold_fold:.2f}), "
                     f"MAE_LoS={outer_fold_los_metrics['mae_los'][-1] if outer_fold_los_metrics['mae_los'] else np.nan:.4f}, "
-                    f"DTscore={dt_score_meta_outer:.4f}, LSscore={current_ls_score_meta:.4f}, GLscore={gl_score_meta_outer:.4f} | "
-                    f"AUROC={auroc_meta_outer:.4f}, Acc(0.5 thr)={acc_meta_outer:.4f}"
+                    f"DTscore={dt_score:.4f}, LSscore={current_ls_score:.4f}, GLscore={gl_score:.4f} | "
+                    f"AUROC={auroc:.4f}, Acc(0.5 thr)={acc:.4f}"
                 )
 
                 # --- Accumulate predictions for CSV logging ---
                 all_test_indices_list.append(outer_test_idx)
                 all_y_test_list.append(y_outer_test)  # Actual outcomeType
                 # Store probabilities for 'Death' class (class 0) for later thresholding if needed for CSV
-                # final_preds_meta_proba_outer is (N, num_classes), class_mapping['Death'] is its index
-                if final_preds_meta_proba_outer is not None and class_mapping.get('Death') is not None:
-                    probas_death_meta = final_preds_meta_proba_outer[:, class_mapping['Death']]
-                    all_probas_meta_list.append(probas_death_meta)
+                # final_preds_meta_proba is (N, num_classes), class_mapping['Death'] is its index
+                if final_preds_meta_proba is not None and class_mapping.get('Death') is not None:
+                    probas_death = final_preds_meta_proba[:, class_mapping['Death']]
+                    all_probas_list.append(probas_death)
                 else:  # Fallback if probas are not available, store NaNs or re-derive from labels if only labels are available
-                    all_probas_meta_list.append(np.full(len(y_outer_test), np.nan))
+                    all_probas_list.append(np.full(len(y_outer_test), np.nan))
 
-                all_preds_meta_list.append(
-                    final_preds_meta_labels_outer)  # Store labels derived from default threshold for metrics
+                all_preds_list.append(
+                    final_preds_meta_labels)  # Store labels derived from default threshold for metrics
 
                 # Get actual lengthOfStay for these test indices from the original X_full_raw_df
                 # Ensure 'lengthofStay' is a valid column name. From logs, it seems to be.

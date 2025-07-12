@@ -1,6 +1,27 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+class FocalLossLGB:
+    def __init__(self, alpha, gamma):
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def __call__(self, y_true, y_pred):
+        y_pred = 1.0 / (1.0 + np.exp(-y_pred))  # Sigmoid transform
+        grad = y_pred * (1 - y_pred) * (self.alpha * (y_true - y_pred) * ((1 - y_true - y_pred).abs() ** self.gamma) * (
+                    np.log(y_pred / (1 - y_pred)) * (y_true - y_pred) + 1) - y_true + y_pred)
+        hess = y_pred * (1 - y_pred) * (self.alpha * (((1 - y_true - y_pred).abs() ** self.gamma) * (
+                    (y_true - y_pred) * (1 - 2 * y_pred) * (
+                        np.log(y_pred / (1 - y_pred)) * (y_true - y_pred) + 1) + (y_true - y_pred) ** 2 * (
+                                y_pred * (1 - y_pred)) ** -1 - (1 - 2 * y_pred)) - self.gamma * (
+                                (1 - y_true - y_pred).abs() ** (self.gamma - 1)) * np.sign(
+            1 - y_true - y_pred) * (y_true - y_pred) * (
+                                np.log(y_pred / (1 - y_pred)) * (y_true - y_pred) + 1)) + 1)
+        return grad, hess
+
 
 class ClassBalancedFocalLoss(nn.Module):
     """
