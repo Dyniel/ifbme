@@ -649,8 +649,8 @@ def main(config_path):
                     balanced_dist_log_msg = f"Inner Fold {inner_fold_idx + 1} (Outer {outer_fold_idx + 1}) - Class distribution after RSMOTE: {dict(zip(unique_classes_balanced, counts_balanced))}"
                     logger.info(balanced_dist_log_msg)
                     wandb.log({
-                        f"outer_fold_{outer_fold_idx + 1}/inner_fold_{inner_fold_idx + 1}/balanced_class_distribution": dict(
-                            zip(unique_classes_balanced, counts_balanced)),
+                        f"outer_fold_{outer_fold_idx + 1}/inner_fold_{inner_fold_idx + 1}/balanced_class_distribution": {
+                            str(k): v for k, v in zip(unique_classes_balanced, counts_balanced)},
                         "outer_fold": outer_fold_idx + 1,  # For grouping if needed
                         "inner_fold": inner_fold_idx + 1  # For grouping if needed
                     })
@@ -716,7 +716,7 @@ def main(config_path):
                         # This might need adjustment in LightGBMModel or here to directly get best score
 
                         # We need a temporary model instance for each trial
-                        temp_lgbm_model = LightGBMModel()
+                        temp_lgbm_model = LightGBMModel(params={'objective': 'binary'})
                         temp_lgbm_model.train(
                             X_inner_fold_train_balanced, y_inner_fold_train_balanced,
                             X_val=X_inner_fold_val, y_val=y_inner_fold_val,
