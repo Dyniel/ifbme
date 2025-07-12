@@ -45,6 +45,7 @@ class XGBoostMetaLearner:
             'colsample_bytree': 0.8,      # Subsample ratio of columns when constructing each tree
             'seed': 42,                   # Random seed for reproducibility
             'nthread': -1,                # Use all available CPU cores for training
+            'scale_pos_weight': 2,        # Set scale_pos_weight to 2
             # Consider 'tree_method': 'hist' for potentially faster training on large datasets.
             # If GPU is available and XGBoost is compiled with GPU support, 'gpu_hist' can be used.
         }

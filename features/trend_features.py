@@ -198,5 +198,3 @@ if __name__ == '__main__':
     nan_df_all_nan_trends = make_trends(nan_df_all_nan.copy(), 'patient_id', 'hour', ['value'], windows=[3], slope_window_min_periods=2)
     print("\nTrends for DataFrame with all NaNs in a rolling window for slope:")
     print(nan_df_all_nan_trends)
-
-```
