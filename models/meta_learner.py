@@ -247,23 +247,24 @@ class XGBoostMetaLearner:
         evals_result_history = {}
         effective_early_stopping_rounds = early_stopping_rounds if use_early_stopping_for_final_train else None
 
-        try:
-            self.model = xgb.train(
-                self.params,
-                dtrain,
-                num_boost_round=num_boost_round,
-                evals=evals_list,
-                early_stopping_rounds=effective_early_stopping_rounds,
-                verbose_eval=verbose_eval,
-                evals_result=evals_result_history
-            )
-        except xgb.core.XGBoostError as e:
-            logger.error(f"XGBoost training failed: {e}")
-            logger.debug(f"XGBoost parameters at time of failure: {self.params}")
-            raise
-        except Exception as e:
-            logger.error(f"An unexpected error occurred during XGBoost training: {e}")
-            raise
+        if not use_optuna:
+            try:
+                self.model = xgb.train(
+                    self.params,
+                    dtrain,
+                    num_boost_round=num_boost_round,
+                    evals=evals_list,
+                    early_stopping_rounds=effective_early_stopping_rounds,
+                    verbose_eval=verbose_eval,
+                    evals_result=evals_result_history
+                )
+            except xgb.core.XGBoostError as e:
+                logger.error(f"XGBoost training failed: {e}")
+                logger.debug(f"XGBoost parameters at time of failure: {self.params}")
+                raise
+            except Exception as e:
+                logger.error(f"An unexpected error occurred during XGBoost training: {e}")
+                raise
 
         if use_early_stopping_for_final_train and hasattr(self.model, 'best_iteration') and self.model.best_iteration is not None:
             self.best_iteration = self.model.best_iteration
