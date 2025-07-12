@@ -9,17 +9,21 @@ class FocalLossLGB:
         self.alpha = alpha
         self.gamma = gamma
 
-    def __call__(self, y_true, y_pred):
-        y_pred = 1.0 / (1.0 + np.exp(-y_pred))  # Sigmoid transform
-        grad = y_pred * (1 - y_pred) * (self.alpha * (y_true - y_pred) * ((1 - y_true - y_pred).abs() ** self.gamma) * (
-                    np.log(y_pred / (1 - y_pred)) * (y_true - y_pred) + 1) - y_true + y_pred)
-        hess = y_pred * (1 - y_pred) * (self.alpha * (((1 - y_true - y_pred).abs() ** self.gamma) * (
-                    (y_true - y_pred) * (1 - 2 * y_pred) * (
-                        np.log(y_pred / (1 - y_pred)) * (y_true - y_pred) + 1) + (y_true - y_pred) ** 2 * (
-                                y_pred * (1 - y_pred)) ** -1 - (1 - 2 * y_pred)) - self.gamma * (
-                                (1 - y_true - y_pred).abs() ** (self.gamma - 1)) * np.sign(
+    def __call__(self, preds, train_data):
+        y_true = train_data.get_label()
+        y_pred = 1.0 / (1.0 + np.exp(-preds))  # Sigmoid transform
+        grad = y_pred * (1 - y_pred) * (self.alpha * (y_true - y_pred) * (np.abs(1 - y_true - y_pred) ** self.gamma) * (
+                np.log(y_pred / (1 - y_pred)) * (y_true - y_pred) + 1) - y_true + y_pred)
+        hess = y_pred * (1 - y_pred) * (self.alpha * (((np.abs(1 - y_true - y_pred) ** self.gamma) * (
+                (y_true - y_pred) * (1 - 2 * y_pred) * (
+                np.log(y_pred / (1 - y_pred)) * (y_true - y_pred) + 1) + (y_true - y_pred) ** 2 * (
+                        y_pred * (1 - y_pred)) ** -1 - (1 - 2 * y_pred))) - self.gamma * (
+                                                                  (np.abs(1 - y_true - y_pred) ** (
+                                                                              self.gamma - 1))) * np.sign(
             1 - y_true - y_pred) * (y_true - y_pred) * (
-                                np.log(y_pred / (1 - y_pred)) * (y_true - y_pred) + 1)) + 1)
+                                                                  np.log(y_pred / (
+                                                                              1 - y_pred)) * (
+                                                                              y_true - y_pred) + 1)) + 1)
         return grad, hess
 
 
