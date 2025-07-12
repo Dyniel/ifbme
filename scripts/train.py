@@ -719,7 +719,7 @@ def main(config_path):
                         temp_lgbm_model = LightGBMModel()
                         temp_lgbm_model.train(
                             X_inner_fold_train_balanced, y_inner_fold_train_balanced,
-                            X_inner_fold_val, y_inner_fold_val,
+                            X_val=X_inner_fold_val, y_val=y_inner_fold_val,
                             fobj=fobj,
                             # num_boost_round passed via n_estimators in lgbm_params
                             early_stopping_rounds=lgbm_config.get('early_stopping_rounds', 20)

@@ -102,9 +102,20 @@ class LightGBMModel:
                     else:
                         current_params['metric'] = original_metric_from_init
         else:
+            # When a custom objective is used, 'metric' is ignored by lgb.train.
+            # Evaluation is done via feval. We don't set a custom feval here,
+            # but early stopping still requires a validation set.
             current_params['objective'] = fobj
-            current_params.pop('metric', None)
-
+            # Keep the metric if it exists, for the valid_sets. LightGBM needs a metric for early stopping.
+            # If no metric is specified, it might default to 'l2', which could be problematic for classification.
+            # Let's ensure a reasonable default if 'metric' is not in params.
+            if 'metric' not in current_params and not is_regression_task:
+                if 'binary' in original_objective_from_init:
+                    current_params['metric'] = 'binary_logloss'
+                elif 'multiclass' in original_objective_from_init:
+                    current_params['metric'] = 'multi_logloss'
+            elif 'metric' not in current_params and is_regression_task:
+                current_params['metric'] = 'l2' # Default for regression
 
         print(f"LightGBM using effective objective: {current_params.get('objective')} and effective metric: {current_params.get('metric')}")
 
@@ -112,9 +123,11 @@ class LightGBMModel:
 
         callbacks = []
         if early_stopping_rounds > 0:
-            callbacks.append(lgb.early_stopping(stopping_rounds=early_stopping_rounds, verbose=1))
+            # verbose=True is more informative than just 1
+            callbacks.append(lgb.early_stopping(stopping_rounds=early_stopping_rounds, verbose=True))
 
         evals_result = {} # To store training progress
+        callbacks.append(lgb.record_evaluation(evals_result)) # Correct way to use evals_result
         callbacks.append(lgb.log_evaluation(period=100)) # Log every 100 rounds
 
         valid_sets = [lgb_train]
@@ -124,15 +137,20 @@ class LightGBMModel:
                                   categorical_feature=categorical_feature, free_raw_data=False)
             valid_sets.append(lgb_val)
             valid_names.append('valid')
+        # Ensure that if early stopping is on, there is a validation set.
+        elif early_stopping_rounds > 0:
+            raise ValueError("For early stopping, a validation set (X_val, y_val) must be provided.")
+
 
         self.model = lgb.train(
-            current_params, # USE THE MODIFIED current_params
+            current_params,
             lgb_train,
             num_boost_round=num_boost_round,
             valid_sets=valid_sets,
-            valid_names=valid_names,
+            # valid_names is deprecated and will be removed in a future version.
+            # Use valid_sets instead.
+            # valid_names=valid_names,
             callbacks=callbacks
-            # evals_result=evals_result # This requires lgb.record_evaluation(evals_result) in callbacks
         )
 
         # print("LightGBM training evaluation results:", evals_result)
