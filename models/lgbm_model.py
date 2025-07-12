@@ -102,7 +102,7 @@ class LightGBMModel:
                     else:
                         current_params['metric'] = original_metric_from_init
         else:
-            current_params.pop('objective', None)
+            current_params['objective'] = fobj
             current_params.pop('metric', None)
 
 
@@ -131,8 +131,7 @@ class LightGBMModel:
             num_boost_round=num_boost_round,
             valid_sets=valid_sets,
             valid_names=valid_names,
-            callbacks=callbacks,
-            fobj=fobj
+            callbacks=callbacks
             # evals_result=evals_result # This requires lgb.record_evaluation(evals_result) in callbacks
         )
 
