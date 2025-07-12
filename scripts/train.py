@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader
 import optuna  # Import Optuna
 
 # Project-specific imports
-from data_utils.balancing import RSMOTEGAN
+from data_utils.balancing import RSMOTE
 from data_utils.data_loader import load_raw_data
 from data_utils.preprocess import get_preprocessor
 from models import LightGBMModel, XGBoostMetaLearner
@@ -349,7 +349,7 @@ def main(config_path):
     all_predicted_los_list = []  # For LSestimation.csv (predicted lengthOfStay)
     # If patient IDs are consistently available and aligned with X_full_raw_df.index:
     all_patient_ids_list = []
-    all_best_thresholds_fold_list = []  # For storing best F1 threshold from each fold
+    thr_dict = {}  # For storing best F1 threshold from each fold
     all_f1_at_best_thr_meta_list = []  # For storing F1 score at best threshold for meta-learner from each fold
 
     X_full_for_split = X_full_raw_df
@@ -505,22 +505,21 @@ def main(config_path):
             X_inner_fold_val, y_inner_fold_val = X_outer_train_processed[inner_val_idx], y_outer_train[inner_val_idx]
 
             if config.get('balancing', {}).get('use_rsmote_gan_in_cv', True):
-                logger.info(f"Inner Fold {inner_fold_idx + 1}: Applying RSMOTE-GAN...")
+                logger.info(f"Inner Fold {inner_fold_idx + 1}: Applying RSMOTE...")
                 rsmote_cv_config = config['balancing'].get('rsmote_gan_params', {})
-                rsmote_gan_cv = RSMOTEGAN(
-                    k_neighbors=rsmote_cv_config.get('k', 5),
-                    minority_upsample_factor=rsmote_cv_config.get('minority_upsample_factor', 3.0),
+                rsmote = RSMOTE(
+                    k_neighbors=3,
                     random_state=seed + outer_fold_idx + inner_fold_idx
                 )
                 try:
-                    X_inner_fold_train_balanced, y_inner_fold_train_balanced = rsmote_gan_cv.fit_resample(
+                    X_inner_fold_train_balanced, y_inner_fold_train_balanced = rsmote.fit_resample(
                         X_inner_fold_train, y_inner_fold_train)
                     logger.info(
-                        f"Inner Fold {inner_fold_idx + 1}: RSMOTE-GAN completed. New shape: {X_inner_fold_train_balanced.shape}")
+                        f"Inner Fold {inner_fold_idx + 1}: RSMOTE completed. New shape: {X_inner_fold_train_balanced.shape}")
                     # Log class distribution after balancing
                     unique_classes_balanced, counts_balanced = np.unique(y_inner_fold_train_balanced,
                                                                          return_counts=True)
-                    balanced_dist_log_msg = f"Inner Fold {inner_fold_idx + 1} (Outer {outer_fold_idx + 1}) - Class distribution after RSMOTE-GAN: {dict(zip(unique_classes_balanced, counts_balanced))}"
+                    balanced_dist_log_msg = f"Inner Fold {inner_fold_idx + 1} (Outer {outer_fold_idx + 1}) - Class distribution after RSMOTE: {dict(zip(unique_classes_balanced, counts_balanced))}"
                     logger.info(balanced_dist_log_msg)
                     wandb.log({
                         f"outer_fold_{outer_fold_idx + 1}/inner_fold_{inner_fold_idx + 1}/balanced_class_distribution": dict(
@@ -530,7 +529,7 @@ def main(config_path):
                     })
                 except Exception as e:
                     logger.error(
-                        f"Inner Fold {inner_fold_idx + 1}: Error during RSMOTE-GAN: {e}. Proceeding without balancing.")
+                        f"Inner Fold {inner_fold_idx + 1}: Error during RSMOTE: {e}. Proceeding without balancing.")
                     X_inner_fold_train_balanced, y_inner_fold_train_balanced = X_inner_fold_train, y_inner_fold_train
             else:
                 X_inner_fold_train_balanced, y_inner_fold_train_balanced = X_inner_fold_train, y_inner_fold_train
@@ -546,7 +545,7 @@ def main(config_path):
                         # Define hyperparameter search space for Optuna
                         # Parameters for Focal Loss (CB-Focal)
                         lgbm_params = {
-                            'objective': 'binary',  # For Focal Loss, typically binary
+                            'objective': 'binary:focal',  # For Focal Loss, typically binary
                             'metric': 'binary_logloss',  # Or custom F1 for tuning if Focal Loss aims for F1
                             'alpha': 0.25,  # Focal loss alpha parameter
                             'gamma': 2.0,  # Focal loss gamma parameter
@@ -649,7 +648,7 @@ def main(config_path):
                     # Train final LGBM model for this inner fold using best params
                     # Ensure Focal Loss parameters are included if not already optimized by Optuna (or if Optuna is off)
                     final_lgbm_params = {
-                        'objective': 'binary',  # Consistent with Focal Loss
+                        'objective': 'binary:focal',  # Consistent with Focal Loss
                         'metric': 'binary_logloss',  # Or the metric Optuna optimized for
                         'alpha': 0.25,  # Ensure Focal Loss alpha
                         'gamma': 2.0,  # Ensure Focal Loss gamma
@@ -670,7 +669,7 @@ def main(config_path):
 
                     # Re-assert Focal Loss specific params if Optuna didn't tune them or if we want to enforce them
                     # This is crucial if Optuna was optimizing e.g. 'reg_alpha' and we need our specific 'alpha' for Focal Loss.
-                    final_lgbm_params['objective'] = 'binary'
+                    final_lgbm_params['objective'] = 'binary:focal'
                     final_lgbm_params['alpha'] = 0.25
                     final_lgbm_params['gamma'] = 2.0
                     final_lgbm_params['class_weight'] = None
@@ -1353,44 +1352,6 @@ def main(config_path):
                     # The warning in XGBoostMetaLearner about X_val/y_val not provided for early stopping applies.
                     pass  # No explicit split here for X_meta_val_optuna
 
-                # Use fixed scale_pos_weight from config if provided, otherwise XGBoost default (or None)
-                # The meta_config['model_specific_params'] should ideally already contain scale_pos_weight if set in YAML
-                current_meta_params = meta_config.get('model_specific_params', {}).copy()
-
-                # If scale_pos_weight is explicitly in meta_config (e.g. at the same level as 'depth')
-                # and not in model_specific_params, add it to current_meta_params.
-                # The YAML structure has it inside meta_learner_xgb_params, so it should be in model_specific_params.
-                # Let's ensure it's logged if used.
-                # User Request: Ensure scale_pos_weight = 2 for XGBoost meta-learner
-                if 'scale_pos_weight' not in current_meta_params:
-                    logger.info(
-                        f"Outer Fold {outer_fold_idx + 1}: 'scale_pos_weight' not found in meta_config's model_specific_params. Setting to 2 as per requirement.")
-                    current_meta_params['scale_pos_weight'] = 2
-                elif current_meta_params['scale_pos_weight'] != 2:
-                    logger.warning(
-                        f"Outer Fold {outer_fold_idx + 1}: 'scale_pos_weight' in meta_config's model_specific_params is {current_meta_params['scale_pos_weight']}. Overriding to 2 as per requirement.")
-                    current_meta_params['scale_pos_weight'] = 2
-                else:  # It's present and already 2
-                    logger.info(
-                        f"Outer Fold {outer_fold_idx + 1}: Using 'scale_pos_weight': {current_meta_params['scale_pos_weight']} from meta_config for XGBoost meta-learner (matches requirement).")
-
-                # Ensure 'objective' is appropriate for binary classification if scale_pos_weight is used.
-                # scale_pos_weight is typically for binary classification.
-                if num_classes == 2 and current_meta_params.get('objective', '').startswith('multi:'):
-                    logger.info(
-                        f"Outer Fold {outer_fold_idx + 1}: num_classes is 2 and scale_pos_weight is used. Changing XGBoost objective from {current_meta_params.get('objective')} to 'binary:logistic'.")
-                    current_meta_params['objective'] = 'binary:logistic'
-                    if 'eval_metric' not in current_meta_params or current_meta_params.get('eval_metric') == 'mlogloss':
-                        current_meta_params['eval_metric'] = ['logloss']  # Common eval metric for binary
-                elif num_classes != 2 and 'scale_pos_weight' in current_meta_params:
-                    logger.warning(
-                        f"Outer Fold {outer_fold_idx + 1}: scale_pos_weight is set for XGBoost meta-learner, but num_classes is {num_classes} (not 2). scale_pos_weight might not be effective or intended for multiclass scenarios with this XGBoost setup.")
-
-                xgb_meta_model_outer = XGBoostMetaLearner(
-                    params=current_meta_params,  # This now includes the enforced scale_pos_weight=2
-                    depth=meta_config.get('depth', 3)
-                )
-
                 xgb_meta_model_outer.train(
                     X_meta_train_outer, y_meta_train_outer,
                     X_val=None,
@@ -1441,7 +1402,7 @@ def main(config_path):
                         class_mapping=class_mapping,
                         positive_label_name='Death'
                     )
-                    all_best_thresholds_fold_list.append(best_threshold_fold_meta)
+                    thr_dict[outer_fold_idx] = best_threshold_fold_meta
                     all_f1_at_best_thr_meta_list.append(f1_at_best_threshold_meta)  # Store this F1
                     logger.info(
                         f"Outer Fold {outer_fold_idx + 1} Meta-Learner: Best F1 threshold for 'Death' = {best_threshold_fold_meta:.4f} (yields F1 = {f1_at_best_threshold_meta:.4f})")
@@ -1659,6 +1620,18 @@ def main(config_path):
                     final_preds_soft_vote_proba_outer = final_preds_soft_vote_proba_outer / row_sums
 
                     final_preds_soft_vote_labels_outer = np.argmax(final_preds_soft_vote_proba_outer, axis=1)
+
+                    best_threshold_fold_sv, f1_at_best_threshold_sv = maximise_f1_threshold(
+                        y_true=y_outer_test,
+                        y_probas=final_preds_soft_vote_proba_outer,
+                        target_label_value=death_label_value,
+                        class_mapping=class_mapping,
+                        positive_label_name='Death'
+                    )
+
+                    death_class_idx = class_mapping['Death']
+                    final_preds_soft_vote_labels_outer = (final_preds_soft_vote_proba_outer[:, death_class_idx] > best_threshold_fold_sv).astype(int)
+
                     acc_sv_outer = accuracy_score(y_outer_test, final_preds_soft_vote_labels_outer)
                     f1_sv_outer = f1_score(y_outer_test, final_preds_soft_vote_labels_outer,
                                            average='weighted' if num_classes > 2 else 'binary', zero_division=0)
@@ -1885,56 +1858,31 @@ def main(config_path):
 
             # DTestimation.csv: vector of predicted discharge type (outcomeType)
             # Apply the determined best F1 threshold.
-            final_best_thr_for_csv = 0.5  # Default
-            if all_best_thresholds_fold_list:
-                final_best_thr_for_csv = np.nanmean([thr for thr in all_best_thresholds_fold_list if not np.isnan(thr)])
-                if np.isnan(final_best_thr_for_csv):  # Handles case where all entries were NaN
-                    final_best_thr_for_csv = 0.5
-                    logger.warning(
-                        "All fold-specific best F1 thresholds were NaN. Defaulting DTestimation threshold to 0.5.")
-                wandb.summary["final_best_f1_threshold_for_csv"] = final_best_thr_for_csv
-                logger.info(f"Using final average best F1 threshold for DTestimation.csv: {final_best_thr_for_csv:.4f}")
-            else:
-                logger.warning("No best F1 thresholds recorded from folds. Defaulting DTestimation threshold to 0.5.")
+            # Create a mapping from original index to fold index
+            fold_map = {}
+            for i in range(len(all_test_indices_list)):
+                for j in all_test_indices_list[i]:
+                    fold_map[j] = i
 
-            if 'Death' not in class_mapping:
-                logger.error("'Death' class not in class_mapping. Cannot generate DTestimation.csv correctly.")
-                # Create an empty or default CSV to avoid crashing downstream processes
-                predicted_labels_for_csv = np.full(len(results_df_sorted), class_mapping.get('Survival',
-                                                                                             1))  # Default to survival or a common class
-            elif np.isnan(all_probas_death_meta_flat).all():
-                logger.warning(
-                    "Probabilities for meta-learner (P(Death)) were all NaN. DTestimation.csv will use labels from default model.predict().")
-                predicted_labels_for_csv = results_df_sorted['predicted_outcomeType'].values
-            else:
-                # Predict 'Death' if its probability > final_best_thr_for_csv.
-                # Assumes 'Death' is class_mapping['Death'] (e.g., 0) and 'Survival' is the other class.
-                # The probabilities in all_probas_death_meta_flat are P(Death).
-                # So, if P(Death) > threshold, predict 'Death' (value from class_mapping).
-                # Otherwise, predict 'Survival' (value from class_mapping).
+            # Sort by original index
+            sorted_indices = np.sort(list(fold_map.keys()))
+
+            # Create the prediction vector
+            predicted_labels_for_csv = []
+            for i in sorted_indices:
+                fold_idx = fold_map[i]
+                threshold = thr_dict.get(fold_idx, 0.5)
+
+                # Find the corresponding probability
+                prob_death = all_probas_meta_list[fold_idx][np.where(all_test_indices_list[fold_idx] == i)[0][0]]
+
                 death_val = class_mapping['Death']
-                survival_val = class_mapping.get('Survival')  # Need a robust way to get the other class label
-                if survival_val is None:  # Try to infer survival value if not explicitly 'Survival'
-                    possible_labels = list(class_mapping.values())
-                    if len(possible_labels) == 2:
-                        survival_val = [l for l in possible_labels if l != death_val][0]
-                    else:  # More than 2 classes, or 'Survival' not defined. This is problematic.
-                        logger.error(
-                            "Cannot determine 'Survival' class label for DTestimation.csv. Defaulting non-Death to majority or first alternative.")
-                        # Fallback: predict death vs. not-death (where not-death is the most frequent other class or just the alternative)
-                        # This part needs careful handling if there are >2 classes or unusual mapping.
-                        # For binary 'Death'/'Survival', this should be fine.
-                        # Assuming binary: if not Death, it's the other one.
-                        survival_val = [l for l in class_mapping.values() if l != death_val][0] if len(
-                            set(class_mapping.values())) == 2 else death_val  # Avoid error if only one class
+                survival_val = [l for l in class_mapping.values() if l != death_val][0]
 
-                logger.info(
-                    f"Generating DTestimation.csv using P(Death) and threshold {final_best_thr_for_csv:.4f}. Death label: {death_val}, Survival label: {survival_val}")
-                predicted_labels_for_csv = np.where(
-                    all_probas_death_meta_flat > final_best_thr_for_csv,
-                    death_val,  # Predict 'Death'
-                    survival_val  # Predict 'Survival'
-                )
+                if prob_death > threshold:
+                    predicted_labels_for_csv.append(death_val)
+                else:
+                    predicted_labels_for_csv.append(survival_val)
 
             dt_estimation_df = pd.DataFrame({'predicted_outcome': predicted_labels_for_csv})
             dt_estimation_path = os.path.join(output_dir, "DTestimation.csv")
