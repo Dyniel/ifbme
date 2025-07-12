@@ -119,6 +119,9 @@ class LightGBMModel:
             elif 'metric' not in current_params and is_regression_task:
                 current_params['metric'] = 'l2' # Default for regression
 
+            # If fobj is used, the metric should be binary.
+            current_params['metric'] = 'binary_logloss'
+
         print(f"LightGBM using effective objective: {current_params.get('objective')} and effective metric: {current_params.get('metric')}")
 
         lgb_train = lgb.Dataset(X_train, y_train, categorical_feature=categorical_feature, free_raw_data=False)
