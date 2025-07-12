@@ -171,10 +171,21 @@ def main(args):
 
     # B. Using Soft Voting
     soft_vote_weights = ensemble_config.get('soft_vote_weights', {})
+    soft_vote_weights = ensemble_config.get('soft_vote_weights', {})
     if soft_vote_weights:
         print("\nCombining predictions using Soft Voting...")
+        # Load the thresholds saved during training
+        thresholds_path = predict_config.get('thresholds_path', 'thresholds.joblib')
+        try:
+            thresholds = joblib.load(thresholds_path)
+            best_thr_sv = thresholds.get('sv_best_thr', 0.5)
+            print(f"Loaded soft voting threshold: {best_thr_sv}")
+        except FileNotFoundError:
+            print(f"Thresholds file not found at {thresholds_path}. Using default threshold 0.5 for soft voting.")
+            best_thr_sv = 0.5
+
         # Ensure all base model predictions are available and have same number of samples
-        num_classes_for_vote = config.get('dummy_data_classes',2) # Get from config
+        num_classes_for_vote = config.get('dummy_data_classes', 2)  # Get from config
         all_probas_for_vote = np.zeros((num_samples_to_predict, num_classes_for_vote))
 
         current_total_weight = 0
@@ -183,30 +194,40 @@ def main(args):
         if 'lgbm' in base_model_predictions_proba and 'lgbm' in soft_vote_weights:
             all_probas_for_vote += soft_vote_weights['lgbm'] * base_model_predictions_proba['lgbm']
             current_total_weight += soft_vote_weights['lgbm']
-            valid_models_for_vote +=1
+            valid_models_for_vote += 1
         if 'teco' in base_model_predictions_proba and 'teco' in soft_vote_weights:
             if base_model_predictions_proba['teco'].shape == all_probas_for_vote.shape:
                 all_probas_for_vote += soft_vote_weights['teco'] * base_model_predictions_proba['teco']
                 current_total_weight += soft_vote_weights['teco']
-                valid_models_for_vote +=1
-            else: print(f"TECO predictions shape mismatch for soft vote: {base_model_predictions_proba['teco'].shape}")
+                valid_models_for_vote += 1
+            else:
+                print(f"TECO predictions shape mismatch for soft vote: {base_model_predictions_proba['teco'].shape}")
         if 'stm_gnn' in base_model_predictions_proba and 'stm_gnn' in soft_vote_weights:
             if base_model_predictions_proba['stm_gnn'].shape == all_probas_for_vote.shape:
                 all_probas_for_vote += soft_vote_weights['stm_gnn'] * base_model_predictions_proba['stm_gnn']
                 current_total_weight += soft_vote_weights['stm_gnn']
-                valid_models_for_vote +=1
-            else: print(f"STM-GNN predictions shape mismatch for soft vote: {base_model_predictions_proba['stm_gnn'].shape}")
+                valid_models_for_vote += 1
+            else:
+                print(
+                    f"STM-GNN predictions shape mismatch for soft vote: {base_model_predictions_proba['stm_gnn'].shape}")
 
-        if valid_models_for_vote > 0 : # and abs(current_total_weight - 1.0) < 1e-6 : # Check if weights sum to 1
+        if valid_models_for_vote > 0:  # and abs(current_total_weight - 1.0) < 1e-6 : # Check if weights sum to 1
             # If weights don't sum to 1, they should be normalized if that's the intent.
             # Assuming weights are meant to be used as is, or pre-normalized.
             # final_proba_soft_vote = all_probas_for_vote / current_total_weight # if normalization needed
             final_proba_soft_vote = all_probas_for_vote
-            final_labels_soft_vote = np.argmax(final_proba_soft_vote, axis=1)
+
+            # Assuming 'Death' is class 0 and 'Survival' is class 1
+            death_class_idx = 0
+            survival_class_idx = 1
+
+            final_labels_soft_vote = np.where(final_proba_soft_vote[:, death_class_idx] > best_thr_sv, death_class_idx, survival_class_idx)
+
             print("Soft Voting Final Probabilities:\n", final_proba_soft_vote)
-            print("Soft Voting Final Labels:\n", final_labels_soft_vote)
+            print("Soft Voting Final Labels (with threshold):\n", final_labels_soft_vote)
         else:
-            print("Not enough valid models or weights for soft voting, or weights don't sum to 1 (if that's a requirement).")
+            print(
+                "Not enough valid models or weights for soft voting, or weights don't sum to 1 (if that's a requirement).")
 
     print("\nPrediction script finished.")
 

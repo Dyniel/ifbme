@@ -1402,7 +1402,7 @@ def main(config_path):
                         class_mapping=class_mapping,
                         positive_label_name='Death'
                     )
-                    thr_dict[outer_fold_idx] = best_threshold_fold_meta
+                    thr_dict[f"meta_{outer_fold_idx}"] = best_threshold_fold_meta
                     all_f1_at_best_thr_meta_list.append(f1_at_best_threshold_meta)  # Store this F1
                     logger.info(
                         f"Outer Fold {outer_fold_idx + 1} Meta-Learner: Best F1 threshold for 'Death' = {best_threshold_fold_meta:.4f} (yields F1 = {f1_at_best_threshold_meta:.4f})")
@@ -1628,9 +1628,18 @@ def main(config_path):
                         class_mapping=class_mapping,
                         positive_label_name='Death'
                     )
+                    thr_dict[f"sv_{outer_fold_idx}"] = best_threshold_fold_sv
+                    logger.info(
+                        f"Outer Fold {outer_fold_idx + 1} Soft Vote: Best F1 threshold for 'Death' = {best_threshold_fold_sv:.4f} (yields F1 = {f1_at_best_threshold_sv:.4f})")
+                    wandb.log({
+                        f"outer_fold_{outer_fold_idx + 1}/sv_best_f1_thr_death": best_threshold_fold_sv,
+                        f"outer_fold_{outer_fold_idx + 1}/sv_f1_at_best_thr_death": f1_at_best_threshold_sv,
+                        "outer_fold": outer_fold_idx + 1
+                    })
 
                     death_class_idx = class_mapping['Death']
-                    final_preds_soft_vote_labels_outer = (final_preds_soft_vote_proba_outer[:, death_class_idx] > best_threshold_fold_sv).astype(int)
+                    survival_class_idx = class_mapping.get('Survival', 1 - death_class_idx)
+                    final_preds_soft_vote_labels_outer = np.where(final_preds_soft_vote_proba_outer[:, death_class_idx] > best_threshold_fold_sv, death_class_idx, survival_class_idx)
 
                     acc_sv_outer = accuracy_score(y_outer_test, final_preds_soft_vote_labels_outer)
                     f1_sv_outer = f1_score(y_outer_test, final_preds_soft_vote_labels_outer,
@@ -1871,7 +1880,7 @@ def main(config_path):
             predicted_labels_for_csv = []
             for i in sorted_indices:
                 fold_idx = fold_map[i]
-                threshold = thr_dict.get(fold_idx, 0.5)
+                threshold = thr_dict.get(f"sv_{fold_idx}", 0.5)
 
                 # Find the corresponding probability
                 prob_death = all_probas_meta_list[fold_idx][np.where(all_test_indices_list[fold_idx] == i)[0][0]]
@@ -1909,6 +1918,13 @@ def main(config_path):
     else:
         logger.warning("No test predictions accumulated. Skipping CSV logging for DTestimation and LSestimation.")
     # --- End Process and Log ---
+
+    # Save the thresholds dictionary
+    output_dir = config.get('output_dir', 'outputs')
+    os.makedirs(output_dir, exist_ok=True)
+    thresholds_path = os.path.join(output_dir, "thresholds.joblib")
+    joblib.dump(thr_dict, thresholds_path)
+    logger.info(f"Saved thresholds dictionary to {thresholds_path}")
 
     wandb.finish()
     logger.info("Full Nested Cross-Validation ensemble training run finished successfully.")
