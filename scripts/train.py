@@ -615,6 +615,7 @@ def main(config_path):
                     patient_df_split=X_outer_test_raw_fold_df,  # Raw features for this outer test fold
                     patient_id_col=patient_id_col_name,
                     y_series_split=y_outer_test_fold_series,
+                    global_concept_mappers=global_concept_mappers,
                     target_variable_name=y_full_for_split.name,  # Original target column name
                     label_timestamp_col=gnn_config['data_columns']['label_timestamp_column'],
                     # To identify event time for snapshot
@@ -1056,6 +1057,7 @@ def main(config_path):
                         patient_df_split=X_inner_train_raw_gnn,
                         patient_id_col=patient_id_col_name,
                         y_series_split=y_inner_train_gnn_series,
+                        global_concept_mappers=global_concept_mappers,
                         target_variable_name=y_full_for_split.name,
                         label_timestamp_col=gnn_config['data_columns']['label_timestamp_column'],
                         timestamp_col=gnn_config['data_columns']['event_timestamp_column'],
@@ -1076,6 +1078,7 @@ def main(config_path):
                         patient_df_split=X_inner_val_raw_gnn,
                         patient_id_col=patient_id_col_name,
                         y_series_split=y_inner_val_gnn_series,
+                        global_concept_mappers=global_concept_mappers,
                         # ... other params same as inner_train_graph_dataset ...
                         target_variable_name=y_full_for_split.name,
                         label_timestamp_col=gnn_config['data_columns']['label_timestamp_column'],
