@@ -26,7 +26,10 @@ def get_preprocessor(numerical_cols, categorical_cols, imputation_strategy='medi
 
     numerical_transformers = []
     if imputation_strategy:
-        numerical_transformers.append(('imputer', SimpleImputer(strategy=imputation_strategy)))
+        if imputation_strategy in ['median', 'mean']:
+            numerical_transformers.append(('imputer', SimpleImputer(strategy=imputation_strategy, fill_value=0)))
+        else:
+            numerical_transformers.append(('imputer', SimpleImputer(strategy=imputation_strategy)))
     if scale_numerics:
         numerical_transformers.append(('scaler', StandardScaler()))
 
