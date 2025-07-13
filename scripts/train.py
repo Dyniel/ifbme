@@ -1241,6 +1241,7 @@ def main(config_path):
                 y_los_outer_train_cleaned_orig_scale = y_los_outer_train_raw[valid_los_train_indices]
 
                 # Apply log1p transformation to the LoS target for training
+                y_los_outer_train_cleaned_orig_scale = np.maximum(0, y_los_outer_train_cleaned_orig_scale)
                 y_los_outer_train_transformed = np.log1p(y_los_outer_train_cleaned_orig_scale)
 
                 logger.info(
