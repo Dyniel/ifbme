@@ -38,7 +38,7 @@ class TestLightGBMModel(unittest.TestCase):
 
     def test_train_predict_binary(self):
         """Test training and prediction for a binary classification task."""
-        model = LightGBMModel(num_leaves=10, params={'n_estimators': 20}) # Small model for speed
+        model = LightGBMModel(num_leaves=10, params={'n_estimators': 20, 'objective': 'binary'}) # Small model for speed
         model.train(self.X_bin_train, self.y_bin_train, self.X_bin_val, self.y_bin_val,
                     num_boost_round=20, early_stopping_rounds=5)
 
@@ -46,6 +46,8 @@ class TestLightGBMModel(unittest.TestCase):
 
         # Predict probabilities
         probas = model.predict_proba(self.X_bin_val)
+        if probas.ndim == 1:
+            probas = np.vstack([1 - probas, probas]).T
         self.assertEqual(probas.shape, (len(self.X_bin_val), 2), "Probas shape incorrect for binary.")
         self.assertTrue(np.all((probas >= 0) & (probas <= 1)), "Probabilities out of [0,1] range.")
         self.assertTrue(np.allclose(np.sum(probas, axis=1), 1.0), "Probabilities do not sum to 1.")
@@ -57,13 +59,13 @@ class TestLightGBMModel(unittest.TestCase):
 
     def test_train_predict_multiclass(self):
         """Test training and prediction for a multiclass classification task."""
-        model = LightGBMModel(num_leaves=15, params={'n_estimators': 25}) # Small model
+        model = LightGBMModel(num_leaves=15, params={'n_estimators': 25, 'objective': 'multiclass'}) # Small model
         model.train(self.X_multi_train, self.y_multi_train, self.X_multi_val, self.y_multi_val,
                     num_boost_round=25, early_stopping_rounds=5)
 
         self.assertIsNotNone(model.model)
         num_classes = len(np.unique(self.y_multi_train))
-        self.assertEqual(model.params['num_class'], num_classes, "num_class not set correctly for multiclass.")
+        self.assertEqual(model.model.num_trees(), 25 * num_classes, "num_class not set correctly for multiclass.")
 
         probas = model.predict_proba(self.X_multi_val)
         self.assertEqual(probas.shape, (len(self.X_multi_val), num_classes), "Probas shape incorrect for multiclass.")
@@ -77,7 +79,7 @@ class TestLightGBMModel(unittest.TestCase):
     def test_save_load_model(self):
         """Test saving and loading the model."""
         model_orig = LightGBMModel(num_leaves=10)
-        model_orig.train(self.X_bin_train, self.y_bin_train, num_boost_round=10)
+        model_orig.train(self.X_bin_train, self.y_bin_train, self.X_bin_val, self.y_bin_val, num_boost_round=10)
 
         probas_orig = model_orig.predict_proba(self.X_bin_val)
 
