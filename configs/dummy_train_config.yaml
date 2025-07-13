@@ -62,7 +62,7 @@ ensemble:
 
   train_lgbm: true
   train_teco: true
-  train_gnn: false # Keeping GNN Disabled for now to manage complexity
+  train_gnn: true # Keeping GNN Disabled for now to manage complexity
   train_meta_learner: true
 
   lgbm_params:
@@ -151,7 +151,7 @@ wandb:
 
 # --- Text Embedding Generation (Optional) ---
 text_embedding_params:
-  enabled: false # Set to true to enable this feature
+  enabled: true # Set to true to enable this feature
   text_column: "text_notes" # Name of the column containing clinical notes
   model_name: "emilyalsentzer/Bio_ClinicalBERT" # Or other Hugging Face model
   pooling_strategy: "cls" # "cls" or "mean"
@@ -160,7 +160,7 @@ text_embedding_params:
 
 # --- Ontology Embedding Generation (Optional) ---
 ontology_embedding_params:
-  enabled: false # Set to true to enable this feature
+  enabled: true # Set to true to enable this feature
   # Path to pre-trained embeddings. If null, will train from scratch.
   pretrained_path: null # "path/to/your/ontology_embeddings.npz"
   # Path to save newly trained embeddings.
