@@ -192,5 +192,3 @@ if __name__ == '__main__':
         print(f"Error: Expected None or empty array for empty list, got shape {empty_embeddings.shape}")
 
     print("\n--- Example Finished ---")
-
-```

@@ -7,7 +7,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 import time
 import argparse
-import traceback as traceback
+import traceback
 import yaml
 import wandb
 import torch
@@ -21,7 +21,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import optuna  # Import Optuna
 import joblib
-import traceback
 
 # Project-specific imports
 from data_utils.balancing import RSMOTE
@@ -157,7 +156,8 @@ def main(config_path):
     gnn_config = config.get('ensemble', {}).get('gnn_params', {})
     train_gnn = config.get('ensemble', {}).get('train_gnn', False)
     global_concept_mappers = None
-    patient_id_col_name_for_gnn = config.get('patient_id_column')  # Get from top-level config
+    patient_id_col_name_for_gnn = config.get('patient_id_column')
+    patient_id_col_name = config.get('patient_id_column')
 
     if train_gnn:
         # Generate 'graph_instance_id' if specified in config, or use existing patient_id_column
