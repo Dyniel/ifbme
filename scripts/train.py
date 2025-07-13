@@ -1235,6 +1235,7 @@ def main(config_path):
 
             # Ensure no NaN values in target for LoS training
             valid_los_train_indices = ~np.isnan(y_los_outer_train_raw)
+            logger.info(f"Outer Fold {outer_fold_idx + 1}: Found {np.sum(valid_los_train_indices)} non-NaN LoS samples out of {len(y_los_outer_train_raw)} for training.")
 
             if np.sum(valid_los_train_indices) > 0:
                 X_los_train_fold_processed = X_outer_train_processed[valid_los_train_indices]
@@ -1394,13 +1395,17 @@ def main(config_path):
             else:
                 logger.warning(
                     f"Outer Fold {outer_fold_idx + 1}: No valid LoS data to train LoS regressor after NaN removal. LSscore will be 10.")
-                outer_fold_los_metrics['mae_los'].append(np.nan)
-                outer_fold_los_metrics['ls_score'].append(10.0)
+                mae_los_outer = np.nan
+                ls_score_outer = ls_score_calc(mae_los_outer)
+                outer_fold_los_metrics['mae_los'].append(mae_los_outer)
+                outer_fold_los_metrics['ls_score'].append(ls_score_outer)
         else:
             logger.warning(
                 f"Outer Fold {outer_fold_idx + 1}: '{los_column_name}' not found in raw data. Skipping LoS regression. LSscore will be 10.")
-            outer_fold_los_metrics['mae_los'].append(np.nan)
-            outer_fold_los_metrics['ls_score'].append(10.0)
+            mae_los_outer = np.nan
+            ls_score_outer = ls_score_calc(mae_los_outer)
+            outer_fold_los_metrics['mae_los'].append(mae_los_outer)
+            outer_fold_los_metrics['ls_score'].append(ls_score_outer)
 
         all_predicted_los_list.append(predicted_los_outer_test)
         # --- End Length of Stay (LoS) Regression ---
