@@ -20,7 +20,7 @@ def ls_score_calc(mae_los_score: float) -> float:
     LSscore = min(10, MAE_LS)
     A lower LSscore is better. Perfect score is 0, capped at 10.
     """
-    if np.isnan(mae_los_score):
+    if mae_los_score is None or np.isnan(mae_los_score):
         # If MAE is NaN, it indicates a failure in LoS prediction for the fold.
         return 10.0
     return min(10.0, mae_los_score)
