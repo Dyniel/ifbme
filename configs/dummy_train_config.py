@@ -44,11 +44,30 @@ def get_dummy_config():
         meta_learner_xgb_params:
             num_boost_round: 10
             early_stopping_rounds: 5
+    text_embedding_params:
+        enabled: true
+        text_column: 'text_notes'
+        model_name: 'emilyalsentzer/Bio_ClinicalBERT'
+        pooling_strategy: 'cls'
+        max_length: 512
+        batch_size: 32
+    ontology_embedding_params:
+        enabled: true
+        code_columns: ['icdCode']
+        ontology_data: 'data/ontology.json'
+        node2vec_params:
+            dimensions: 64
+            walk_length: 30
+            num_walks: 200
+            workers: 4
+        save_path: 'outputs/ontology_embeddings.emb'
     optuna:
         lgbm:
-            use_optuna: false
+            use_optuna: true
+            n_trials: 10
         xgboost_meta:
-            use_optuna_for_meta: false
+            use_optuna_for_meta: true
+            n_trials: 10
     balancing:
-        use_rsmote_gan_in_cv: false
+        use_rsmote_gan_in_cv: true
     """)
