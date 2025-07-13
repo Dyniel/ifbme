@@ -67,6 +67,9 @@ class LightGBMModel:
         is_regression_task = any(reg_obj in original_objective_from_init for reg_obj in
                                  ['regression', 'regression_l1', 'regression_l2', 'mae', 'mse', 'huber', 'quantile', 'poisson', 'gamma', 'tweedie'])
 
+        if 'quantile' in original_objective_from_init:
+            current_params.pop('monotone_constraints', None)
+
         if fobj is None:
             if is_regression_task:
                 current_params['objective'] = original_objective_from_init # Explicitly set regression objective
