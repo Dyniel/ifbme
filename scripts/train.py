@@ -230,7 +230,7 @@ def main(config_path):
             if text_col_name and text_col_name in X_full_raw_df.columns:
                 logger.info(f"Processing text embeddings for column: '{text_col_name}'")
 
-                text_data = X_full_raw_df[text_col_name].fillna("").tolist() # Ensure no NaNs
+                text_data = X_full_raw_df[text_col_name].fillna("").tolist()  # Ensure no NaNs
 
                 model_name = text_embed_config.get('model_name', 'emilyalsentzer/Bio_ClinicalBERT')
                 tokenizer, model = get_clinical_bert_model_and_tokenizer(model_name, device=device)
@@ -263,10 +263,12 @@ def main(config_path):
                     logger.info("Updated config's numerical_cols with new text embedding features.")
 
                 else:
-                    logger.error("Text embedding generation failed or returned incorrect shape. Skipping feature addition.")
+                    logger.error(
+                        "Text embedding generation failed or returned incorrect shape. Skipping feature addition.")
 
             else:
-                logger.warning(f"Text embedding column '{text_col_name}' not found in data or not configured. Skipping.")
+                logger.warning(
+                    f"Text embedding column '{text_col_name}' not found in data or not configured. Skipping.")
 
         except ImportError as e:
             logger.error(f"Failed to import text embedding modules. Make sure transformers are installed. Error: {e}")
@@ -303,14 +305,17 @@ def main(config_path):
 
                         if embeddings is not None and embeddings.shape[0] == len(X_full_raw_df):
                             emb_feature_names = [f'ont_emb_{col_name}_{i}' for i in range(embeddings.shape[1])]
-                            embeddings_df = pd.DataFrame(embeddings, columns=emb_feature_names, index=X_full_raw_df.index)
+                            embeddings_df = pd.DataFrame(embeddings, columns=emb_feature_names,
+                                                         index=X_full_raw_df.index)
 
                             X_full_raw_df = pd.concat([X_full_raw_df.drop(columns=[col_name]), embeddings_df], axis=1)
-                            logger.info(f"Successfully added {len(emb_feature_names)} ontology embedding features for '{col_name}'.")
+                            logger.info(
+                                f"Successfully added {len(emb_feature_names)} ontology embedding features for '{col_name}'.")
 
                             # Add new features to numerical_cols in config
                             if 'preprocessing' not in config: config['preprocessing'] = {}
-                            if 'numerical_cols' not in config['preprocessing']: config['preprocessing']['numerical_cols'] = []
+                            if 'numerical_cols' not in config['preprocessing']: config['preprocessing'][
+                                'numerical_cols'] = []
 
                             existing_num_cols = set(config['preprocessing']['numerical_cols'])
                             for emb_col in emb_feature_names:
@@ -323,12 +328,12 @@ def main(config_path):
                         logger.warning(f"Ontology code column '{col_name}' not found in data. Skipping.")
 
         except ImportError as e:
-            logger.error(f"Failed to import ontology embedding modules. Make sure node2vec and networkx are installed. Error: {e}")
+            logger.error(
+                f"Failed to import ontology embedding modules. Make sure node2vec and networkx are installed. Error: {e}")
         except Exception as e:
             logger.error(f"An error occurred during ontology embedding generation: {e}")
     else:
         logger.info("Ontology embedding generation is DISABLED.")
-
 
     # --- Preprocessing Setup (for tabular models like LGBM, TECO) ---
     logger.info("Starting preprocessing setup...")  # This line was indented
@@ -1241,7 +1246,8 @@ def main(config_path):
 
             # Ensure no NaN values in target for LoS training
             valid_los_train_indices = ~np.isnan(y_los_outer_train_raw)
-            logger.info(f"Outer Fold {outer_fold_idx + 1}: Found {np.sum(valid_los_train_indices)} non-NaN LoS samples out of {len(y_los_outer_train_raw)} for training.")
+            logger.info(
+                f"Outer Fold {outer_fold_idx + 1}: Found {np.sum(valid_los_train_indices)} non-NaN LoS samples out of {len(y_los_outer_train_raw)} for training.")
 
             if np.sum(valid_los_train_indices) > 0:
                 X_los_train_fold_processed = X_outer_train_processed[valid_los_train_indices]
@@ -1349,17 +1355,16 @@ def main(config_path):
                         final_los_params['metric'] = 'quantile'
 
                         los_model = LightGBMModel(params=final_los_params)
-                        los_model.train(X_los_train_fold_processed, y_los_outer_train_transformed,
-                                        # Train on full transformed training data for the fold
-                                        early_stopping_rounds=lgbm_los_config.get('early_stopping_rounds_final', 20))
+                        los_model.train(X_los_train_fold_processed, y_los_outer_train_transformed)
+                        # Train on full transformed training data for the fold
+
                     else:
                         if use_optuna_for_los:
                             logger.warning(
                                 f"Outer Fold {outer_fold_idx + 1}: Skipping Optuna for LoS due to insufficient data ({X_los_train_fold_processed.shape[0]} samples). Using base lgbm_los_params.")
-                        los_model.train(X_los_train_fold_processed, y_los_outer_train_transformed,
-                                        # Train on transformed
-                                        early_stopping_rounds=lgbm_los_config.get('early_stopping_rounds_final', 20),
-                                        )
+                        los_model.train(X_los_train_fold_processed, y_los_outer_train_transformed)
+                        # Train on transformed
+
                     predicted_los_transformed = los_model.predict(X_outer_test_processed)
                     logger.info(f"LoS predictions before np.expm1: {predicted_los_transformed[:5]}")
                     predicted_los_outer_test = np.expm1(predicted_los_transformed)
@@ -1568,7 +1573,7 @@ def main(config_path):
                 if death_label_value is not None and final_preds_meta_proba is not None:
                     death_class_idx = class_mapping['Death']
                     final_preds_meta_labels_custom_thr = (
-                                final_preds_meta_proba[:, death_class_idx] > best_threshold_fold).astype(int)
+                            final_preds_meta_proba[:, death_class_idx] > best_threshold_fold).astype(int)
                     # Important: If 'Death' is class 0 and 'Survival' is 1, predictions should be 0 for Death, 1 for Survival.
                     # The line above gives 1 if P(Death) > thr, 0 otherwise. This needs to map back to original labels.
                     # If target_label_value for Death is 0, then:
@@ -1584,16 +1589,16 @@ def main(config_path):
                 # --- End F1 Threshold Maximization ---
 
                 acc = accuracy_score(y_outer_test,
-                                                final_preds_meta_labels)  # Based on default 0.5 threshold
+                                     final_preds_meta_labels)  # Based on default 0.5 threshold
                 f1 = f1_score(y_outer_test, final_preds_meta_labels,  # Based on default 0.5 threshold
-                                         average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+                              average='weighted' if num_classes > 2 else 'binary', zero_division=0)
                 prec = precision_score(y_outer_test, final_preds_meta_labels,
-                                                  # Based on default 0.5 threshold
-                                                  average='weighted' if num_classes > 2 else 'binary',
-                                                  zero_division=0)
+                                       # Based on default 0.5 threshold
+                                       average='weighted' if num_classes > 2 else 'binary',
+                                       zero_division=0)
                 rec = recall_score(y_outer_test, final_preds_meta_labels,
-                                              # Based on default 0.5 threshold
-                                              average='weighted' if num_classes > 2 else 'binary', zero_division=0)
+                                   # Based on default 0.5 threshold
+                                   average='weighted' if num_classes > 2 else 'binary', zero_division=0)
                 auroc = -1.0
                 dt_score = 10.0  # Default to worst score
 
@@ -1603,7 +1608,7 @@ def main(config_path):
                                            final_preds_meta_proba.shape[
                                                1] >= 2 else final_preds_meta_proba
                     auroc = roc_auc_score(y_outer_test, probas_for_auc, multi_class='ovr',
-                                                     average='weighted')
+                                          average='weighted')
                 except ValueError as e:
                     logger.warning(
                         f"Outer Fold {outer_fold_idx + 1} Meta AUROC calc error: {e}. Proba shape: {final_preds_meta_proba.shape if isinstance(final_preds_meta_proba, np.ndarray) else 'N/A'}")
@@ -1618,9 +1623,9 @@ def main(config_path):
                             f"Outer Fold {outer_fold_idx + 1} Meta-Learner: Using F1_Death from maximized threshold ({f1_death_for_dtscore:.4f}) for DTscore.")
                     else:  # Fallback to F1 from default 0.5 threshold if maximization yielded 0 or was skipped
                         f1_death_for_dtscore = f1_score(y_outer_test, final_preds_meta_labels,
-                                                             # Labels from default 0.5
-                                                             labels=[death_label_value], pos_label=death_label_value,
-                                                             average='binary', zero_division=0)
+                                                        # Labels from default 0.5
+                                                        labels=[death_label_value], pos_label=death_label_value,
+                                                        average='binary', zero_division=0)
                         logger.info(
                             f"Outer Fold {outer_fold_idx + 1} Meta-Learner: Using F1_Death from default 0.5 threshold ({f1_death_for_dtscore:.4f}) for DTscore.")
                     dt_score = dt_score_calc(f1_death_for_dtscore)
@@ -1785,7 +1790,9 @@ def main(config_path):
 
                     death_class_idx = class_mapping['Death']
                     survival_class_idx = class_mapping.get('Survival', 1 - death_class_idx)
-                    final_preds_soft_vote_labels_outer = np.where(final_preds_soft_vote_proba_outer[:, death_class_idx] > best_threshold_fold_sv, death_class_idx, survival_class_idx)
+                    final_preds_soft_vote_labels_outer = np.where(
+                        final_preds_soft_vote_proba_outer[:, death_class_idx] > best_threshold_fold_sv, death_class_idx,
+                        survival_class_idx)
 
                     acc_sv_outer = accuracy_score(y_outer_test, final_preds_soft_vote_labels_outer)
                     f1_sv_outer = f1_score(y_outer_test, final_preds_soft_vote_labels_outer,
@@ -1962,7 +1969,8 @@ def main(config_path):
 
         logger.info(f"Length of Stay Regressor Average LSscore: {avg_ls_score:.4f}")
         logger.info(
-            f"Length of Stay Regressor Average MAE: {avg_mae_los:.4f}" if not np.isnan(avg_mae_los) else "Length of Stay Regressor Average MAE: nan")
+            f"Length of Stay Regressor Average MAE: {avg_mae_los:.4f}" if not np.isnan(
+                avg_mae_los) else "Length of Stay Regressor Average MAE: nan")
         wandb.summary["ncv_los_avg_ls_score"] = avg_ls_score
         wandb.summary["ncv_los_avg_mae"] = avg_mae_los if not np.isnan(avg_mae_los) else 'nan'
     else:

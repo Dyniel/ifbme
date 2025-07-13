@@ -241,7 +241,8 @@ class PatientHeteroGraphDataset(Dataset):
                 patient_df_snap = patient_df_snap[patient_df_snap[self.time_rel_col_name] >= history_limit_rel]
 
             if patient_df_snap.empty:
-                print(f"Warning: Patient {patient_id} has no data in the final snapshot window before {snapshot_end_time_rel:.2f} rel_hours. Skipping graph.")
+                # This warning is very noisy, so it's disabled.
+                # print(f"Warning: Patient {patient_id} has no data in the final snapshot window before {snapshot_end_time_rel:.2f} rel_hours. Skipping graph.")
                 continue
 
             graph_data = build_patient_graph(
