@@ -126,6 +126,13 @@ def main(config_path):
             X_full_raw_df[dummy_text_col_name] = np.random.choice(dummy_texts, num_total_samples)
             logger.info(f"Added dummy text column '{dummy_text_col_name}' to dummy data.")
 
+        # Add dummy LoS column if not present
+        los_col_name_dummy = config.get('los_column', 'lengthofStay')
+        if los_col_name_dummy not in X_full_raw_df.columns:
+            # Generate dummy LoS data, e.g., random integers from 1 to 30
+            X_full_raw_df[los_col_name_dummy] = np.random.randint(1, 31, num_total_samples)
+            logger.info(f"Added dummy Length of Stay column '{los_col_name_dummy}' to dummy data.")
+
         logger.info(
             f"Dummy raw data generated: X_df shape {X_full_raw_df.shape}, y_series shape {y_full_raw_series.shape}")
     else:
@@ -1217,7 +1224,8 @@ def main(config_path):
             # --- End GNN Block ---
 
         # --- Length of Stay (LoS) Regression ---
-        los_column_name = 'lengthofStay'  # Make sure this matches the actual column name
+        los_column_name = config.get('los_column',
+                                     'lengthofStay')  # Get LoS column name from config, default to 'lengthofStay'
         predicted_los_outer_test = np.full(len(y_outer_test), np.nan)  # Default to NaN
 
         if los_column_name in X_outer_train_raw_fold_df.columns and los_column_name in X_outer_test_raw_fold_df.columns:
@@ -1659,14 +1667,15 @@ def main(config_path):
                 else:  # Fallback if probas are not available, store NaNs or re-derive from labels if only labels are available
                     all_probas_list.append(np.full(len(y_outer_test), np.nan))
 
-                all_preds_list.append(
+                all_preds_meta_list.append(
                     final_preds_meta_labels)  # Store labels derived from default threshold for metrics
 
                 # Get actual lengthOfStay for these test indices from the original X_full_raw_df
                 # Ensure 'lengthofStay' is a valid column name. From logs, it seems to be.
-                los_column_name = 'lengthofStay'  # As seen in logs
-                if los_column_name in X_full_raw_df.columns:
-                    actual_los_fold = X_full_raw_df.iloc[outer_test_idx][los_column_name].values
+                los_column_name_from_config = config.get('los_column',
+                                                         'lengthofStay')  # Use the same config key as in LoS regression
+                if los_column_name_from_config in X_full_raw_df.columns:
+                    actual_los_fold = X_full_raw_df.iloc[outer_test_idx][los_column_name_from_config].values
                     all_actual_los_list.append(actual_los_fold)
                 else:
                     logger.warning(
@@ -1693,8 +1702,9 @@ def main(config_path):
                 all_test_indices_list.append(outer_test_idx)  # Still log indices
                 all_y_test_list.append(y_outer_test)
                 all_preds_meta_list.append(np.full(len(y_outer_test), np.nan))  # NaN for predictions
-                if 'lengthofStay' in X_full_raw_df.columns:
-                    all_actual_los_list.append(X_full_raw_df.iloc[outer_test_idx]['lengthofStay'].values)
+                los_column_name_fallback = config.get('los_column', 'lengthofStay')
+                if los_column_name_fallback in X_full_raw_df.columns:
+                    all_actual_los_list.append(X_full_raw_df.iloc[outer_test_idx][los_column_name_fallback].values)
                 else:
                     all_actual_los_list.append(np.full(len(y_outer_test), np.nan))
                 if patient_id_col_name_for_gnn and patient_id_col_name_for_gnn in X_full_raw_df.columns:
