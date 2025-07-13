@@ -92,7 +92,10 @@ def load_raw_data(config, base_data_path="data/"):
                 # For this dataset, dates seem to be in multiple formats (e.g. YYYY-MM-DD and DD/MM/YYYY)
                 # So, direct format specification might lead to more NaTs if not careful.
                 # Letting pandas infer, but logging time.
-                X_full[col_name] = pd.to_datetime(X_full[col_name], errors='coerce')
+                if col_name == 'requestDate':
+                    X_full[col_name] = pd.to_datetime(X_full[col_name], dayfirst=True, errors='coerce')
+                else:
+                    X_full[col_name] = pd.to_datetime(X_full[col_name], errors='coerce')
                 X_full[col_name] = (X_full[col_name] - pd.Timestamp("1970-01-01")) // pd.Timedelta('1s')
                 logger.info(f"Converted column '{col_name}' to Unix timestamp. Time: {time.time() - t_col_start:.2f}s")
             except Exception as e:

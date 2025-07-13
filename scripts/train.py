@@ -7,6 +7,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 import time
 import argparse
+import traceback
 import yaml
 import wandb
 import torch
@@ -155,7 +156,8 @@ def main(config_path):
     gnn_config = config.get('ensemble', {}).get('gnn_params', {})
     train_gnn = config.get('ensemble', {}).get('train_gnn', False)
     global_concept_mappers = None
-    patient_id_col_name_for_gnn = config.get('patient_id_column')  # Get from top-level config
+    patient_id_col_name_for_gnn = config.get('patient_id_column')
+    patient_id_col_name = config.get('patient_id_column')
 
     if train_gnn:
         # Generate 'graph_instance_id' if specified in config, or use existing patient_id_column
@@ -612,7 +614,8 @@ def main(config_path):
                                           'gnn_processed_test'),
                     patient_df_split=X_outer_test_raw_fold_df,  # Raw features for this outer test fold
                     patient_id_col=patient_id_col_name,
-                    y_map=y_map_outer_test,  # Map of patient_id to (label, label_timestamp_abs)
+                    y_series_split=y_outer_test_fold_series,
+                    global_concept_mappers=global_concept_mappers,
                     target_variable_name=y_full_for_split.name,  # Original target column name
                     label_timestamp_col=gnn_config['data_columns']['label_timestamp_column'],
                     # To identify event time for snapshot
@@ -1052,7 +1055,9 @@ def main(config_path):
                                               f'fold_{outer_fold_idx + 1}_inner_{inner_fold_idx + 1}',
                                               'gnn_processed_train'),
                         patient_df_split=X_inner_train_raw_gnn,
-                        patient_id_col=patient_id_col_name, y_map=y_map_inner_train_gnn,
+                        patient_id_col=patient_id_col_name,
+                        y_series_split=y_inner_train_gnn_series,
+                        global_concept_mappers=global_concept_mappers,
                         target_variable_name=y_full_for_split.name,
                         label_timestamp_col=gnn_config['data_columns']['label_timestamp_column'],
                         timestamp_col=gnn_config['data_columns']['event_timestamp_column'],
@@ -1071,8 +1076,9 @@ def main(config_path):
                                               f'fold_{outer_fold_idx + 1}_inner_{inner_fold_idx + 1}',
                                               'gnn_processed_val'),
                         patient_df_split=X_inner_val_raw_gnn,
-                        patient_id_col=patient_id_col_name, y_map=y_map_inner_val_gnn,
-                        # ... other params same as inner_train_graph_dataset ...
+                        patient_id_col=patient_id_col_name,
+                        y_series_split=y_inner_val_gnn_series,
+                        global_concept_mappers=global_concept_mappers,
                         target_variable_name=y_full_for_split.name,
                         label_timestamp_col=gnn_config['data_columns']['label_timestamp_column'],
                         timestamp_col=gnn_config['data_columns']['event_timestamp_column'],
