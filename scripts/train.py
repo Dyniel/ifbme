@@ -474,6 +474,8 @@ def main(config_path):
     all_probas_meta_list = []  # For DTestimation.csv (predicted probabilities for 'Death' class, to allow custom thresholding later)
     all_actual_los_list = []  # For LSestimation.csv (actual lengthOfStay)
     all_predicted_los_list = []  # For LSestimation.csv (predicted lengthOfStay)
+    all_probas_list = []
+    all_best_thresholds_fold_list = []
     # If patient IDs are consistently available and aligned with X_full_raw_df.index:
     all_patient_ids_list = []
     thr_dict = {}  # For storing best F1 threshold from each fold
@@ -1349,38 +1351,37 @@ def main(config_path):
                     predicted_los_outer_test = np.maximum(0,
                                                           predicted_los_outer_test)  # Ensure non-negativity after transform
 
-                    valid_los_indices_for_mae = ~np.isnan(y_los_outer_test_actual_orig_scale) & ~np.isnan(
-                        predicted_los_outer_test)
-                    if np.sum(valid_los_indices_for_mae) > 0:
-                        mae_los_outer = mean_absolute_error(
-                            y_los_outer_test_actual_orig_scale[valid_los_indices_for_mae],
-                            predicted_los_outer_test[valid_los_indices_for_mae]
-                        )
-                    else:
-                        logger.warning(
-                            f"Outer Fold {outer_fold_idx + 1}: No valid (non-NaN) actual/predicted LoS pairs for MAE calculation. MAE set to NaN.")
-                        mae_los_outer = np.nan
-
-                    if np.isnan(mae_los_outer):
-                        logger.warning(f"Outer Fold {outer_fold_idx + 1}: MAE for LoS is NaN. Setting LSscore to 10.")
-                        ls_score_outer = ls_score_calc(np.nan)
-                    else:
-                        ls_score_outer = ls_score_calc(mae_los_outer)
-
-                    outer_fold_los_metrics['mae_los'].append(mae_los_outer)
-                    outer_fold_los_metrics['ls_score'].append(ls_score_outer)
-                    wandb.log({
-                        f"outer_fold_{outer_fold_idx + 1}/ls_score": ls_score_outer,
-                        f"outer_fold_{outer_fold_idx + 1}/mae_los": mae_los_outer,
-                        "outer_fold": outer_fold_idx + 1
-                    })
-                    logger.info(
-                        f"Outer Fold {outer_fold_idx + 1} LoS Regressor: MAE={mae_los_outer:.4f}, LSscore={ls_score_outer:.4f}")
-
                 except Exception as e_los:
                     logger.error(f"Outer Fold {outer_fold_idx + 1}: Error during LoS Regression: {e_los}")
-                    outer_fold_los_metrics['mae_los'].append(np.nan)
-                    outer_fold_los_metrics['ls_score'].append(10.0)  # Worst score
+                    # Fallback for predicted_los_outer_test if error occurred
+                    predicted_los_outer_test = np.full(len(y_outer_test), np.nan)
+
+                # This block should be outside the try-except for LoS model training
+                # It calculates metrics based on whatever predicted_los_outer_test holds (either predictions or NaNs)
+                valid_los_indices_for_mae = ~np.isnan(y_los_outer_test_actual_orig_scale) & ~np.isnan(
+                    predicted_los_outer_test)
+
+                if np.sum(valid_los_indices_for_mae) > 0:
+                    mae_los_outer = mean_absolute_error(
+                        y_los_outer_test_actual_orig_scale[valid_los_indices_for_mae],
+                        predicted_los_outer_test[valid_los_indices_for_mae]
+                    )
+                else:
+                    logger.warning(
+                        f"Outer Fold {outer_fold_idx + 1}: No valid (non-NaN) actual/predicted LoS pairs for MAE calculation. MAE set to NaN.")
+                    mae_los_outer = np.nan
+
+                ls_score_outer = ls_score_calc(mae_los_outer)  # ls_score_calc handles NaN MAE
+
+                outer_fold_los_metrics['mae_los'].append(mae_los_outer)
+                outer_fold_los_metrics['ls_score'].append(ls_score_outer)
+                wandb.log({
+                    f"outer_fold_{outer_fold_idx + 1}/ls_score": ls_score_outer,
+                    f"outer_fold_{outer_fold_idx + 1}/mae_los": mae_los_outer,
+                    "outer_fold": outer_fold_idx + 1
+                })
+                logger.info(
+                    f"Outer Fold {outer_fold_idx + 1} LoS Regressor: MAE={mae_los_outer if not np.isnan(mae_los_outer) else 'NaN'}, LSscore={ls_score_outer:.4f}")
             else:
                 logger.warning(
                     f"Outer Fold {outer_fold_idx + 1}: No valid LoS data to train LoS regressor after NaN removal. LSscore will be 10.")
@@ -1933,17 +1934,19 @@ def main(config_path):
                 wandb.summary["ncv_sv_std_auroc"] = np.nan
 
     # --- Log LoS NCV Summary ---
-    if any(not np.isnan(v) for v in outer_fold_los_metrics['ls_score']):
+    if outer_fold_los_metrics['ls_score']:  # Check if the list is not empty
         avg_ls_score = np.nanmean(outer_fold_los_metrics['ls_score'])
-        avg_mae_los = np.nanmean(outer_fold_los_metrics['mae_los'])
+        avg_mae_los = np.nanmean(outer_fold_los_metrics['mae_los'])  # np.nanmean is safe for lists with NaNs
+
         logger.info(f"Length of Stay Regressor Average LSscore: {avg_ls_score:.4f}")
-        logger.info(f"Length of Stay Regressor Average MAE: {avg_mae_los:.4f}")
+        logger.info(
+            f"Length of Stay Regressor Average MAE: {avg_mae_los:.4f}" if not np.isnan(avg_mae_los) else "Length of Stay Regressor Average MAE: nan")
         wandb.summary["ncv_los_avg_ls_score"] = avg_ls_score
-        wandb.summary["ncv_los_avg_mae"] = avg_mae_los
+        wandb.summary["ncv_los_avg_mae"] = avg_mae_los if not np.isnan(avg_mae_los) else 'nan'
     else:
-        logger.info("LoS metrics (LSscore, MAE) not computed or all NaN.")
-        wandb.summary["ncv_los_avg_ls_score"] = np.nan
-        wandb.summary["ncv_los_avg_mae"] = np.nan
+        logger.info("LoS metrics (LSscore, MAE) not computed as no LoS data was available across folds.")
+        wandb.summary["ncv_los_avg_ls_score"] = 10.0  # Worst score
+        wandb.summary["ncv_los_avg_mae"] = 'nan'
 
     # --- Process and Log Accumulated Predictions ---
     if all_test_indices_list:

@@ -70,6 +70,10 @@ class LightGBMModel:
         if 'quantile' in original_objective_from_init:
             current_params.pop('monotone_constraints', None)
 
+        if 'quantile' in original_objective_from_init and 'monotone_constraints' in current_params:
+            del current_params['monotone_constraints']
+            print("[INFO] LightGBMModel.train() - Removed 'monotone_constraints' for quantile regression.")
+
         if fobj is None:
             if is_regression_task:
                 current_params['objective'] = original_objective_from_init # Explicitly set regression objective

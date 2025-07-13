@@ -133,7 +133,7 @@ ensemble:
     depth: 3
     num_boost_round: 100      # Increased for comprehensive evaluation
     early_stopping_rounds: 15 # Increased for comprehensive evaluation
-    scale_pos_weight: 2.5     # Fixed value for cost-sensitive learning
+    scale_pos_weight: 2     # Fixed value for cost-sensitive learning
     save_path: 'models_output/meta_learner_xgb_ncv_trained.joblib'
 
   soft_vote_weights:
