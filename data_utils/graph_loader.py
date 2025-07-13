@@ -108,8 +108,8 @@ class PatientHeteroGraphDataset(Dataset):
 
         # Pre-calculate relative time for the current split
         # Convert timestamp columns to datetime
-        self.patient_df_split[self.timestamp_col] = pd.to_datetime(self.patient_df_split[self.timestamp_col], errors='coerce')
-        self.patient_df_split[self.admission_timestamp_col] = pd.to_datetime(self.patient_df_split[self.admission_timestamp_col], errors='coerce')
+        self.patient_df_split[self.timestamp_col] = pd.to_datetime(self.patient_df_split[self.timestamp_col], unit='s', errors='coerce')
+        self.patient_df_split[self.admission_timestamp_col] = pd.to_datetime(self.patient_df_split[self.admission_timestamp_col], unit='s', errors='coerce')
 
         # Drop rows where essential timestamps are NaT after conversion
         self.patient_df_split.dropna(subset=[self.timestamp_col, self.admission_timestamp_col], inplace=True)
