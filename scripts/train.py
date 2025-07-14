@@ -1427,8 +1427,6 @@ def main(config_path):
             oof_preds_inner['lgbm'])
         if config.get('ensemble', {}).get('train_teco', True): meta_features_train_outer_list.append(
             oof_preds_inner['teco'])
-        if train_gnn:  # Add GNN OOF preds if GNN was trained
-            meta_features_train_outer_list.append(oof_preds_inner['gnn'])
 
         if not meta_features_train_outer_list:
             logger.error(
@@ -1519,8 +1517,6 @@ def main(config_path):
                     base_model_preds_on_outer_test_sum['lgbm'])
                 if config.get('ensemble', {}).get('train_teco', True): meta_features_test_outer_list.append(
                     base_model_preds_on_outer_test_sum['teco'])
-                if train_gnn:  # Add GNN test preds if GNN was trained
-                    meta_features_test_outer_list.append(base_model_preds_on_outer_test_sum['gnn'])
 
                 if not meta_features_test_outer_list:  # Should not happen if train_meta_learner is true and at least one base model ran
                     logger.error(
@@ -1733,8 +1729,6 @@ def main(config_path):
 
         # Determine active models for soft voting, now potentially including GNN
         potential_sv_models = ['lgbm', 'teco']
-        if train_gnn:
-            potential_sv_models.append('gnn')
 
         active_models_for_sv = [model_key for model_key in potential_sv_models
                                 if config.get('ensemble', {}).get(f'train_{model_key}', True) and \
