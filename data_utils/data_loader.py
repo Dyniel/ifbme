@@ -2,6 +2,7 @@ import pandas as pd
 import os
 import logging
 import time # Added for timing
+from features.trend_features import make_trends
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,23 @@ def load_raw_data(config, base_data_path="data/"):
         df_full = df_train
         logger.info(f"Using only training data as full data (validation data not loaded/found). Time: {time.time() - t0:.2f}s")
 
+    # --- Column Renaming ---
+    column_mapping = {
+        'blodPressure': 'sbp', # Simplified mapping, assuming this represents systolic blood pressure
+        'hematocrit': 'hematocrit',
+        'hemoglobin': 'hemoglobin',
+        'leucocitos': 'leukocytes',
+        'lymphocytes': 'lymphocytes',
+        'urea': 'urea',
+        'creatinine': 'creatinine',
+        'platelets': 'platelets',
+        'diuresis': 'diuresis',
+        'patientGender': 'gender',
+    }
+    df_full.rename(columns=column_mapping, inplace=True)
+    # Note: 'heart_rate' and other specific vitals are not in the provided CSV columns.
+    # This will be handled by the trend feature generation logic which will only use available columns.
+
     logger.info(f"Available columns in the loaded DataFrame (df_full): {df_full.columns.tolist()}")
     # ---- END DEBUG PRINT ----
 
@@ -105,8 +123,45 @@ def load_raw_data(config, base_data_path="data/"):
     logger.info(f"Finished date column conversions. Total time: {time.time() - date_conversion_start_time:.2f}s")
     # --- End Date Column Conversion ---
 
+    # --- Feature Engineering: Trend Features ---
+    X_full = get_vitals_trends(X_full)
+
     logger.info(f"Data loading and initial date conversion complete. X_full shape: {X_full.shape}, y_full shape: {y_full.shape}. Total time: {time.time() - overall_start_time:.2f}s")
     return X_full, y_full # Return DataFrames
+
+def get_vitals_trends(df):
+    """
+    Adds trend features for vital signs to the dataframe.
+    """
+    # Define columns for which to generate trend features
+    trend_value_cols = [
+        'heart_rate', 'sbp', 'dbp', 'mbp', 'resp_rate', 'temperature', 'spo2', 'glucose'
+    ]
+    # Filter to only include columns present in the dataframe
+    trend_value_cols = [col for col in trend_value_cols if col in df.columns]
+
+    if trend_value_cols:
+        if 'admissionDate' in df.columns:
+            df['time_col'] = pd.to_datetime(df['admissionDate'])
+            df['time_col'] = (df['time_col'] - df['time_col'].min()).dt.total_seconds() / 3600
+        else:
+            df['time_col'] = df.index
+
+        # Assuming 'patient_id' is not available, using index as a proxy for unique stays
+        if 'patientId' not in df.columns:
+            df['patientId'] = df.index
+
+        df = make_trends(
+            df=df,
+            id_col='patientId',
+            time_col='time_col',
+            value_cols=trend_value_cols,
+            windows=[12, 24, 48]
+        )
+        # Drop original raw columns used for trends and the temporary time/id columns
+        cols_to_drop = trend_value_cols + ['time_col']
+        df = df.drop(columns=[col for col in cols_to_drop if col in df.columns])
+    return df
 
 # Example usage (conceptual, would be in train.py)
 # if __name__ == '__main__':
