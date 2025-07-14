@@ -1355,15 +1355,18 @@ def main(config_path):
                         final_los_params['metric'] = 'quantile'
 
                         los_model = LightGBMModel(params=final_los_params)
-                        los_model.train(X_los_train_fold_processed, y_los_outer_train_transformed)
-                        # Train on full transformed training data for the fold
+                        # Train on full transformed training data for the fold, no early stopping here
+                        los_model.train(X_los_train_fold_processed, y_los_outer_train_transformed, early_stopping_rounds=0)
+
 
                     else:
                         if use_optuna_for_los:
                             logger.warning(
                                 f"Outer Fold {outer_fold_idx + 1}: Skipping Optuna for LoS due to insufficient data ({X_los_train_fold_processed.shape[0]} samples). Using base lgbm_los_params.")
-                        los_model.train(X_los_train_fold_processed, y_los_outer_train_transformed)
-                        # Train on transformed
+                        # When not using Optuna, we train on the full available LoS training data.
+                        # Early stopping is not used here to prevent needing a separate validation split,
+                        # consistent with the logic for the Optuna-tuned model which is also trained on the full set at the end.
+                        los_model.train(X_los_train_fold_processed, y_los_outer_train_transformed, early_stopping_rounds=0)
 
                     predicted_los_transformed = los_model.predict(X_outer_test_processed)
                     logger.info(f"LoS predictions before np.expm1: {predicted_los_transformed[:5]}")

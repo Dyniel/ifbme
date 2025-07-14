@@ -5,6 +5,9 @@ data_dir: 'data/'
 output_dir: 'outputs/'
 los_column: 'LengthOfStay'
 
+data_paths:
+  target_column: 'outcomeType'
+
 # Preprocessing settings
 preprocessing:
   numerical_cols:

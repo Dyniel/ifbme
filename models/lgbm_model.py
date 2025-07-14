@@ -134,13 +134,9 @@ class LightGBMModel:
         lgb_train = lgb.Dataset(X_train, y_train, categorical_feature=categorical_feature, free_raw_data=False)
 
         callbacks = []
-        if early_stopping_rounds > 0:
-            # verbose=True is more informative than just 1
-            callbacks.append(lgb.early_stopping(stopping_rounds=early_stopping_rounds, verbose=True))
-
         evals_result = {} # To store training progress
-        callbacks.append(lgb.record_evaluation(evals_result)) # Correct way to use evals_result
-        callbacks.append(lgb.log_evaluation(period=100)) # Log every 100 rounds
+        callbacks.append(lgb.record_evaluation(evals_result))
+        callbacks.append(lgb.log_evaluation(period=100))
 
         valid_sets = [lgb_train]
         valid_names = ['train']
@@ -149,9 +145,13 @@ class LightGBMModel:
                                   categorical_feature=categorical_feature, free_raw_data=False)
             valid_sets.append(lgb_val)
             valid_names.append('valid')
-        # Ensure that if early stopping is on, there is a validation set.
+            if early_stopping_rounds > 0:
+                callbacks.append(lgb.early_stopping(stopping_rounds=early_stopping_rounds, verbose=True))
         elif early_stopping_rounds > 0:
-            raise ValueError("For early stopping, a validation set (X_val, y_val) must be provided.")
+            # If early stopping is desired but no validation set is provided,
+            # we can't proceed with early stopping. We'll just train for num_boost_round.
+            # A warning could be logged here.
+            print("[WARNING] LightGBMModel.train() - early_stopping_rounds > 0 but no validation set was provided. Training for full num_boost_round.")
 
 
         self.model = lgb.train(
@@ -159,9 +159,7 @@ class LightGBMModel:
             lgb_train,
             num_boost_round=num_boost_round,
             valid_sets=valid_sets,
-            # valid_names is deprecated and will be removed in a future version.
-            # Use valid_sets instead.
-            # valid_names=valid_names,
+            # valid_names=valid_names, # Deprecated
             callbacks=callbacks
         )
 
