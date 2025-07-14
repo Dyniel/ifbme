@@ -496,9 +496,9 @@ def main(config_path):
     thr_dict = {}  # For storing best F1 threshold from each fold
     all_f1_at_best_thr_meta_list = []  # For storing F1 score at best threshold for meta-learner from each fold
 
-    # For collecting OOF predictions for the final meta-learner
-    all_oof_preds_list = []
-    all_oof_y_list = []
+    # OOF predictions for final meta-learner training
+    oof_preds_for_meta_lgbm = np.zeros((len(X_full_raw_df), num_classes))
+    oof_preds_for_meta_teco = np.zeros((len(X_full_raw_df), num_classes))
 
 
     X_full_for_split = X_full_raw_df
@@ -1446,13 +1446,14 @@ def main(config_path):
 
         X_meta_train_outer = np.concatenate(meta_features_train_outer_list, axis=1)
         y_meta_train_outer = y_outer_train
-
-        # Collect OOF predictions and labels for final meta-learner training
-        all_oof_preds_list.append(X_meta_train_outer)
-        all_oof_y_list.append(y_meta_train_outer)
-
         logger.info(
             f"Outer Fold {outer_fold_idx + 1}: Meta-learner training features shape: {X_meta_train_outer.shape}")
+
+        # Store OOF predictions from this fold for the final meta-learner
+        if config.get('ensemble', {}).get('train_lgbm', True):
+            oof_preds_for_meta_lgbm[outer_test_idx] = base_model_preds_on_outer_test_sum['lgbm']
+        if config.get('ensemble', {}).get('train_teco', True):
+            oof_preds_for_meta_teco[outer_test_idx] = base_model_preds_on_outer_test_sum['teco']
 
         if config.get('ensemble', {}).get('train_meta_learner', True):
             logger.info(f"Outer Fold {outer_fold_idx + 1}: Training XGBoost Meta-Learner...")
@@ -2102,76 +2103,58 @@ def main(config_path):
     X_full_processed = final_preprocessor.fit_transform(X_full_raw_df)
     y_full_encoded = y_full_for_split.to_numpy()
 
-    try:
-        final_processed_feature_names = final_preprocessor.get_feature_names_out()
-    except Exception:
-        num_processed_features = X_full_processed.shape[1]
-        final_processed_feature_names = [f'proc_feat_{i}' for i in range(num_processed_features)]
-
     # 2. Final Base Models
     final_base_models = {}
-
-    # Final LGBM
     if config.get('ensemble', {}).get('train_lgbm', True):
         logger.info("Training final LightGBM model on all data...")
         lgbm_config = config.get('ensemble', {}).get('lgbm_params', {})
-        # Using best params from the first fold's Optuna study as a proxy
-        # A more robust approach could average params or run Optuna on the full dataset
-        # For now, we'll just retrain with fixed params for simplicity
         final_lgbm_params = {
-            'random_state': seed,
-            'n_jobs': -1,
-            'verbose': -1,
+            'random_state': seed, 'n_jobs': -1, 'verbose': -1,
             'n_estimators': lgbm_config.get('num_boost_round', 1000),
-            'learning_rate': 0.05, # Example fixed value
-            'num_leaves': 31,      # Example fixed value
+            'learning_rate': 0.05, 'num_leaves': 31,
         }
         if num_classes > 2:
             final_lgbm_params['num_class'] = num_classes
 
         fobj_final = FocalLossLGB(alpha=0.25, gamma=2.0)
         final_lgbm_model = LightGBMModel(params=final_lgbm_params)
-        # No validation set for final training, so no early stopping
         final_lgbm_model.train(X_full_processed, y_full_encoded, fobj=fobj_final)
         final_base_models['lgbm'] = final_lgbm_model
         logger.info("Final LightGBM model trained.")
 
-    # Final TECO (conceptual, as it requires more setup)
     if config.get('ensemble', {}).get('train_teco', True):
-        logger.warning("Final TECO model training is not fully implemented in this script. A placeholder will be used.")
-        # In a real scenario, you would train TECO on the full dataset here.
-        # For now, we'll store a placeholder or the model from the last fold.
-        # This is a significant simplification.
-        final_base_models['teco'] = None # Placeholder
-
+        logger.warning("Final TECO model training is not fully implemented. Placeholder will be used.")
+        final_base_models['teco'] = None
 
     # 3. Final Meta-Learner
-    # The meta-learner is trained on the OOF predictions from the NCV loop.
-    # This is the correct way to do it to prevent data leakage.
-    if config.get('ensemble', {}).get('train_meta_learner', True) and all_oof_preds_list and all_oof_y_list:
-        logger.info("Training final XGBoost Meta-Learner on all OOF predictions...")
+    final_meta_learner = None
+    if config.get('ensemble', {}).get('train_meta_learner', True):
+        logger.info("Training final XGBoost Meta-Learner on OOF predictions...")
+        meta_features_list = []
+        if config.get('ensemble', {}).get('train_lgbm', True):
+            meta_features_list.append(oof_preds_for_meta_lgbm)
+        if config.get('ensemble', {}).get('train_teco', True):
+            meta_features_list.append(oof_preds_for_meta_teco)
 
-        # Concatenate all OOF predictions and labels from the NCV loop
-        full_oof_preds = np.concatenate(all_oof_preds_list, axis=0)
-        full_oof_y = np.concatenate(all_oof_y_list, axis=0)
+        if meta_features_list:
+            full_oof_preds = np.concatenate(meta_features_list, axis=1)
+            full_oof_y = y_full_for_split.to_numpy()
 
-        logger.info(f"Full OOF predictions shape for final meta-learner: {full_oof_preds.shape}")
+            logger.info(f"Full OOF predictions shape for final meta-learner: {full_oof_preds.shape}")
 
-        meta_config = config.get('ensemble', {}).get('meta_learner_xgb_params', {})
-        final_meta_learner = XGBoostMetaLearner(
-            params=meta_config.get('model_specific_params'),
-            depth=meta_config.get('depth', 3)
-        )
-        final_meta_learner.train(full_oof_preds, full_oof_y)
-        logger.info("Final XGBoost Meta-Learner trained on all OOF predictions.")
-    else:
-        logger.warning("Skipping final meta-learner training because no OOF predictions were collected.")
-        final_meta_learner = None
+            meta_config = config.get('ensemble', {}).get('meta_learner_xgb_params', {})
+            final_meta_learner = XGBoostMetaLearner(
+                params=meta_config.get('model_specific_params'),
+                depth=meta_config.get('depth', 3)
+            )
+            final_meta_learner.train(full_oof_preds, full_oof_y)
+            logger.info("Final XGBoost Meta-Learner trained on all OOF predictions.")
+        else:
+            logger.warning("No OOF predictions available to train the final meta-learner.")
 
     # 4. Final LoS Model
-    logger.info("Training final Length of Stay model on all data...")
-    los_column_name = config.get('los_column', 'lengthofStay')
     final_los_model = None
+    los_column_name = config.get('los_column', 'lengthofStay')
     if los_column_name in X_full_raw_df.columns:
         y_los_full_raw = X_full_raw_df[los_column_name].values
         valid_los_indices = ~np.isnan(y_los_full_raw)
@@ -2200,7 +2183,7 @@ def main(config_path):
         meta_learner=final_meta_learner,
         los_model=final_los_model,
         class_mapping=class_mapping,
-        thresholds=thr_dict, # Using thresholds from NCV
+        thresholds=thr_dict,
         config=config
     )
 
@@ -2208,7 +2191,6 @@ def main(config_path):
     prediction_pipeline.save(pipeline_path)
     logger.info(f"Final prediction pipeline saved to {pipeline_path}")
     wandb.log_artifact(pipeline_path, name="prediction_pipeline", type="model")
-
 
     wandb.finish()
     logger.info("Full Nested Cross-Validation ensemble training run finished successfully.")
