@@ -150,7 +150,7 @@ class LightGBMModel:
             valid_sets.append(lgb_val)
             valid_names.append('valid')
         # Ensure that if early stopping is on, there is a validation set.
-        elif early_stopping_rounds > 0:
+        elif early_stopping_rounds > 0 and (X_val is None or y_val is None):
             raise ValueError("For early stopping, a validation set (X_val, y_val) must be provided.")
 
 
