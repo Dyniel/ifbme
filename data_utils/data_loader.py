@@ -83,6 +83,14 @@ def load_raw_data(config, base_data_path="data/"):
     # Note: 'heart_rate' and other specific vitals are not in the provided CSV columns.
     # This will be handled by the trend feature generation logic which will only use available columns.
 
+    # --- Data Cleaning: Blood Pressure ---
+    if 'sbp' in df_full.columns:
+        logger.info("Cleaning 'sbp' (blood pressure) column...")
+        # Extract the first number from strings like '120x80' or '120X80'
+        df_full['sbp'] = df_full['sbp'].astype(str).str.extract(r'(\d+)').astype(float)
+        logger.info("Finished cleaning 'sbp' column.")
+
+
     logger.info(f"Available columns in the loaded DataFrame (df_full): {df_full.columns.tolist()}")
     # ---- END DEBUG PRINT ----
 
