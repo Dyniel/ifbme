@@ -1,0 +1,105 @@
+random_seed: 42
+use_gpu: true
+
+# --- Data Configuration ---
+use_dummy_data_for_full_run: true # SET TO FALSE TO USE REAL DATA
+data_dir: "data/"
+data_paths:
+  train: "trainData.csv"
+  val: "valData.csv"
+  target_column: "outcomeType"
+# GNN related data column - will be generated if set to 'graph_instance_id'
+patient_id_column: 'graph_instance_id' # Instructs train.py to generate per-row IDs
+
+# Dummy data settings (only used if use_dummy_data_for_full_run is true)
+dummy_data_total_samples: 100
+dummy_data_features: 10
+dummy_data_classes: 2
+dummy_data_weights: [0.85, 0.15]
+
+# --- Preprocessing Configuration ---
+preprocessing:
+  numerical_cols: [
+    "requestDate",
+    "admissionDate",
+    "patientAge",
+    "glasgowScale",
+    "hematocrit",
+    "hemoglobin",
+    "leucocitos",
+    "lymphocytes",
+    "urea",
+    "creatinine",
+    "platelets",
+    "diuresis",
+    "lengthofStay"
+  ]
+  categorical_cols: [
+    "requestType",
+    "requestBedType",
+    "admissionBedType",
+    "admissionHealthUnit",
+    "patientGender",
+    "patientFfederalUnit",
+    "icdCode",
+    "blodPressure"
+  ]
+  imputation_strategy: 'median'
+  scale_numerics: true
+  onehot_handle_unknown: 'ignore'
+
+# --- Balancing Configuration ---
+balancing:
+  use_rsmote_gan_in_cv: false
+
+# --- Ensemble Configuration ---
+ensemble:
+  n_outer_folds: 1
+  n_inner_folds_for_oof: 1
+
+  train_lgbm: true
+  train_teco: false
+  train_gnn: false
+  train_meta_learner: true
+
+  lgbm_params:
+    num_leaves: 31
+    class_weight: 'balanced'
+    learning_rate: 0.05
+    reg_alpha: 0.1
+    reg_lambda: 0.1
+    min_child_samples: 20
+    colsample_bytree: 0.7
+    subsample: 0.7
+    num_boost_round: 10
+    early_stopping_rounds: 5
+    save_path: 'models_output/lgbm_final_ncv_trained.joblib'
+
+  meta_learner_xgb_params:
+    depth: 3
+    num_boost_round: 10
+    early_stopping_rounds: 5
+    scale_pos_weight: 2
+    save_path: 'models_output/meta_learner_xgb_ncv_trained.joblib'
+
+  soft_vote_weights:
+    lgbm: 1.0
+
+# --- W&B Logging ---
+wandb:
+  project: 'ifbme-fast-track'
+  entity: null
+  run_name: 'fast_track_run'
+  run_notes: 'Fast track run to verify pipeline.'
+  tags: ['fast_track']
+
+# --- Text Embedding Generation (Optional) ---
+text_embedding_params:
+  enabled: false
+
+# --- Ontology Embedding Generation (Optional) ---
+ontology_embedding_params:
+  enabled: false
+
+# --- Output Directory ---
+output_dir: "outputs"
