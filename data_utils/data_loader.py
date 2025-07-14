@@ -68,6 +68,7 @@ def load_raw_data(config, base_data_path="data/"):
 
     # --- Column Renaming ---
     column_mapping = {
+        'heartRate': 'heart_rate',
         'blodPressure': 'sbp', # Simplified mapping, assuming this represents systolic blood pressure
         'hematocrit': 'hematocrit',
         'hemoglobin': 'hemoglobin',
