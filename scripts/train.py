@@ -1993,10 +1993,10 @@ def main(config_path):
             all_y_test_flat = np.concatenate(all_y_test_list)
             # all_preds_meta_flat contains labels based on default threshold (used for metrics during CV)
             all_preds_meta_flat = np.concatenate(all_preds_meta_list)
-            all_probas_death_meta_flat = np.concatenate(all_probas_meta_list)  # Probabilities for 'Death' class
-            all_actual_los_flat = np.concatenate(all_actual_los_list)
-            all_predicted_los_flat = np.concatenate(all_predicted_los_list)
-            all_patient_ids_flat = np.concatenate(all_patient_ids_list)
+            all_probas_death_meta_flat = np.concatenate(all_probas_list) if all_probas_list else np.array([])
+            all_actual_los_flat = np.concatenate(all_actual_los_list) if all_actual_los_list else np.array([])
+            all_predicted_los_flat = np.concatenate(all_predicted_los_list) if all_predicted_los_list else np.array([])
+            all_patient_ids_flat = np.concatenate(all_patient_ids_list) if all_patient_ids_list else np.array([])
 
             # Create a DataFrame for DTestimation.csv
             # Sort by original index to ensure consistent order if needed, though not strictly necessary for a simple vector.
@@ -2118,7 +2118,7 @@ def main(config_path):
 
         fobj_final = FocalLossLGB(alpha=0.25, gamma=2.0)
         final_lgbm_model = LightGBMModel(params=final_lgbm_params)
-        final_lgbm_model.train(X_full_processed, y_full_encoded, fobj=fobj_final)
+        final_lgbm_model.train(X_full_processed, y_full_encoded, fobj=fobj_final, early_stopping_rounds=0)
         final_base_models['lgbm'] = final_lgbm_model
         logger.info("Final LightGBM model trained.")
 
