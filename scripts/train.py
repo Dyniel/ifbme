@@ -19,7 +19,7 @@ import pandas as pd
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import optuna  # Import Optuna
-
+import sys, os, time, argparse, yaml, wandb, torch, joblib   #  ←  DODANE „joblib”
 # Project-specific imports
 from data_utils.balancing import RSMOTE
 from data_utils.data_loader import load_raw_data
@@ -487,6 +487,11 @@ def main(config_path):
     logger.info(
         f"Target variable '{y_full_raw_series.name}' encoded. Mapping: {class_mapping}. Unique values after encoding: {y_full_raw_series_encoded.unique()}")
     y_full_for_split = y_full_raw_series_encoded
+
+    # ---------- BEST-MODEL TRACKER ----------
+    best_glscore = float("inf")  # im mniejszy tym lepszy
+    best_artifact_path = None  # uzupełni się gdy znajdziemy lepszy model
+    # ---------- END BEST-MODEL TRACKER ------
 
     for outer_fold_idx, (outer_train_idx, outer_test_idx) in enumerate(
             outer_skf.split(X_full_raw_df, y_full_for_split)):
@@ -1623,6 +1628,42 @@ def main(config_path):
                 gl_score_meta_outer = gl_score_calc(dt_score_meta_outer, current_ls_score_meta)
                 outer_fold_metrics_meta['gl_score'].append(gl_score_meta_outer)
 
+                # ---------- BEST‐MODEL CHECK (meta‐learner) ----------
+                # Use the GL‐score we just computed for this outer fold
+                current_gl = gl_score_meta_outer
+
+                if current_gl < best_glscore:
+                    best_glscore = current_gl
+
+                    artifact_bundle = {
+                        "preprocessor": fold_preprocessor,
+                        "lgbm_model": lgbm_inner_fold_model,
+                        "teco_model": teco_model_inner,
+                        "los_reg": los_model,
+                        "soft_vote_weights": soft_vote_weights,
+                        "thresholds": {"death_best": best_threshold_fold_meta}
+                    }
+
+                    model_dir = os.path.join(config.get("output_dir", "outputs"))
+                    os.makedirs(model_dir, exist_ok=True)
+                    best_artifact_path = os.path.join(model_dir, "best_model.joblib")
+                    joblib.dump(artifact_bundle, best_artifact_path)
+
+                    art = wandb.Artifact(
+                        name=f"best_model_fold_{outer_fold_idx + 1}",
+                        type="model",
+                        metadata={"GLscore": current_gl}
+                    )
+                    art.add_file(best_artifact_path)
+                    wandb.run.log_artifact(art)
+
+                    logger.info(
+                        f"[BEST MODEL UPDATE] Fold {outer_fold_idx + 1} → new best GL={current_gl:.4f}, "
+                        f"saved to {best_artifact_path}"
+                    )
+
+
+
                 wandb.log({
                     f"outer_fold_{outer_fold_idx + 1}/meta_f1_death_for_dtscore": f1_death_for_dtscore_meta if death_label_value is not None else np.nan,
                     # Log the original F1_Death based on 0.5 threshold for comparison if needed
@@ -2050,6 +2091,12 @@ def main(config_path):
     thresholds_path = os.path.join(output_dir, "thresholds.joblib")
     joblib.dump(thr_dict, thresholds_path)
     logger.info(f"Saved thresholds dictionary to {thresholds_path}")
+
+    # ---------- BEST-MODEL FINAL INFO ----------
+    logger.info(f"Najlepszy GLscore w całym NCV = {best_glscore:.4f}")
+    logger.info(f"Ścieżka do paczki modelu: {best_artifact_path}")
+    wandb.summary["best_glscore"] = best_glscore
+    # ---------- END BEST-MODEL FINAL INFO -----
 
     wandb.finish()
     logger.info("Full Nested Cross-Validation ensemble training run finished successfully.")
